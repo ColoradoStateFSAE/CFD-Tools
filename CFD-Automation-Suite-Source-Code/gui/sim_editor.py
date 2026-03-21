@@ -1,6 +1,7 @@
 """
 Simulation configuration editor — PyQt6.
-Tabbed dialog: General | Meshing | Ramp-Up | Wheel MRF | CoP / Aero Balance
+Tabbed dialog: General | Meshing | Ramp-Up | Wheel MRF
+CoP is derived automatically from Fluent moment reports — no geometry tab needed.
 """
 import os
 from PyQt6.QtWidgets import (
@@ -74,7 +75,6 @@ class SimEditorDialog(QDialog):
         self._build_rampup_tab()
         if self.config.use_wheel_mrf:
             self._build_wheel_tab()
-        self._build_cop_tab()
 
         # Button row
         btn_frame = QFrame()
@@ -189,6 +189,28 @@ class SimEditorDialog(QDialog):
         self.sb_ch = QDoubleSpinBox()
         self.sb_ch.setRange(0.1, 10); self.sb_ch.setDecimals(3); self.sb_ch.setSuffix(" m")
         form.addRow("Height H (Y axis):", self.sb_ch)
+
+        form.addRow(self._hsep())
+
+        wb_label = QLabel("CoP Calculation")
+        wb_label.setObjectName("subheading")
+        form.addRow(wb_label)
+
+        self.sb_wheelbase = QDoubleSpinBox()
+        self.sb_wheelbase.setRange(10.0, 300.0)
+        self.sb_wheelbase.setDecimals(2)
+        self.sb_wheelbase.setSingleStep(0.5)
+        self.sb_wheelbase.setSuffix(" in")
+        self.sb_wheelbase.setToolTip(
+            "Front-to-rear axle distance. Used to compute front/rear aero balance %.\n"
+            "Lf, Lr, Lu are derived automatically from Fluent moment reports — "
+            "no hand measurement needed."
+        )
+        note_wb = QLabel("Lf / Lr / Lu derived from simulation moment data automatically.")
+        note_wb.setObjectName("muted")
+        note_wb.setWordWrap(True)
+        form.addRow("Wheelbase L:", self.sb_wheelbase)
+        form.addRow(note_wb)
 
         w.layout().addLayout(form)
         w.layout().addStretch()
@@ -361,72 +383,6 @@ class SimEditorDialog(QDialog):
         v.addStretch()
         self._refresh_wheel_table()
 
-    # ── CoP tab ───────────────────────────────────────────────────────────────
-
-    def _build_cop_tab(self):
-        w = self._scroll_tab("  CoP / Aero Balance  ")
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setSpacing(9)
-        form.setContentsMargins(20, 16, 20, 16)
-
-        lbl = QLabel("Center-of-Pressure Geometry")
-        lbl.setObjectName("subheading")
-        form.addRow(lbl)
-
-        note = QLabel(
-            "All dimensions in inches — matches Ram Racing MATLAB script convention."
-        )
-        note.setObjectName("muted")
-        form.addRow(note)
-
-        form.addRow(self._hsep())
-
-        fields = [
-            ("sb_wb",  "Wheelbase L [in]:",
-             "Total front-to-rear axle distance", 0.1, 300.0),
-            ("sb_lf",  "Lf: FW CoP → front axle [in]:",
-             "Distance from front wing CoP to front axle", 0.1, 200.0),
-            ("sb_lr",  "Lr: RW CoP → rear axle [in]:",
-             "Distance from rear wing CoP to rear axle", 0.1, 200.0),
-            ("sb_lu",  "Lu: UT CoP → front axle [in]:",
-             "Distance from undertray CoP to front axle", 0.1, 300.0),
-            ("sb_rwh", "H: RW drag CoP height [in]:",
-             "Height of rear wing drag centre above ground", 0.1, 200.0),
-        ]
-        for attr, label, tip, lo, hi in fields:
-            sb = QDoubleSpinBox()
-            sb.setRange(lo, hi)
-            sb.setDecimals(3)
-            sb.setSingleStep(0.1)
-            sb.setSuffix(" in")
-            sb.setToolTip(tip)
-            setattr(self, attr, sb)
-            form.addRow(label, sb)
-
-        form.addRow(self._hsep())
-
-        # Equation reference
-        eq_label = QLabel("Equation Reference (from MATLAB script)")
-        eq_label.setObjectName("subheading")
-        form.addRow(eq_label)
-
-        eq_box = QTextEdit()
-        eq_box.setReadOnly(True)
-        eq_box.setFixedHeight(130)
-        eq_box.setPlainText(
-            "Mz  = (Fr*(L+Lr)) + (Fu*Lu) + (Fdr*H) - (Ff*Lf)\n"
-            "x_cp = Mz / Fy\n"
-            "W_RD = ((Fu*Lu) + (Fr*(L+Lr)) + (Fdr*H) - (Ff*Lf)) / L\n"
-            "W_FD = ((Ff*(L+Lf)) + (Fu*(L-Lu)) - (Fr*Lr) - (Fdr*H)) / L\n"
-            "% Rear  = W_RD / (W_FD + W_RD)\n"
-            "% Front = W_FD / (W_FD + W_RD)"
-        )
-        form.addRow(eq_box)
-
-        w.layout().addLayout(form)
-        w.layout().addStretch()
-
     # ── Wheel table helpers ───────────────────────────────────────────────────
 
     def _refresh_wheel_table(self):
@@ -499,6 +455,7 @@ class SimEditorDialog(QDialog):
         self.sb_cl.setValue(c.car_length_m)
         self.sb_cw.setValue(c.car_width_m)
         self.sb_ch.setValue(c.car_height_m)
+        self.sb_wheelbase.setValue(c.wheelbase_in)
 
         self.sb_surf_min.setValue(c.surface_mesh_min)
         self.sb_surf_max.setValue(c.surface_mesh_max)
@@ -518,12 +475,6 @@ class SimEditorDialog(QDialog):
         if hasattr(self, "chk_mrf"):
             self.chk_mrf.setChecked(c.use_wheel_mrf)
 
-        cop = c.cop_geometry
-        self.sb_wb.setValue(cop.wheelbase)
-        self.sb_lf.setValue(cop.lf)
-        self.sb_lr.setValue(cop.lr)
-        self.sb_lu.setValue(cop.lu)
-        self.sb_rwh.setValue(cop.rw_drag_height)
 
     def _write_to_config(self):
         c = self.config
@@ -538,6 +489,7 @@ class SimEditorDialog(QDialog):
         c.car_length_m      = self.sb_cl.value()
         c.car_width_m       = self.sb_cw.value()
         c.car_height_m      = self.sb_ch.value()
+        c.wheelbase_in      = self.sb_wheelbase.value()
 
         c.surface_mesh_min  = self.sb_surf_min.value()
         c.surface_mesh_max  = self.sb_surf_max.value()
@@ -557,11 +509,6 @@ class SimEditorDialog(QDialog):
         if hasattr(self, "chk_mrf"):
             c.use_wheel_mrf = self.chk_mrf.isChecked()
 
-        c.cop_geometry.wheelbase      = self.sb_wb.value()
-        c.cop_geometry.lf             = self.sb_lf.value()
-        c.cop_geometry.lr             = self.sb_lr.value()
-        c.cop_geometry.lu             = self.sb_lu.value()
-        c.cop_geometry.rw_drag_height = self.sb_rwh.value()
 
     def _accept(self):
         try:

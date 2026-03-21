@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Ram Racing CFD Tool",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/CFD-Automation-Suite-Source-Code/main.py",
+            "cwd": "${workspaceFolder}/CFD-Automation-Suite-Source-Code",
+            "console": "integratedTerminal",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+        }
+    ]
+}

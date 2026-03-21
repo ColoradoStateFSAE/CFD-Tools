@@ -439,6 +439,26 @@ def _configure_force_reports(solver, config):
     safe_add_drag("drag_aero", _FW_ZONES + _RW_ZONES + _UT_ZONES)
     safe_add_drag("drag_rw",   _RW_ZONES)
 
+    # Pitching moment reports — used to derive CoP arm lengths post-sim
+    # Moment axis = Z axis (0,0,1), moment centre = origin (front axle at X=0)
+    # Fluent moment convention: positive = nose-up
+    def safe_add_moment(name, zones):
+        existing = [z for z in zones
+                    if z in solver.setup.boundary_conditions.wall]
+        if not existing:
+            log.warning(f"  No zones found for moment report '{name}': {zones}")
+            return
+        solver.solution.report_definitions.moment[name] = {
+            "zones":  existing,
+            "moment_center": [0, 0, 0],
+            "moment_axis":   [0, 0, 1],
+        }
+
+    safe_add_moment("moment_fw", _FW_ZONES)
+    safe_add_moment("moment_rw", _RW_ZONES)
+    safe_add_moment("moment_ut", _UT_ZONES)
+    safe_add_moment("moment_total", _FW_ZONES + _RW_ZONES + _UT_ZONES)
+
     # Extra user-defined zones
     for zone_def in config.extra_result_zones:
         ztype = zone_def.get("type", "lift")
@@ -581,8 +601,11 @@ def _extract_results(solver, config) -> dict:
             if report_type == "lift":
                 return solver.solution.report_definitions.lift[
                     name].get_monitor_value()
-            else:
+            elif report_type == "drag":
                 return solver.solution.report_definitions.drag[
+                    name].get_monitor_value()
+            else:  # moment
+                return solver.solution.report_definitions.moment[
                     name].get_monitor_value()
         except Exception as e:
             log.warning(f"  Could not read report '{name}': {e}")
@@ -595,6 +618,14 @@ def _extract_results(solver, config) -> dict:
     results["drag_total_lbf"]    = get_val("drag", "drag_total")
     results["drag_aero_lbf"]     = get_val("drag", "drag_aero")
     results["drag_rw_lbf"]       = get_val("drag", "drag_rw")
+
+    # Pitching moments about front axle (Z axis, origin) [lbf·m from Fluent]
+    # Convert to inches for CoP calculation to match MATLAB script convention
+    M_TO_IN = 39.3701
+    results["moment_fw_lbf_in"]  = get_val("moment", "moment_fw")  * M_TO_IN
+    results["moment_rw_lbf_in"]  = get_val("moment", "moment_rw")  * M_TO_IN
+    results["moment_ut_lbf_in"]  = get_val("moment", "moment_ut")  * M_TO_IN
+    results["moment_tot_lbf_in"] = get_val("moment", "moment_total") * M_TO_IN
 
     # Convenience totals
     mult = 2.0 if config.is_half_symmetry else 1.0
@@ -634,7 +665,7 @@ def _extract_results(solver, config) -> dict:
 
     # Export results text file
     try:
-        from results_exporter import export_results
+        from utils.results_exporter import export_results
         result_file = export_results(config, results,
                                      frontal_area_m2=frontal_area)
         results["result_file"] = result_file

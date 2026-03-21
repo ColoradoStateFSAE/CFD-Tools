@@ -31,74 +31,6 @@ class WheelMRFConfig:
 
 
 @dataclass
-class CoPGeometry:
-    """
-    Car geometry needed for Center-of-Pressure % calculation.
-    All dimensions in inches (matching the MATLAB script convention).
-    Equations ported directly from Ram Racing MATLAB script.
-    """
-    wheelbase: float = 62.0          # L  - total wheelbase [in]
-    lf: float = 29.36                # Lf - dist from FW CoP to front axle [in]
-    lr: float = 8.1                  # Lr - dist from RW CoP to rear axle [in]
-    lu: float = 42.93                # Lu - dist from undertray CoP to front axle [in]
-    rw_drag_height: float = 42.84    # H  - RW drag CoP height from ground [in]
-
-    def compute(self,
-                ff: float, fr: float, fu: float,
-                fdr: float) -> dict:
-        """
-        Compute CoP metrics.
-        ff  = front wing downforce [lbf]
-        fr  = rear wing downforce  [lbf]
-        fu  = undertray downforce  [lbf]
-        fdr = rear wing drag       [lbf]
-
-        Returns dict with keys:
-          x_cp           - CoP location from front axle [in]
-          percent_rear   - fraction of downforce over rear
-          percent_front  - fraction of downforce over front
-          fy             - total downforce [lbf]
-          fx             - total aero drag (rear wing drag) [lbf]
-          f_resultant    - resultant force magnitude [lbf]
-          theta_deg      - angle of resultant from vertical [deg]
-        """
-        import math
-        L   = self.wheelbase
-        Lf  = self.lf
-        Lr  = self.lr
-        Lu  = self.lu
-        H   = self.rw_drag_height
-
-        Fx  = fdr
-        Fy  = ff + fr + fu
-
-        # Pitching moment about front axle (z axis)
-        Mz  = (fr * (L + Lr)) + (fu * Lu) + (fdr * H) - (ff * Lf)
-
-        x_cp = Mz / Fy if Fy != 0 else 0.0
-
-        W_RD = ((fu * Lu) + (fr * (L + Lr)) + (fdr * H) - (ff * Lf)) / L
-        W_FD = ((ff * (L + Lf)) + (fu * (L - Lu)) - (fr * Lr) - (fdr * H)) / L
-
-        total = W_FD + W_RD
-        pct_rear  = W_RD / total if total != 0 else 0.0
-        pct_front = W_FD / total if total != 0 else 0.0
-
-        theta = 180 - (math.degrees(math.atan2(Fy, Fx)) + 90)
-        f_res = math.sqrt(Fx**2 + Fy**2)
-
-        return {
-            "x_cp": x_cp,
-            "percent_rear": pct_rear,
-            "percent_front": pct_front,
-            "fy": Fy,
-            "fx": Fx,
-            "f_resultant": f_res,
-            "theta_deg": theta,
-        }
-
-
-@dataclass
 class BaseSimConfig:
     """Base configuration shared by all simulation types."""
     name: str = "Untitled Sim"
@@ -139,8 +71,9 @@ class BaseSimConfig:
     wheel_mrf_zones: List[WheelMRFConfig] = field(default_factory=list)
     use_wheel_mrf: bool = True
 
-    # CoP geometry (for post-processing % calculation)
-    cop_geometry: CoPGeometry = field(default_factory=CoPGeometry)
+    # Wheelbase for CoP % calculation [in] — RR26 default 62.0 in
+    # CoP arm lengths (Lf, Lr, Lu) are derived from simulation moment data
+    wheelbase_in: float = 62.0
 
     # Extra custom result fields user can define (expandable)
     # Each entry: {"label": str, "zone": str, "type": "lift"|"drag"}
