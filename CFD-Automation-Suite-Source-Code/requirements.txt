@@ -1,0 +1,3 @@
+PyQt6>=6.6.0
+ansys-fluent-core>=0.20.0
+reportlab>=4.0.0
