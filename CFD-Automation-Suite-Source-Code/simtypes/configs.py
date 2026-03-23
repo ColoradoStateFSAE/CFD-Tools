@@ -42,8 +42,8 @@ class BaseSimConfig:
     use_curvature_correction: bool = False    # off until final ramp-up
     use_production_limiter: bool = True
     double_precision: bool = True
-    num_processes: int = 40
-    mpi_type: str = "openmpi"                # openmpi, intel, default
+    num_processes: int = 70
+    mpi_type: str = "intel"                # openmpi, intel, default
 
     # Mesh sizing
     surface_mesh_min: float = 0.002          # [m]
@@ -52,18 +52,18 @@ class BaseSimConfig:
     volume_mesh_max: float = 0.256           # [m]
 
     # Boundary layer
-    bl_num_layers: int = 6
+    bl_num_layers: int = 8
     bl_first_height: float = 0.0005          # [m]
     bl_transition_ratio: float = 0.272
 
     # Ramp-up iterations
-    ramp0_iters: int = 200    # Initial first-order run
-    ramp1_iters: int = 300    # Second order + Presto pressure
-    ramp2_iters: int = 300    # Full second order no curvature correction
-    ramp3_iters: int = 500    # Full send (with curvature correction)
+    ramp0_iters: int = 500    # Initial first-order run
+    ramp1_iters: int = 1000    # Second order + Presto pressure
+    ramp2_iters: int = 1000    # Full second order no curvature correction
+    ramp3_iters: int = 1000    # Full send (with curvature correction)
 
     # Car geometry reference (for refinement box sizing)
-    car_length_m: float = 2.8    # L - x axis
+    car_length_m: float = 3.1    # L - x axis
     car_width_m: float = 1.4     # W - z axis
     car_height_m: float = 1.2    # H - y axis
 

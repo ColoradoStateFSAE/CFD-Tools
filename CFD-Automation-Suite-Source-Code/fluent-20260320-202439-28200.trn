@@ -1,0 +1,28 @@
+Auto-Transcript Start Time:  20:24:39, 20 Mar 2026 Mountain Daylight Time 
+Current Directory: "C:\Users\Hayes Dodson\Documents\VSCode\CFD-Tools\CFD-Automation-Suite-Source-Code"
+Information: The server has started and is running.
+
+              Welcome to ANSYS Fluent 2025 R2.04
+
+              Copyright 1987-2025 ANSYS, Inc. All Rights Reserved.
+              Unauthorized use, distribution or duplication is prohibited.
+              This product is subject to U.S. laws governing export and re-export.
+              For full Legal Notice, see documentation.
+
+Build Time: Oct  7 2025 15:34:38 EDT  Build Id: 10205  
+ 
+Connected License Server List:	1055@MECHIE-Dodson
+
+     --------------------------------------------------------------
+     This is an academic version of ANSYS FLUENT. Usage of this product
+     license is limited to the terms and conditions specified in your ANSYS
+     license form, additional terms section.
+     --------------------------------------------------------------
+Host spawning Node 0 on machine "MECHIE-Dodson" (win64).
+Abort(2663823) on node 0 (rank 0 in comm 0): Fatal error in PMPI_Init: Other MPI error, error stack:
+MPIR_Init_thread(176).........: 
+MPID_Init(1512)...............: 
+MPIDI_SHMI_mpi_init_hook(27)..: 
+MPIDI_POSIX_mpi_init_hook(165): 
+MPIDI_POSIX_eager_init(2891)..: 
+MPIDU_Init_shm_alloc(151).....: unable to allocate shared memory

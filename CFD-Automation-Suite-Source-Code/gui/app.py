@@ -83,6 +83,8 @@ class SimTypeChooserDialog(QWidget):
                 "QFrame { background: #282c34; border: 1px solid #3e4451;"
                 " border-radius: 6px; padding: 4px; }"
                 "QFrame:hover { border-color: #00b4a0; }"
+                "QRadioButton { background: transparent; border: none; }"
+                "QLabel { background: transparent; border: none; }"
             )
             card_l = QVBoxLayout(card)
             card_l.setContentsMargins(10, 8, 10, 8)
@@ -165,6 +167,12 @@ class RamRacingCFDWindow(QMainWindow):
         mb = self.menuBar()
 
         file_menu = mb.addMenu("&File")
+        settings_act = QAction("Car Settings…", self)
+        settings_act.setShortcut("Ctrl+,")
+        settings_act.setToolTip("Set wheelbase, CoP geometry constants, reference area")
+        settings_act.triggered.connect(self._open_car_settings)
+        file_menu.addAction(settings_act)
+        file_menu.addSeparator()
         save_log = QAction("Save Queue Log…", self)
         save_log.setShortcut("Ctrl+S")
         save_log.triggered.connect(self._save_log)
@@ -443,6 +451,10 @@ class RamRacingCFDWindow(QMainWindow):
             if job.job_id == job_id:
                 return job
         return None
+
+    def _open_car_settings(self):
+        from gui.settings_dialog import CarSettingsDialog
+        CarSettingsDialog(self).exec()
 
     def _save_log(self):
         path, _ = QFileDialog.getSaveFileName(

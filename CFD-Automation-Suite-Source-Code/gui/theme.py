@@ -148,6 +148,28 @@ QPushButton:disabled {{
     border-color: {BORDER};
 }}
 
+/* ── Icon / arrow buttons (▲ ▼ ✎ ✕) ── */
+QPushButton[text="▲"], QPushButton[text="▼"] {{
+    background-color: {PANEL_BG};
+    color: {TEXT_BRIGHT};
+    border: 1px solid {BORDER};
+    border-radius: 5px;
+    padding: 0px;
+    min-width: 32px;
+    max-width: 32px;
+    min-height: 32px;
+    max-height: 32px;
+    font-size: 13pt;
+    font-family: "Segoe UI Symbol", "Arial Unicode MS", sans-serif;
+    qproperty-iconSize: 0px;
+}}
+
+QPushButton[text="▲"]:hover, QPushButton[text="▼"]:hover {{
+    background-color: {HOVER_BG};
+    border-color: {ACCENT};
+    color: {ACCENT};
+}}
+
 /* ── Inputs ── */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background-color: {INPUT_BG};
@@ -221,6 +243,36 @@ QCheckBox::indicator {{
 QCheckBox::indicator:checked {{
     background-color: {ACCENT};
     border-color: {ACCENT};
+}}
+
+/* ── RadioButton ── */
+QRadioButton {{
+    color: {TEXT_BRIGHT};
+    spacing: 10px;
+    font-size: 10pt;
+}}
+
+QRadioButton::indicator {{
+    width: 16px;
+    height: 16px;
+    border-radius: 8px;
+    border: 2px solid {BORDER};
+    background-color: {INPUT_BG};
+}}
+
+QRadioButton::indicator:hover {{
+    border-color: {ACCENT};
+}}
+
+QRadioButton::indicator:checked {{
+    border: 2px solid {ACCENT};
+    background-color: {INPUT_BG};
+    image: none;
+}}
+
+QRadioButton::indicator:checked {{
+    border: 3px solid {ACCENT};
+    background-color: {ACCENT};
 }}
 
 /* ── Tab widget ── */
