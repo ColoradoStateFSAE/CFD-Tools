@@ -23,7 +23,19 @@ def main():
 
     # Global stylesheet
     app.setStyleSheet(QSS)
+    
+    #Windows Icon
+    def _resource_path(relative):
+        import sys, os
+        if hasattr(sys, '_MEIPASS'):
+            return os.path.join(sys._MEIPASS, relative)
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative)
 
+    from PyQt6.QtGui import QIcon
+    icon_path = _resource_path(os.path.join("assets", "logo.png"))
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+    
     # Default font
     font = QFont("Segoe UI", 9)
     app.setFont(font)

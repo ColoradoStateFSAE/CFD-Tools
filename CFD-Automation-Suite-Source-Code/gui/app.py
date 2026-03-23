@@ -207,7 +207,18 @@ class RamRacingCFDWindow(QMainWindow):
         h_layout = QHBoxLayout(header)
         h_layout.setContentsMargins(20, 0, 20, 0)
 
-        logo = QLabel("🏎  Ram Racing  |  CFD Automation")
+        import os
+        from PyQt6.QtGui import QPixmap
+
+        def _resource_path(relative):
+            import sys
+            if hasattr(sys, '_MEIPASS'):
+                return os.path.join(sys._MEIPASS, relative)
+            return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative)
+
+        icon_path = _resource_path(os.path.join("assets", "logo.png"))
+
+        logo = QLabel("Ram Racing  |  CFD Automation")
         logo.setStyleSheet(
             "font-size: 15pt; font-weight: bold; color: #00b4a0;"
             " background: transparent;"

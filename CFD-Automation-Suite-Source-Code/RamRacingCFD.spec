@@ -42,6 +42,7 @@ a = Analysis(
     binaries=linux_binaries,
     datas=[
         ('utils/Wheel_MRF_Setup_Guide.pdf', 'utils'),
+        ('assets/logo.png', 'assets'),
     ],
     hiddenimports=[
         'PyQt6.QtCore',
@@ -85,6 +86,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='RamRacingCFD',
+    icon='assets/logo.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=IS_LINUX,
