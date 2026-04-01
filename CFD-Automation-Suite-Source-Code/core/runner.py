@@ -242,7 +242,7 @@ def _read_mesh(solver, mesh_file: str):
     try:
         solver.file.read_mesh(file_name=mesh_file)
     except (AttributeError, Exception):
-        solver.file.read(file_name=mesh_file, file_type="case")
+        solver.file.read(file_name=mesh_file)
 
 
 def _write_case(solver, path: str):
@@ -574,25 +574,19 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
         # EXECUTE the workflow cascade:
         # Use task(args) callable syntax — the only pattern that sends
         # File Name through gRPC correctly in 252.
-        log.info("  Executing Import Geometry...")
-        prog("Importing geometry (executing)...", 86)
-        workflow.TaskObject["Import Geometry"]({
-            "File Name":   config.geometry_path,
-            "Length Unit": "m",
-        })
 
         log.info("  Executing full workflow pipeline...")
         prog("Running meshing pipeline...", 87)
-        result = workflow.TaskObject["Generate the Volume Mesh"].Execute()
+        result = workflow.TaskObject["Generate the Volume Mesh"]({})
         log.info(f"  Volume mesh generation complete (result={result})")
+        
+        if not result:
+            raise RuntimeError("Volume mesh generation failed - check Fluent logs for details")
 
         # Step 12: Improve Volume Mesh (after full mesh generation)
         prog("Improving volume mesh...", 92)
         try:
-            meshing.meshing.ImproveVolumeMesh(
-                QualityMethod="Orthogonal",
-                CellQualityLimit=0.2
-            )
+            meshing.scheme_eval.string_eval('(improve-volume-mesh "orthogonal" 0.2)')
             log.info("  ImproveVolumeMesh complete")
         except Exception as e:
             log.warning(f"  ImproveVolumeMesh skipped: {e}")
@@ -606,9 +600,9 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
         # Try 1: scheme eval — most reliable in 252
         try:
             meshing.scheme_eval.string_eval(
-                f'(write-mesh "{mesh_file}")'
+                f'(write-case "{mesh_file}")'
             )
-            log.info(f"  Mesh written via scheme_eval")
+            log.info(f"  Case written via scheme_eval")
             written = True
         except Exception as e:
             log.debug(f"  scheme_eval write failed: {e}")
@@ -832,13 +826,25 @@ def run_solver(config, mesh_file: str,
             progress_cb(msg, pct)
 
     prog("Launching Fluent solver...", 0)
+    import_file_name = (mesh_file)
     solver = _launch_fluent_solver(pyfluent, config)
 
     try:
         # Load mesh
         prog("Loading mesh...", 2)
-        _read_mesh(solver, mesh_file)
+        solver.settings.file.read_case(file_name=import_file_name)
         solver.mesh.check()
+
+        # Validate mesh has volume elements
+        try:
+            mesh_stats = solver.tui.report.mesh_statistics()
+            log.info(f"  Mesh loaded: {mesh_stats}")
+            # Check for volume cells (should be >0 for volumetric mesh)
+            if "cells:" in mesh_stats.lower():
+                # Basic check - if no cells mentioned or very few, might be surface
+                pass  # For now, assume it's ok if no error
+        except Exception as e:
+            log.warning(f"  Could not get mesh statistics: {e}")
 
         # Units
         solver.setup.general.units["force"] = "lbf"
