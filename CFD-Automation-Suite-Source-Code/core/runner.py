@@ -12,6 +12,241 @@ log = logging.getLogger("fluent_runner")
 
 
 # ---------------------------------------------------------------------------
+# Version compatibility layer
+# Handles API differences between PyFluent 0.28 (2024R2),
+#                                            0.29 (2025R1),
+#                                            0.30 (2025R2)
+# ---------------------------------------------------------------------------
+
+def _get_pyfluent_version() -> tuple:
+    """Returns (major, minor) int tuple e.g. (0, 28)."""
+    try:
+        import ansys.fluent.core as pf
+        ver = getattr(pf, "__version__", "0.28.0")
+        parts = str(ver).split(".")
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        return 0, 28  # assume 2024R2 as safe default
+
+
+def _launch_fluent_meshing(pyfluent, config):
+    """
+    Launch Fluent in meshing mode.
+    0.28: launch_fluent(mode="meshing", ...)
+    0.29+: same API, but product_version kwarg added.
+    """
+    maj, minor = _get_pyfluent_version()
+    kwargs = dict(
+        mode="meshing",
+        precision="double" if config.double_precision else "single",
+        processor_count=config.num_processes,
+    )
+    if minor >= 29:
+        # 0.29+ accepts product_version to disambiguate multiple Fluent installs
+        kwargs["product_version"] = "25.1.0" if minor == 29 else "25.2.0"
+    return pyfluent.launch_fluent(**kwargs)
+
+
+def _launch_fluent_solver(pyfluent, config):
+    """Launch Fluent in solver mode with version-appropriate kwargs."""
+    maj, minor = _get_pyfluent_version()
+    kwargs = dict(
+        mode="solver",
+        precision="double" if config.double_precision else "single",
+        processor_count=config.num_processes,
+    )
+    if minor >= 29:
+        kwargs["product_version"] = "25.1.0" if minor == 29 else "25.2.0"
+    return pyfluent.launch_fluent(**kwargs)
+
+
+def _init_workflow(meshing):
+    """
+    Initialize the Watertight Geometry workflow.
+    0.28: workflow.InitializeWorkflow(WorkflowType=...)
+    0.29+: workflow.initialize_workflow(workflow_type=...) snake_case
+    """
+    maj, minor = _get_pyfluent_version()
+    wf = meshing.workflow
+    if minor >= 29:
+        # snake_case API introduced in 0.29
+        if hasattr(wf, "initialize_workflow"):
+            wf.initialize_workflow(workflow_type="Watertight Geometry")
+        else:
+            wf.InitializeWorkflow(WorkflowType="Watertight Geometry")
+    else:
+        wf.InitializeWorkflow(WorkflowType="Watertight Geometry")
+    return wf
+
+
+def _task(workflow, name_028: str, name_029: str = None):
+    """
+    Get a workflow task by name, handling renames between versions.
+    0.28 used Title Case names; 0.29 kept them but some were renamed.
+    name_028: task name in 0.28
+    name_029: task name in 0.29+ (if different, else same)
+    """
+    maj, minor = _get_pyfluent_version()
+    name = name_029 if (minor >= 29 and name_029) else name_028
+    # Try the version-specific name first, fall back to the other
+    try:
+        return workflow.TaskObject[name]
+    except (KeyError, Exception):
+        fallback = name_028 if name != name_028 else name_029
+        if fallback:
+            return workflow.TaskObject[fallback]
+        raise
+
+
+def _hybrid_init(solver):
+    """
+    Hybrid initialization.
+    0.28: solver.solution.initialization.hybrid_initialize()
+    0.29+: same, but also accepts solver.solution.initialization.initialize()
+    """
+    try:
+        _hybrid_init(solver)
+    except AttributeError:
+        solver.solution.initialization.initialize()
+
+
+def _iterate(solver, n: int):
+    """
+    Run iterations.
+    0.28: _iterate(solver, n)
+    0.29+: same API maintained (no change needed)
+    """
+    _iterate(solver, n)
+
+
+def _set_discretization(solver, scheme: str, field: str):
+    """
+    Set spatial discretization scheme for a field.
+    0.28: solver.solution.methods.spatial_discretization.<field> = scheme
+    0.29+: API path unchanged but some scheme name strings changed:
+           "presto" -> still "presto"  (no change)
+           "second-order" -> still "second-order"  (no change)
+    Handles pressure_velocity_coupling.scheme separately.
+    """
+    methods = solver.solution.methods
+
+    # pressure_velocity_coupling is a separate sub-object
+    if field == "pressure_velocity_coupling":
+        try:
+            methods.pressure_velocity_coupling.scheme = scheme
+        except Exception as e:
+            log.warning(f"  Could not set pv_coupling scheme: {e}")
+        return
+
+    # All other fields go through spatial_discretization
+    if hasattr(methods, "spatial_discretization"):
+        try:
+            setattr(methods.spatial_discretization, field, scheme)
+        except Exception as e:
+            log.warning(f"  Could not set {field}={scheme}: {e}")
+    elif hasattr(methods, "discretization"):
+        try:
+            setattr(methods.discretization, field, scheme)
+        except Exception as e:
+            log.warning(f"  Could not set discretization {field}={scheme}: {e}")
+    else:
+        log.warning(f"  Discretization path not found for {field}={scheme}")
+
+
+def _read_mesh(solver, mesh_file: str):
+    """
+    Read mesh file.
+    0.28: solver.file.read(file_name=..., file_type="mesh")
+    0.29+: solver.file.read_mesh(file_name=...) introduced as preferred
+    """
+    maj, minor = _get_pyfluent_version()
+    if minor >= 29 and hasattr(solver.file, "read_mesh"):
+        solver.file.read_mesh(file_name=mesh_file)
+    else:
+        _read_mesh(solver, mesh_file)
+
+
+def _write_case(solver, path: str):
+    """Write case+data file."""
+    maj, minor = _get_pyfluent_version()
+    if minor >= 29 and hasattr(solver.file, "write_case_data"):
+        solver.file.write_case_data(file_name=path)
+    else:
+        _write_case(solver, path)
+
+
+def _add_report_lift(solver, name: str, zones: list, force_vector: list):
+    """Add a lift force report monitor."""
+    maj, minor = _get_pyfluent_version()
+    try:
+        if minor >= 29:
+            # 0.29 introduced dict-style and object-style setters
+            solver.solution.report_definitions.lift[name] = {
+                "zones": zones,
+                "force_vector": force_vector,
+            }
+        else:
+            solver.solution.report_definitions.lift[name] = {
+                "zones": zones,
+                "force_vector": force_vector,
+            }
+    except Exception as e:
+        log.warning(f"  Could not add lift report {name!r}: {e}")
+
+
+def _add_report_drag(solver, name: str, zones: list, force_vector: list):
+    """Add a drag force report monitor."""
+    try:
+        solver.solution.report_definitions.drag[name] = {
+            "zones": zones,
+            "force_vector": force_vector,
+        }
+    except Exception as e:
+        log.warning(f"  Could not add drag report {name!r}: {e}")
+
+
+def _add_report_moment(solver, name: str, zones: list,
+                       center: list, axis: list):
+    """Add a moment report monitor."""
+    try:
+        solver.solution.report_definitions.moment[name] = {
+            "zones":         zones,
+            "moment_center": center,
+            "moment_axis":   axis,
+        }
+    except Exception as e:
+        log.warning(f"  Could not add moment report {name!r}: {e}")
+
+
+def _get_report_value(solver, report_type: str, name: str) -> float:
+    """Read a report monitor value."""
+    try:
+        rd = solver.solution.report_definitions
+        if report_type == "lift":
+            return rd.lift[name].get_monitor_value()
+        elif report_type == "drag":
+            return rd.drag[name].get_monitor_value()
+        else:
+            return rd.moment[name].get_monitor_value()
+    except Exception as e:
+        log.warning(f"  Could not read report {name!r}: {e}")
+        return 0.0
+
+
+def _compute_reference_values(solver, speed_ms: float,
+                               car_length_m: float):
+    """Set reference values for force coefficient calculation."""
+    maj, minor = _get_pyfluent_version()
+    try:
+        rv = solver.setup.reference_values
+        rv.compute_from = "inlet"
+        rv.velocity     = speed_ms
+        rv.length       = car_length_m
+    except Exception as e:
+        log.warning(f"  Reference values: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Speed / RPM helpers
 # ---------------------------------------------------------------------------
 
@@ -124,15 +359,10 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
             progress_cb(msg, pct)
 
     prog("Launching Fluent Meshing...", 0)
-    meshing = pyfluent.launch_fluent(
-        mode="meshing",
-        precision="double" if config.double_precision else "single",
-        processor_count=config.num_processes,
-    )
+    meshing = _launch_fluent_meshing(pyfluent, config)
 
     try:
-        workflow = meshing.workflow
-        workflow.InitializeWorkflow(WorkflowType="Watertight Geometry")
+        workflow = _init_workflow(meshing)
 
         # Step 2: Import geometry
         prog("Importing geometry...", 5)
@@ -366,29 +596,29 @@ def _set_boundary_conditions(solver, config):
 
 
 def _set_methods_first_order(solver):
-    solver.solution.methods.pressure_velocity_coupling.scheme = "simple"
-    solver.solution.methods.spatial_discretization.pressure = "standard"
-    solver.solution.methods.spatial_discretization.momentum = "first-order-upwind"
-    solver.solution.methods.spatial_discretization.turbulent_kinetic_energy = "first-order-upwind"
-    solver.solution.methods.spatial_discretization.specific_dissipation_rate = "first-order-upwind"
+    _set_discretization(solver, "simple",             "pressure_velocity_coupling")
+    _set_discretization(solver, "standard",           "pressure")
+    _set_discretization(solver, "first-order-upwind", "momentum")
+    _set_discretization(solver, "first-order-upwind", "turbulent_kinetic_energy")
+    _set_discretization(solver, "first-order-upwind", "specific_dissipation_rate")
 
 
 def _set_methods_ramp1(solver):
     """Second order + Presto pressure."""
-    solver.solution.methods.pressure_velocity_coupling.scheme = "simple"
-    solver.solution.methods.spatial_discretization.pressure = "presto"
-    solver.solution.methods.spatial_discretization.momentum = "second-order-upwind"
-    solver.solution.methods.spatial_discretization.turbulent_kinetic_energy = "second-order-upwind"
-    solver.solution.methods.spatial_discretization.specific_dissipation_rate = "second-order-upwind"
+    _set_discretization(solver, "simple",              "pressure_velocity_coupling")
+    _set_discretization(solver, "presto",              "pressure")
+    _set_discretization(solver, "second-order-upwind", "momentum")
+    _set_discretization(solver, "second-order-upwind", "turbulent_kinetic_energy")
+    _set_discretization(solver, "second-order-upwind", "specific_dissipation_rate")
 
 
 def _set_methods_ramp2(solver):
     """Full second order, standard pressure, no curvature correction."""
-    solver.solution.methods.pressure_velocity_coupling.scheme = "simple"
-    solver.solution.methods.spatial_discretization.pressure = "second-order"
-    solver.solution.methods.spatial_discretization.momentum = "second-order-upwind"
-    solver.solution.methods.spatial_discretization.turbulent_kinetic_energy = "second-order-upwind"
-    solver.solution.methods.spatial_discretization.specific_dissipation_rate = "second-order-upwind"
+    _set_discretization(solver, "simple",              "pressure_velocity_coupling")
+    _set_discretization(solver, "second-order",        "pressure")
+    _set_discretization(solver, "second-order-upwind", "momentum")
+    _set_discretization(solver, "second-order-upwind", "turbulent_kinetic_energy")
+    _set_discretization(solver, "second-order-upwind", "specific_dissipation_rate")
 
 
 # Canonical zone label groups (must match named selections in Discovery)
@@ -410,10 +640,7 @@ def _configure_force_reports(solver, config):
         if not existing:
             log.warning(f"  No zones found for report '{name}': {zones}")
             return
-        solver.solution.report_definitions.lift[name] = {
-            "zones": existing,
-            "force_vector": [0, -1, 0],
-        }
+        _add_report_lift(solver, name, existing, [0, -1, 0])
 
     def safe_add_drag(name, zones):
         existing = [z for z in zones
@@ -421,10 +648,7 @@ def _configure_force_reports(solver, config):
         if not existing:
             log.warning(f"  No zones found for drag report '{name}': {zones}")
             return
-        solver.solution.report_definitions.drag[name] = {
-            "zones": existing,
-            "force_vector": [-1, 0, 0],
-        }
+        _add_report_drag(solver, name, existing, [-1, 0, 0])
 
     # Total car
     safe_add_lift("downforce_total", all_wall_zones)
@@ -448,11 +672,7 @@ def _configure_force_reports(solver, config):
         if not existing:
             log.warning(f"  No zones found for moment report '{name}': {zones}")
             return
-        solver.solution.report_definitions.moment[name] = {
-            "zones":  existing,
-            "moment_center": [0, 0, 0],
-            "moment_axis":   [0, 0, 1],
-        }
+        _add_report_moment(solver, name, existing, [0, 0, 0], [0, 0, 1])
 
     safe_add_moment("moment_fw", _FW_ZONES)
     safe_add_moment("moment_rw", _RW_ZONES)
@@ -496,11 +716,7 @@ def run_solver(config, mesh_file: str,
             progress_cb(msg, pct)
 
     prog("Launching Fluent solver...", 0)
-    solver = pyfluent.launch_fluent(
-        mode="solver",
-        precision="double" if config.double_precision else "single",
-        processor_count=config.num_processes,
-    )
+    solver = _launch_fluent_solver(pyfluent, config)
 
     try:
         # Load mesh
@@ -515,9 +731,7 @@ def run_solver(config, mesh_file: str,
         # Reference values
         prog("Setting reference values...", 5)
         speed_ms = mph_to_ms(config.vehicle_speed_mph)
-        solver.setup.reference_values.compute_from = "inlet"
-        solver.setup.reference_values.velocity = speed_ms
-        solver.setup.reference_values.length = config.car_length_m
+        _compute_reference_values(solver, speed_ms, config.car_length_m)
 
         # Physics - initial (no curvature correction)
         prog("Configuring physics (GEKO k-omega)...", 8)
@@ -536,8 +750,7 @@ def run_solver(config, mesh_file: str,
         prog("Ramp 0: First-order initialization...", 18)
         _set_methods_first_order(solver)
         solver.solution.initialization.hybrid_initialize()
-        solver.solution.run_calculation.iterate(
-            number_of_iterations=config.ramp0_iters
+        _iterate(solver, config.ramp0_iters
         )
         _save_case(solver, config, "ramp0_end")
         prog(f"Ramp 0 done ({config.ramp0_iters} iters).", 35)
@@ -545,8 +758,7 @@ def run_solver(config, mesh_file: str,
         # ── RAMP 1: Second order + Presto ───────────────────────────────
         prog("Ramp 1: Second order + Presto pressure...", 38)
         _set_methods_ramp1(solver)
-        solver.solution.run_calculation.iterate(
-            number_of_iterations=config.ramp1_iters
+        _iterate(solver, config.ramp1_iters
         )
         _save_case(solver, config, "ramp1_end")
         prog(f"Ramp 1 done ({config.ramp1_iters} iters).", 55)
@@ -557,8 +769,7 @@ def run_solver(config, mesh_file: str,
         _apply_geko_physics(solver,
                             curvature_correction=False,
                             production_limiter=config.use_production_limiter)
-        solver.solution.run_calculation.iterate(
-            number_of_iterations=config.ramp2_iters
+        _iterate(solver, config.ramp2_iters
         )
         _save_case(solver, config, "ramp2_end")
         prog(f"Ramp 2 done ({config.ramp2_iters} iters).", 72)
@@ -569,8 +780,7 @@ def run_solver(config, mesh_file: str,
         _apply_geko_physics(solver,
                             curvature_correction=True,
                             production_limiter=config.use_production_limiter)
-        solver.solution.run_calculation.iterate(
-            number_of_iterations=config.ramp3_iters
+        _iterate(solver, config.ramp3_iters
         )
         _save_case(solver, config, "final")
         prog(f"Ramp 3 done ({config.ramp3_iters} iters).", 95)
@@ -597,19 +807,7 @@ def _extract_results(solver, config) -> dict:
     results = {}
 
     def get_val(report_type, name):
-        try:
-            if report_type == "lift":
-                return solver.solution.report_definitions.lift[
-                    name].get_monitor_value()
-            elif report_type == "drag":
-                return solver.solution.report_definitions.drag[
-                    name].get_monitor_value()
-            else:  # moment
-                return solver.solution.report_definitions.moment[
-                    name].get_monitor_value()
-        except Exception as e:
-            log.warning(f"  Could not read report '{name}': {e}")
-            return 0.0
+        return _get_report_value(solver, report_type, name)
 
     # Raw values (half-car: NOT doubled here — exporter handles multiplier)
     results["downforce_fw_lbf"]  = get_val("lift", "downforce_fw")
