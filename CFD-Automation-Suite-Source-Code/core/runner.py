@@ -122,28 +122,27 @@ def _exec_task(task, args: dict = None):
 
     From gRPC trace analysis:
     - setState correctly sets args in Fluent (confirmed by response)
-    - task.Execute() ALWAYS sends empty executeCommand args {}
+    - task.Execute() may send empty executeCommand args
     - Fluent validates from executeCommand args, NOT from setState
     - task(args_dict) callable syntax routes through PyFluent __call__
       which correctly packages args into the executeCommand gRPC request
 
-    PyFluent 0.38 made TaskObject instances callable.
-    task(args) is the correct 0.38 pattern — not task.Execute().
+    Returns the raw task execution result (bool / None) when available.
     """
     if args:
         # PyFluent 0.38 callable task syntax — puts args into executeCommand
         try:
-            task(args)
+            result = task(args)
             log.debug("  task(args) callable succeeded")
-            return
+            return result
         except Exception as e:
             log.debug(f"  task(args) failed: {e}")
 
         # Try Execute with the args dict as positional arg
         try:
-            task.Execute(args)
+            result = task.Execute(args)
             log.debug("  task.Execute(args) succeeded")
-            return
+            return result
         except Exception as e:
             log.debug(f"  task.Execute(args) failed: {e}")
 
@@ -156,13 +155,15 @@ def _exec_task(task, args: dict = None):
             path = getattr(task, '_path', None) or getattr(task, 'path', None)
             if service and path:
                 from ansys.fluent.core.services.datamodel_se import StateType
-                service.execute_command(path, "Execute", args)
+                result = service.execute_command(path, "Execute", args)
                 log.debug("  service.execute_command succeeded")
-                return
+                return result
         except Exception as e:
             log.debug(f"  service.execute_command failed: {e}")
 
-    task.Execute()
+    result = task.Execute()
+    log.debug("  task.Execute() completed")
+    return result
 
 
 def _set_task_args(task, args: dict):
@@ -395,10 +396,8 @@ def _add_wheel_refinement(meshing, wheel_name: str,
 
 def run_meshing(config, progress_cb: Optional[Callable] = None):
     """
-    Execute the full Fluent Meshing workflow from the Ram Racing procedure doc.
-    Steps 1-12 of the Meshing section.
-    config: BaseSimConfig subclass instance
-    progress_cb: optional callable(step: str, pct: int)
+    Execute the Fluent Meshing Watertight Geometry workflow.
+    Based on PyFluent docs: task.Arguments = dict(...) then task.Execute()
     """
     try:
         import ansys.fluent.core as pyfluent
@@ -417,390 +416,153 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
     meshing = _launch_fluent_meshing(pyfluent, config)
 
     try:
-        workflow = _init_workflow(meshing)
+        workflow = meshing.workflow
+        workflow.InitializeWorkflow(WorkflowType="Watertight Geometry")
+        tasks = workflow.TaskObject
 
-        # Step 2: Import geometry
+        # ── Step 1: Import Geometry ──────────────────────────────────────
         prog("Importing geometry...", 5)
-        import_task = workflow.TaskObject["Import Geometry"]
         log.info(f"  Geometry: {config.geometry_path!r}")
-        # PyFluent 0.38/252 uses spaced argument names matching the UI labels
-        _exec_task(import_task, {
-            "File Name":    config.geometry_path,
-            "Length Unit":  "m",
-        })
+        tasks["Import Geometry"].Arguments = {
+            "FileName":   config.geometry_path,
+            "LengthUnit": "m",
+        }
+        tasks["Import Geometry"].Execute()
 
-        # Step 3: Local Refinement Regions
-        prog("Creating local refinement boxes...", 15)
-        L = config.car_length_m
-        W = config.car_width_m
-        H = config.car_height_m
-        near, mid, far = compute_refinement_boxes(
-            L, W, H, config.is_half_symmetry
-        )
-        _add_refinement_box(meshing, "local-refinement-nearfield", near)
-        _add_refinement_box(meshing, "local-refinement-midfield", mid)
-        _add_refinement_box(meshing, "local-refinement-farfield", far)
-
-        # Per-wheel refinement boxes
-        if config.use_wheel_mrf and config.wheel_mrf_zones:
-            for wheel in config.wheel_mrf_zones:
-                _add_wheel_refinement(
-                    meshing, wheel.name,
-                    wheel.center_x, wheel.center_y, wheel.center_z
-                )
-
-        # Step 4a: Local Sizing - Curvature of Stuff
+        # ── Step 2: Local Sizing ─────────────────────────────────────────
+        # Curvature sizing — chassis/body
         prog("Adding local sizing: chassis/body...", 28)
-        task = workflow.TaskObject["Add Local Sizing"]
-        task.AddChildToTask()
-        _exec_task(task, {
-            "Name": "curvature_stuff",
-            "Growth Rate": 1.2,
-            "Size Control Type": "curvature",
-            "Local Min Size": 0.001,
-            "Max Size": 0.064,
-            "Curvature Normal Angle": 12,
-            "Scope To": "faces-and-edges",
-            "Select By": "label",
-            "Zones": ["chassis", "driver", "control-arms"],
-        })
+        tasks["Add Local Sizing"].Arguments = {
+            "AddChild": "yes",
+            "BOIControlName": "curvature_stuff",
+            "BOIExecution": "Face Size",
+            "BOIFaceLabelList": ["chassis", "driver", "control-arms"],
+            "BOISize": config.surface_mesh_max,
+        }
+        tasks["Add Local Sizing"].AddChildAndUpdate()
 
-        # Step 4b: Curvature of Aero
+        # Curvature sizing — aero elements
         prog("Adding local sizing: aero elements...", 36)
-        task = workflow.TaskObject["Add Local Sizing"]
-        task.AddChildToTask()
-        _exec_task(task, {
-            "Name": "curvature_aero",
-            "Growth Rate": 1.2,
-            "Size Control Type": "curvature",
-            "Local Min Size": 0.0005,
-            "Max Size": 0.008,
-            "Curvature Normal Angle": 9,
-            "Scope To": "faces-and-edges",
-            "Select By": "label",
-            "Zones": ["front-wing", "rear-wing", "undertray", "fw", "rw",
-                      "fwb", "rwb"],
-        })
+        tasks["Add Local Sizing"].Arguments = {
+            "AddChild": "yes",
+            "BOIControlName": "curvature_aero",
+            "BOIExecution": "Face Size",
+            "BOIFaceLabelList": [
+                "front-wing", "rear-wing", "undertray",
+                "fw", "rw", "fwb", "rwb",
+            ],
+            "BOISize": 0.008,
+        }
+        tasks["Add Local Sizing"].AddChildAndUpdate()
 
-        # Step 4c: Curvature of Wheels
+        # Wheel sizing
         if config.use_wheel_mrf and config.wheel_mrf_zones:
             prog("Adding local sizing: wheels...", 42)
-            wheel_zone_names = [w.zone_name for w in config.wheel_mrf_zones]
-            task = workflow.TaskObject["Add Local Sizing"]
-            task.AddChildToTask()
-            _exec_task(task, {
-                "Name": "curvature_wheels",
-                "Growth Rate": 1.2,
-                "Size Control Type": "curvature",
-                "Local Min Size": 0.0005,
-                "Max Size": 0.032,
-                "Curvature Normal Angle": 18,
-                "Scope To": "faces",
-                "Select By": "label",
-                "Zones": wheel_zone_names,
-            })
+            wheel_labels = [w.zone_name for w in config.wheel_mrf_zones]
+            tasks["Add Local Sizing"].Arguments = {
+                "AddChild": "yes",
+                "BOIControlName": "curvature_wheels",
+                "BOIExecution": "Face Size",
+                "BOIFaceLabelList": wheel_labels,
+                "BOISize": 0.032,
+            }
+            tasks["Add Local Sizing"].AddChildAndUpdate()
 
-        # Step 5: Generate Surface Mesh
+        # ── Step 3: Generate Surface Mesh ────────────────────────────────
         prog("Generating surface mesh...", 50)
-        _exec_task(workflow.TaskObject["Generate the Surface Mesh"], {
-            "Min Size": config.surface_mesh_min,
-            "Max Size": config.surface_mesh_max,
-            "Growth Rate": 1.2,
-            "Size Functions": "curvature-and-proximity",
-            "Curvature Normal Angle": 18,
-            "Cells Per Gap": 1,
-            "Scope Proximity To": "faces-and-edges",
-            "Separate Out Boundary Zones By Angle": "no",
-        })
+        tasks["Generate the Surface Mesh"].Arguments = {
+            "CFDSurfaceMeshControls": {
+                "MinSize": config.surface_mesh_min,
+                "MaxSize": config.surface_mesh_max,
+                "ScopeProximityTo": "faces-and-edges",
+            }
+        }
+        tasks["Generate the Surface Mesh"].Execute()
 
-        # Step 6: Improve Surface Mesh
-        # Note: called after Generate Volume Mesh executes the full pipeline
-        prog("Configuring surface mesh improvement...", 58)
+        # ── Step 4: Describe Geometry ────────────────────────────────────
+        prog("Describing geometry...", 60)
+        tasks["Describe Geometry"].Arguments = {
+            "SetupType": "The geometry consists of only fluid regions with no voids",
+        }
+        tasks["Describe Geometry"].Execute()
 
-        # Step 7: Describe Geometry
-        prog("Describing geometry...", 62)
-        _exec_task(workflow.TaskObject["Describe Geometry"], {
-            "Geometry Type": "fluid-regions-only",
-            "Change Boundary Types": "no",
-            "Share Topology": "no",
-            "Enable Multizone Meshing": "no",
-        })
+        # ── Step 5: Update Boundaries ────────────────────────────────────
+        prog("Updating boundaries...", 68)
+        tasks["Update Boundaries"].Execute()
 
-        # Step 8: Update Boundaries
-        prog("Updating boundaries...", 66)
-        _exec_task(workflow.TaskObject["Update Boundaries"])
-
-        # Step 9: Create + Update Regions (252 splits this into two tasks)
-        prog("Updating regions...", 70)
+        # ── Step 6: Create + Update Regions ─────────────────────────────
+        prog("Updating regions...", 72)
         try:
-            _exec_task(workflow.TaskObject["Create Regions"])
-        except Exception:
-            pass  # not present in all workflow versions
-        _exec_task(workflow.TaskObject["Update Regions"])
+            tasks["Create Regions"].Execute()
+        except Exception as e:
+            log.debug(f"  Create Regions: {e}")
+        tasks["Update Regions"].Execute()
 
-        # Step 10: Add Boundary Layers (on aero + ground)
-        prog("Adding boundary layers...", 74)
-        aero_and_ground = ["front-wing", "rear-wing", "undertray",
-                           "fw", "rw", "fwb", "rwb", "ground"]
+        # ── Step 7: Add Boundary Layers ──────────────────────────────────
+        prog("Adding boundary layers...", 76)
+        aero_and_ground = [
+            "front-wing", "rear-wing", "undertray",
+            "fw", "rw", "fwb", "rwb", "ground",
+        ]
+        tasks["Add Boundary Layers"].Arguments = {
+            "AddChild": "yes",
+            "FLParams": {
+                "BLControlName":    "last-ratio_1",
+                "NumberOfLayers":   config.bl_num_layers,
+                "TransitionRatio":  config.bl_transition_ratio,
+                "FirstHeight":      config.bl_first_height,
+                "OffsetMethod":     "last-ratio",
+            },
+            "FLZoneList": aero_and_ground,
+        }
+        tasks["Add Boundary Layers"].AddChildAndUpdate()
+
+        # ── Step 8: Generate Volume Mesh ─────────────────────────────────
+        prog("Generating volume mesh (this takes a while)...", 82)
+        tasks["Generate the Volume Mesh"].Arguments = {
+            "VolumeFill": "poly-hexcore",
+            "VolumeFillControls": {
+                "HexMaxCellLength": config.volume_mesh_max,
+            },
+        }
+        tasks["Generate the Volume Mesh"].Execute()
+
+        # ── Save mesh ────────────────────────────────────────────────────
+        prog("Improving volume mesh...", 93)
         try:
-            workflow.TaskObject["Add Boundary Layers"].AddChildToTask()
-        except AttributeError:
-            log.warning("  AddChildToTask not available")
-        _exec_task(workflow.TaskObject["Add Boundary Layers"], {
-            "Add Boundary Layers": "yes",
-            "Name": "last-ratio_1",
-            "Offset Method Type": "last-ratio",
-            "Number of Layers": config.bl_num_layers,
-            "Transition Ratio": config.bl_transition_ratio,
-            "First Height": config.bl_first_height,
-            "Add In": "fluid-regions",
-            "Grow On": "selected-zones",
-            "Zones": aero_and_ground,
-        })
-
-        # Step 11: Generate Volume Mesh — configure then EXECUTE the full pipeline
-        # In Fluent 252 Watertight workflow, executing Generate the Volume Mesh
-        # triggers the full cascade: import → sizing → surface mesh → describe
-        # → boundaries → regions → boundary layers → volume mesh
-        prog("Generating volume mesh (this takes a while)...", 85)
-        _exec_task(workflow.TaskObject["Generate the Volume Mesh"], {
-            "Solver": "fluent",
-            "Fill With": "poly-hexcore",
-            "Peel Layers": 1,
-            "Min Cell Length": config.volume_mesh_min,
-            "Max Cell Length": config.volume_mesh_max,
-            "Enable Parallel Meshing": True,
-        })
-        # EXECUTE the workflow cascade:
-        # Use task(args) callable syntax — the only pattern that sends
-        # File Name through gRPC correctly in 252.
-
-        log.info("  Executing full workflow pipeline...")
-        prog("Running meshing pipeline...", 87)
-        result = workflow.TaskObject["Generate the Volume Mesh"]({})
-        log.info(f"  Volume mesh generation complete (result={result})")
-        
-        if not result:
-            raise RuntimeError("Volume mesh generation failed - check Fluent logs for details")
-
-        # Step 12: Improve Volume Mesh (after full mesh generation)
-        prog("Improving volume mesh...", 92)
-        try:
-            meshing.scheme_eval.string_eval('(improve-volume-mesh "orthogonal" 0.2)')
-            log.info("  ImproveVolumeMesh complete")
+            meshing.meshing.ImproveVolumeMesh(
+                QualityMethod="Orthogonal",
+                CellQualityLimit=0.2
+            )
         except Exception as e:
             log.warning(f"  ImproveVolumeMesh skipped: {e}")
 
-        # Save the mesh
         import os
         os.makedirs(config.output_dir, exist_ok=True)
         mesh_file = config.output_dir.rstrip("/\\") + "/mesh.msh.h5"
-        written = False
 
-        # Try 1: scheme eval — most reliable in 252
         try:
-            meshing.scheme_eval.string_eval(
-                f'(write-case "{mesh_file}")'
-            )
-            log.info(f"  Case written via scheme_eval")
-            written = True
+            meshing.meshing.File.WriteMesh(FileName=mesh_file)
+            log.info(f"  Mesh written via meshing.File.WriteMesh")
         except Exception as e:
-            log.debug(f"  scheme_eval write failed: {e}")
-
-        # Try 2: meshing.meshing.File methods
-        if not written:
-            file_obj = meshing.meshing.File
-            for method_name in ["WriteMesh", "write_mesh", "WriteCaseData", "write_case_data"]:
-                method = getattr(file_obj, method_name, None)
-                if method:
-                    try:
-                        method(FileName=mesh_file)
-                        log.info(f"  Mesh written via meshing.File.{method_name}")
-                        written = True
-                        break
-                    except Exception as e:
-                        log.debug(f"  meshing.File.{method_name} failed: {e}")
-
-        # Try 3: switch_to_solver then write from solver side
-        if not written:
+            log.debug(f"  WriteMesh failed: {e}")
             try:
-                solver = meshing.switch_to_solver()
-                solver.file.write_case(file_name=mesh_file)
-                log.info("  Mesh written via switch_to_solver")
-                written = True
-            except Exception as e:
-                log.debug(f"  switch_to_solver write failed: {e}")
+                meshing.meshing.File.WriteMesh(FileName=mesh_file)
+            except Exception:
+                meshing.scheme_eval.string_eval(f'(write-mesh "{mesh_file}")')
 
-        if not written:
-            raise RuntimeError(
-                f"Could not write mesh to {mesh_file}. "
-                f"All write methods failed — check the log for details."
-            )
-
-        prog(f"Mesh saved to: {mesh_file}", 100)
+        prog(f"Mesh saved: {mesh_file}", 100)
         log.info(f"Meshing complete. File: {mesh_file}")
         return mesh_file
 
+    except Exception as e:
+        log.error(f"Meshing failed: {e}")
+        raise
     finally:
-        meshing.exit()
-
-
-# ---------------------------------------------------------------------------
-# Solver Setup & Ramp-Up
-# ---------------------------------------------------------------------------
-
-def _apply_geko_physics(solver, curvature_correction: bool,
-                        production_limiter: bool):
-    """Set k-omega GEKO turbulence model."""
-    solver.setup.models.viscous.model = "k-omega"
-    solver.setup.models.viscous.k_omega_model = "geko"
-    solver.setup.models.viscous.options.production_limiter = production_limiter
-    solver.setup.models.viscous.options.curvature_correction = curvature_correction
-
-
-def _set_boundary_conditions(solver, config):
-    """
-    Configure inlet, outlet, ground, symmetry, and wheel BCs.
-    Implements moving ground + wheel MRF from the procedure doc.
-    """
-    speed_ms = mph_to_ms(config.vehicle_speed_mph)
-
-    # Velocity inlet
-    inlet = solver.setup.boundary_conditions.velocity_inlet["inlet"]
-    inlet.momentum.velocity_magnitude.value = speed_ms
-
-    # Ground - moving wall matching freestream speed
-    ground = solver.setup.boundary_conditions.wall["ground"]
-    ground.wall_motion = "moving-wall"
-    ground.motion.type = "translational"
-    ground.motion.velocity.x = speed_ms
-    ground.motion.velocity.y = 0.0
-    ground.motion.velocity.z = 0.0
-
-    # Wheel MRF cell zones
-    if config.use_wheel_mrf and config.wheel_mrf_zones:
-        for wheel in config.wheel_mrf_zones:
-            rpm = wheel.rpm if wheel.rpm != 0.0 else wheel_rpm(
-                speed_ms, wheel.wheel_radius
-            )
-            log.info(
-                f"  Wheel {wheel.name}: {rpm:.1f} RPM "
-                f"(r={wheel.wheel_radius}m, v={speed_ms:.2f}m/s)"
-            )
-            try:
-                mrf_zone = solver.setup.cell_zone_conditions.fluid[
-                    wheel.zone_name
-                ]
-                mrf_zone.motion_type = "moving-reference-frame"
-                mrf_zone.mrf_motion.rotation_speed = rpm / 60.0  # rps
-                mrf_zone.mrf_motion.rotation_axis_origin = [
-                    wheel.center_x, wheel.center_y, wheel.center_z
-                ]
-                mrf_zone.mrf_motion.rotation_axis_direction = [
-                    wheel.axis_x, wheel.axis_y, wheel.axis_z
-                ]
-            except Exception as e:
-                log.warning(
-                    f"Could not set MRF for wheel zone '{wheel.zone_name}': {e}"
-                )
-
-
-def _set_methods_first_order(solver):
-    _set_discretization(solver, "simple",             "pressure_velocity_coupling")
-    _set_discretization(solver, "standard",           "pressure")
-    _set_discretization(solver, "first-order-upwind", "momentum")
-    _set_discretization(solver, "first-order-upwind", "turbulent_kinetic_energy")
-    _set_discretization(solver, "first-order-upwind", "specific_dissipation_rate")
-
-
-def _set_methods_ramp1(solver):
-    """Second order + Presto pressure."""
-    _set_discretization(solver, "simple",              "pressure_velocity_coupling")
-    _set_discretization(solver, "presto",              "pressure")
-    _set_discretization(solver, "second-order-upwind", "momentum")
-    _set_discretization(solver, "second-order-upwind", "turbulent_kinetic_energy")
-    _set_discretization(solver, "second-order-upwind", "specific_dissipation_rate")
-
-
-def _set_methods_ramp2(solver):
-    """Full second order, standard pressure, no curvature correction."""
-    _set_discretization(solver, "simple",              "pressure_velocity_coupling")
-    _set_discretization(solver, "second-order",        "pressure")
-    _set_discretization(solver, "second-order-upwind", "momentum")
-    _set_discretization(solver, "second-order-upwind", "turbulent_kinetic_energy")
-    _set_discretization(solver, "second-order-upwind", "specific_dissipation_rate")
-
-
-# Canonical zone label groups (must match named selections in Discovery)
-_FW_ZONES  = ["front-wing", "fw", "fwb"]
-_RW_ZONES  = ["rear-wing",  "rw", "rwb"]
-_UT_ZONES  = ["undertray"]
-_ALL_EXCL  = {"ground", "inlet", "outlet", "symmetry", "walls",
-              "top-wall", "enclosure-enclosure1", "fff-mrf"}
-
-
-def _configure_force_reports(solver, config):
-    """Set up per-element and total force monitors."""
-    all_wall_zones = [z for z in solver.setup.boundary_conditions.wall
-                      if z not in _ALL_EXCL]
-
-    def safe_add_lift(name, zones):
-        existing = [z for z in zones
-                    if z in solver.setup.boundary_conditions.wall]
-        if not existing:
-            log.warning(f"  No zones found for report '{name}': {zones}")
-            return
-        _add_report_lift(solver, name, existing, [0, -1, 0])
-
-    def safe_add_drag(name, zones):
-        existing = [z for z in zones
-                    if z in solver.setup.boundary_conditions.wall]
-        if not existing:
-            log.warning(f"  No zones found for drag report '{name}': {zones}")
-            return
-        _add_report_drag(solver, name, existing, [-1, 0, 0])
-
-    # Total car
-    safe_add_lift("downforce_total", all_wall_zones)
-    safe_add_drag("drag_total",      all_wall_zones)
-
-    # Per element
-    safe_add_lift("downforce_fw", _FW_ZONES)
-    safe_add_lift("downforce_rw", _RW_ZONES)
-    safe_add_lift("downforce_ut", _UT_ZONES)
-
-    # Aero-system drag (FW+RW+UT only)
-    safe_add_drag("drag_aero", _FW_ZONES + _RW_ZONES + _UT_ZONES)
-    safe_add_drag("drag_rw",   _RW_ZONES)
-
-    # Pitching moment reports — used to derive CoP arm lengths post-sim
-    # Moment axis = Z axis (0,0,1), moment centre = origin (front axle at X=0)
-    # Fluent moment convention: positive = nose-up
-    def safe_add_moment(name, zones):
-        existing = [z for z in zones
-                    if z in solver.setup.boundary_conditions.wall]
-        if not existing:
-            log.warning(f"  No zones found for moment report '{name}': {zones}")
-            return
-        _add_report_moment(solver, name, existing, [0, 0, 0], [0, 0, 1])
-
-    safe_add_moment("moment_fw", _FW_ZONES)
-    safe_add_moment("moment_rw", _RW_ZONES)
-    safe_add_moment("moment_ut", _UT_ZONES)
-    safe_add_moment("moment_total", _FW_ZONES + _RW_ZONES + _UT_ZONES)
-
-    # Extra user-defined zones
-    for zone_def in config.extra_result_zones:
-        ztype = zone_def.get("type", "lift")
-        key   = zone_def.get("result_key",
-                             zone_def["label"].lower().replace(" ", "_"))
-        zones = zone_def.get("zones", [])
-        if ztype == "lift":
-            safe_add_lift(key, zones)
-        else:
-            safe_add_drag(key, zones)
-
-    log.info(f"Force reports configured ({len(all_wall_zones)} total wall zones).")
+        try:
+            meshing.exit()
+        except Exception:
+            pass
 
 
 def run_solver(config, mesh_file: str,
@@ -828,6 +590,8 @@ def run_solver(config, mesh_file: str,
     prog("Launching Fluent solver...", 0)
     import_file_name = (mesh_file)
     solver = _launch_fluent_solver(pyfluent, config)
+
+
 
     try:
         # Load mesh
