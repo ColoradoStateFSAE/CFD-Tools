@@ -475,7 +475,10 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
                 "MinSize": config.surface_mesh_min,
                 "MaxSize": config.surface_mesh_max,
                 "ScopeProximityTo": "faces-and-edges",
-            }
+            },
+            "SurfaceMeshPreferences": {
+                "SmoothFoldedFacesLimit": 100,
+            },
         }
         tasks["Generate the Surface Mesh"].Execute()
 
