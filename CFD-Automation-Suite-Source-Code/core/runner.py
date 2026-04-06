@@ -480,12 +480,21 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
                 "SmoothFoldedFacesLimit": 100,
             },
         }
+        # Enable smooth-folded-faces via TUI before executing surface mesh
+        # This allows Fluent to repair self-intersecting faces automatically
+        try:
+            meshing.tui.objects.wrap.set.use_smooth_folded_faces("yes")
+            log.info("  use_smooth_folded_faces enabled")
+        except Exception as e:
+            log.debug(f"  use_smooth_folded_faces TUI call skipped: {e}")
         tasks["Generate the Surface Mesh"].Execute()
 
         # ── Step 4: Describe Geometry ────────────────────────────────────
         prog("Describing geometry...", 60)
         tasks["Describe Geometry"].Arguments = {
             "SetupType": "The geometry consists of only fluid regions with no voids",
+            "WallToInternal": "No",
+            "InvokeShareTopology": "No",
         }
         tasks["Describe Geometry"].Execute()
 
@@ -499,6 +508,34 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
             tasks["Create Regions"].Execute()
         except Exception as e:
             log.debug(f"  Create Regions: {e}")
+
+        # Assign region types before Update Regions:
+        # Any region whose name contains "enclosure" is fluid (poly-hexcore).
+        # Everything else (car body volumes etc.) is solid (none = skip meshing).
+        try:
+            import re as _re
+            gs = meshing.meshing.GlobalSettings
+            all_regions = list(gs.FTMRegionData.AllRegionNameList.get_state())
+            if all_regions:
+                types  = []
+                fills  = []
+                for r in all_regions:
+                    if "enclosure" in r.lower():
+                        types.append("fluid")
+                        fills.append("poly-hexcore")
+                    else:
+                        types.append("solid")
+                        fills.append("none")
+                log.info(f"  Regions: {list(zip(all_regions, types))}")
+                tasks["Update Regions"].Arguments = {
+                    "AllRegionNameList":       all_regions,
+                    "AllRegionTypeList":       types,
+                    "AllRegionVolumeFillList": fills,
+                }
+            else:
+                log.debug("  No region list available, letting Fluent auto-assign")
+        except Exception as e:
+            log.debug(f"  Update Regions args: {e}")
         tasks["Update Regions"].Execute()
 
         # ── Step 7: Add Boundary Layers ──────────────────────────────────
