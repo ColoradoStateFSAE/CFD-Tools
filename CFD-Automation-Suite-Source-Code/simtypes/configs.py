@@ -42,8 +42,8 @@ class BaseSimConfig:
     use_curvature_correction: bool = False    # off until final ramp-up
     use_production_limiter: bool = True
     double_precision: bool = True
-    num_processes: int = 40
-    mpi_type: str = "openmpi"                # openmpi, intel, default
+    num_processes: int = 70
+    mpi_type: str = "default"                # openmpi, intel, default
 
     # Mesh sizing
     surface_mesh_min: float = 0.002          # [m]
@@ -57,10 +57,10 @@ class BaseSimConfig:
     bl_transition_ratio: float = 0.272
 
     # Ramp-up iterations
-    ramp0_iters: int = 200    # Initial first-order run
-    ramp1_iters: int = 300    # Second order + Presto pressure
-    ramp2_iters: int = 300    # Full second order no curvature correction
-    ramp3_iters: int = 500    # Full send (with curvature correction)
+    ramp0_iters: int = 1000    # Initial first-order run
+    ramp1_iters: int = 1000    # Second order + Presto pressure
+    ramp2_iters: int = 1000    # Full second order no curvature correction
+    ramp3_iters: int = 5000    # Full send (with curvature correction)
 
     # Car geometry reference (for refinement box sizing)
     car_length_m: float = 2.8    # L - x axis
@@ -77,7 +77,7 @@ class BaseSimConfig:
 
     # Fluent launch timeout [seconds] — increase for slow HPC startup
     # 60s is the PyFluent default; 300s recommended for cluster machines
-    launch_timeout: int = 300
+    launch_timeout: int = 65
 
     # Extra custom result fields user can define (expandable)
     # Each entry: {"label": str, "zone": str, "type": "lift"|"drag"}
