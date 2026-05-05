@@ -161,6 +161,16 @@ class SimEditorDialog(QDialog):
         )
         form.addRow("Processes:", self.sb_procs)
 
+        self.sb_timeout = QSpinBox()
+        self.sb_timeout.setRange(60, 1800)
+        self.sb_timeout.setSingleStep(30)
+        self.sb_timeout.setSuffix(" s")
+        self.sb_timeout.setToolTip(
+            "How long to wait for Fluent to start before giving up. "
+            "Increase to 300-600s on slow HPC cluster machines."
+        )
+        form.addRow("Launch Timeout:", self.sb_timeout)
+
         self.cb_mpi = QComboBox()
         self.cb_mpi.addItems(MPI_OPTIONS)
         self.cb_mpi.setToolTip(
@@ -450,6 +460,7 @@ class SimEditorDialog(QDialog):
         self.e_output.setText(c.output_dir)
         self.e_results.setText(c.results_dir)
         self.sb_procs.setValue(c.num_processes)
+        self.sb_timeout.setValue(c.launch_timeout)
         self.cb_mpi.setCurrentText(c.mpi_type)
         self.chk_double.setChecked(c.double_precision)
         self.sb_cl.setValue(c.car_length_m)
@@ -484,6 +495,7 @@ class SimEditorDialog(QDialog):
         c.output_dir        = self.e_output.text().strip()
         c.results_dir       = self.e_results.text().strip()
         c.num_processes     = self.sb_procs.value()
+        c.launch_timeout    = self.sb_timeout.value()
         c.mpi_type          = self.cb_mpi.currentText()
         c.double_precision  = self.chk_double.isChecked()
         c.car_length_m      = self.sb_cl.value()
