@@ -52,7 +52,7 @@ class BaseSimConfig:
     volume_mesh_max: float = 0.256           # [m]
 
     # Boundary layer
-    bl_num_layers: int = 6
+    bl_num_layers: int = 8
     bl_first_height: float = 0.0005          # [m]
     bl_transition_ratio: float = 0.272
 
