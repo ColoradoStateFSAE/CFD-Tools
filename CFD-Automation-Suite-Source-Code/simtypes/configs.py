@@ -63,7 +63,7 @@ class BaseSimConfig:
     ramp3_iters: int = 5000    # Full send (with curvature correction)
 
     # Car geometry reference (for refinement box sizing)
-    car_length_m: float = 3.1    # L - x axis
+    car_length_m: float = 2.8    # L - x axis
     car_width_m: float = 1.4     # W - z axis
     car_height_m: float = 1.2    # H - y axis
 
