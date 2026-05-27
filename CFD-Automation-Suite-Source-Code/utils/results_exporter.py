@@ -75,7 +75,7 @@ def _derive_cop(raw, wheelbase_in):
     lu_derived = abs(Mu / Fu) if Fu != 0 else 0.0
 
     f_res = math.sqrt(Fx ** 2 + Fy ** 2)
-    theta = 180 - (math.degrees(math.atan2(Fy, Fx)) + 90) if Fx != 0 else 90.0
+    theta = 180 - (math.degrees(math.atan2(Fy, Fx)) + 90)
 
     return {
         "x_cp":        x_cp,
@@ -92,10 +92,15 @@ def _derive_cop(raw, wheelbase_in):
     }
 
 
-def export_results(config, raw_results, frontal_area_m2=None):
+def export_results(config, raw_results, frontal_area_m2=None,
+                   mesh_quality: Optional[dict] = None):
     """
     Compute all derived metrics and write the results .txt file.
     Returns the path to the written file.
+
+    mesh_quality: dict returned by _extract_mesh_quality() in runner.py.
+                  When provided, a MESH QUALITY section is written before
+                  the aerodynamic results.
     """
     mult = 2.0 if config.is_half_symmetry else 1.0
 
@@ -151,6 +156,51 @@ def export_results(config, raw_results, frontal_area_m2=None):
         f"  Exported    : {now}",
         f"  Geometry    : {os.path.basename(config.geometry_path)}",
         "",
+    ]
+
+    # ── Mesh quality section ─────────────────────────────────────────────
+    mq = mesh_quality or {}
+    oq_min   = mq.get("oq_min",  0.0)
+    oq_max   = mq.get("oq_max",  0.0)
+    oq_mean  = mq.get("oq_mean", 0.0)
+    oq_note  = mq.get("oq_note", "Not available")
+    oq_cells = mq.get("oq_total_cells", 0)
+    oq_bands = mq.get("oq_bands", [])
+    oq_p01   = mq.get("oq_pct_below_01", 0.0) * 100
+    oq_p02   = mq.get("oq_pct_below_02", 0.0) * 100
+
+    lines += [
+        sep,
+        "  MESH QUALITY  (orthogonal quality, post-improvement)",
+        sep,
+        f"  {'Verdict':<32} {oq_note}",
+        f"  {'Min Orthogonal Quality':<32} {oq_min:>10.4f}",
+        f"  {'Mean Orthogonal Quality':<32} {oq_mean:>10.4f}",
+        f"  {'Max Orthogonal Quality':<32} {oq_max:>10.4f}",
+        f"  {'Total Cell Count':<32} {oq_cells:>10,}",
+        f"  {'Cells below OQ 0.10 (approx)':<32} {oq_p01:>9.2f} %",
+        f"  {'Cells below OQ 0.20 (approx)':<32} {oq_p02:>9.2f} %",
+    ]
+
+    if oq_bands:
+        lines += ["", "  Orthogonal quality distribution (approx):"]
+        for band in oq_bands:
+            bar_width = 20
+            filled    = int(round(band["pct"] / 100 * bar_width))
+            bar       = "█" * filled + "░" * (bar_width - filled)
+            lines.append(
+                f"  {band['label']:<28} [{bar}] {band['pct']:5.1f}%"
+                + (f"  (~{band['count']:,} cells)" if band["count"] > 0 else "")
+            )
+
+    lines += [
+        "",
+        "  Target: min orthogonal quality > 0.10 (ideally > 0.20).",
+        "  Band percentages are approximate (derived from min/mean statistics).",
+        "",
+    ]
+
+    lines += [
         sep,
         f"  DOWNFORCE (lbf){half}",
         sep,

@@ -207,16 +207,8 @@ class RamRacingCFDWindow(QMainWindow):
         h_layout = QHBoxLayout(header)
         h_layout.setContentsMargins(20, 0, 20, 0)
 
-        import os
-        from PyQt6.QtGui import QPixmap
-
-        def _resource_path(relative):
-            import sys
-            if hasattr(sys, '_MEIPASS'):
-                return os.path.join(sys._MEIPASS, relative)
-            return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative)
-
-        icon_path = _resource_path(os.path.join("assets", "logo.png"))
+        from utils.resource_path import resource_path
+        icon_path = resource_path(os.path.join("assets", "logo.png"))
 
         logo = QLabel("Ram Racing  |  CFD Automation")
         logo.setStyleSheet(
@@ -226,7 +218,7 @@ class RamRacingCFDWindow(QMainWindow):
         h_layout.addWidget(logo)
         h_layout.addStretch()
 
-        sub = QLabel("Fluent 2025R2  •  PyFluent  •  PyQt6")
+        sub = QLabel("Fluent 2025R2  •  PyFluent 0.38  •  PyQt6")
         sub.setStyleSheet("color: #abb2bf; background: transparent; font-size: 9pt;")
         h_layout.addWidget(sub)
         root.addWidget(header)
@@ -413,6 +405,12 @@ class RamRacingCFDWindow(QMainWindow):
             return
         config_cls = SIM_TYPE_REGISTRY[chooser.chosen_type]
         config = config_cls()
+        # Apply any user-saved global defaults (File → Car Settings)
+        try:
+            from gui.settings_dialog import apply_defaults_to_config
+            apply_defaults_to_config(config)
+        except Exception:
+            pass
         self._open_editor(config, new=True)
 
     def _edit_job(self):
@@ -482,7 +480,7 @@ class RamRacingCFDWindow(QMainWindow):
             "About",
             "<b>Ram Racing CFD Automation Tool</b><br>"
             "Aerodynamic Subteam<br><br>"
-            "Built on PyFluent (Ansys Fluent 2024R2)<br>"
+            "Built on PyFluent (Ansys Fluent 2025R2 / v252)<br>"
             "GUI: PyQt6<br><br>"
             "Based on Ram Racing Fluent Procedure documentation."
         )
@@ -591,15 +589,42 @@ class RamRacingCFDWindow(QMainWindow):
         mult = 2.0 if job.config.is_half_symmetry else 1.0
         if job.status == JobStatus.DONE and job.results:
             r = job.results
+            # Per-element values are raw (pre-multiplier); apply mult for display.
+            # Total fields (downforce_lbf, drag_lbf) are already doubled in runner.
+            fw  = r.get('downforce_fw_lbf', 0) * mult
+            rw  = r.get('downforce_rw_lbf', 0) * mult
+            ut  = r.get('downforce_ut_lbf', 0) * mult
+            # Use the pre-computed total so it always equals sum of parts.
+            total_df   = r.get('downforce_lbf',  fw + rw + ut)
+            total_drag = r.get('drag_lbf',        0)
+            aero_drag  = r.get('drag_aero_lbf',   0) * mult
             lines = [
-                f"Front Wing Df  : {r.get('downforce_fw_lbf', 0) * mult:>8.2f} lbf",
-                f"Rear Wing Df   : {r.get('downforce_rw_lbf', 0) * mult:>8.2f} lbf",
-                f"Undertray Df   : {r.get('downforce_ut_lbf', 0) * mult:>8.2f} lbf",
-                f"Total Df       : {r.get('downforce_lbf', 0):>8.2f} lbf",
-                f"Total Drag     : {r.get('drag_lbf', 0):>8.2f} lbf",
-                f"Aero Drag      : {r.get('drag_aero_lbf', 0) * mult:>8.2f} lbf",
+                f"Front Wing Df  : {fw:>8.2f} lbf",
+                f"Rear Wing Df   : {rw:>8.2f} lbf",
+                f"Undertray Df   : {ut:>8.2f} lbf",
+                f"Total Df       : {total_df:>8.2f} lbf",
+                f"Total Drag     : {total_drag:>8.2f} lbf",
+                f"Aero Drag      : {aero_drag:>8.2f} lbf",
                 f"L/D Ratio      : {r.get('ld_ratio', 0):>8.3f}",
             ]
+
+            # Mesh quality summary
+            mq = r.get("mesh_quality", {})
+            if mq:
+                oq_min  = mq.get("oq_min",  0.0)
+                oq_mean = mq.get("oq_mean", 0.0)
+                oq_note = mq.get("oq_note", "N/A")
+                passed  = mq.get("oq_pass", False)
+                verdict = "✔ PASS" if passed else "✘ CHECK"
+                lines += [
+                    "",
+                    "── Mesh Quality ──────────────────",
+                    f"Verdict        : {verdict}",
+                    f"Min OQ         : {oq_min:>8.4f}",
+                    f"Mean OQ        : {oq_mean:>8.4f}",
+                    f"Note           : {oq_note}",
+                ]
+
             if "note" in r:
                 lines += ["", r["note"]]
             if "result_file" in r:

@@ -1,3 +1,15 @@
+# Ram Racing CFD Automation Tool — Python dependencies
+# Install order matters on Windows — install pandas before ansys-fluent-core
+# to avoid Meson/vswhere compilation errors:
+#   pip install pandas --only-binary=:all:
+#   pip install ansys-fluent-core
+
 PyQt6>=6.6.0
-ansys-fluent-core>=0.20.0
-reportlab>=4.0.0
+
+# pandas must be installed before ansys-fluent-core (it is a transitive dep).
+# Use --only-binary on Windows to avoid source-compilation failures.
+pandas>=2.0.0
+
+# Target: PyFluent 0.38 / Ansys Fluent 2025 R2 (v252).
+# Upper-bound set to avoid unvetted API changes in future minor versions.
+ansys-fluent-core>=0.38.0,<0.40.0
