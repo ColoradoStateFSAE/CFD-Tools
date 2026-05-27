@@ -1,4 +1,4 @@
-name: Nightly Development Build
+name: Night Development Build
 
 on:
   push:
