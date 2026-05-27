@@ -60,78 +60,14 @@ jobs:
           path: dist-staged/*.exe
           retention-days: 1
 
- # =========================================================================
-# JOB 2: Compile the Rocky Linux Package (.rpm) using YOUR spec file
-# =========================================================================
-build-rocky-linux:
-  runs-on: ubuntu-latest
-  timeout-minutes: 20
-  container:
-    image: rockylinux:9
-
-  steps:
-    - name: Install Git and Core Build Tools
-      run: |
-        dnf clean all
-        dnf makecache
-        dnf install -y git rpm-build rpmdevtools python3.11 python3.11-pip gcc
-
-    - name: Checkout repository code
-      uses: actions/checkout@v4
-
-    - name: Install Python dependencies
-      run: |
-        python3.11 -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then python3.11 -m pip install -r requirements.txt; fi
-        if [ -f CFD-Automation-Suite-Source-Code/requirements.txt ]; then python3.11 -m pip install -r CFD-Automation-Suite-Source-Code/requirements.txt; fi
-
-    - name: Create the expected directory structure for your spec file
-      run: |
-        # Create the dist/RamRacingCFD directory structure that your spec expects
-        mkdir -p /root/rpmbuild/SOURCES/dist/RamRacingCFD
-        
-        # Copy your application files to where the spec expects them
-        # Adjust these paths based on what should be installed:
-        cp -r CFD-Automation-Suite-Source-Code/* /root/rpmbuild/SOURCES/dist/RamRacingCFD/ || true
-        cp -r CFD-Automation-Suite-Source-Code/.??* /root/rpmbuild/SOURCES/dist/RamRacingCFD/ 2>/dev/null || true
-        cp *.py /root/rpmbuild/SOURCES/dist/RamRacingCFD/ 2>/dev/null || true
-        cp requirements.txt /root/rpmbuild/SOURCES/dist/RamRacingCFD/ 2>/dev/null || true
-
-    - name: Build Rocky Linux RPM Package
-      run: |
-        # 1. Explicitly create structural compilation directory map
-        mkdir -p /root/rpmbuild/SPECS
-        mkdir -p /root/rpmbuild/SOURCES
-        mkdir -p /root/rpmbuild/RPMS
-        mkdir -p /root/rpmbuild/BUILD
-        
-        # 2. Package source archive into the SOURCES folder
-        tar --exclude='.git' --exclude='.github' -czf /root/rpmbuild/SOURCES/cfd-tools-app.tar.gz .
-        
-        # 3. Copy YOUR exact repository spec file directly to the build destination target
-        cp CFD-Automation-Suite-Source-Code/RamRacingCFD.rpm.spec /root/rpmbuild/SPECS/RamRacingCFD.rpm.spec
-        
-        # 4. Execute the rpm construction process using your spec file
-        rpmbuild -ba /root/rpmbuild/SPECS/RamRacingCFD.rpm.spec
-        
-        # 5. Move finished packages to a clean directory for staging export
-        mkdir -p dist-staged-rpm
-        cp /root/rpmbuild/RPMS/*/*.rpm dist-staged-rpm/ || cp /root/rpmbuild/RPMS/noarch/*.rpm dist-staged-rpm/ || true
-
-    - name: Archive Rocky Linux RPM Piece
-      uses: actions/upload-artifact@v4
-      with:
-        name: compiled-rocky-rpm
-        path: dist-staged-rpm/*.rpm
-        retention-days: 1
-
+ 
   # =========================================================================
   # JOB 3: Collect Stamped Assets and Publish
   # =========================================================================
   publish-nightly:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 15
-    needs: [build-windows, build-rocky-linux]
+    needs: [build-windows]
 
     steps:
       - name: Checkout repository code
@@ -177,6 +113,5 @@ build-rocky-linux:
           files: |
             dist-assets/*.tar.gz
             dist-assets/*.exe
-            dist-assets/*.rpm
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
