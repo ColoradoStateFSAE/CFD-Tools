@@ -72,6 +72,8 @@ class SimTypeChooserDialog(QWidget):
                 "Isolated rear wing element study.",
             SimType.QUARTER_MODEL:
                 "Quarter model — two symmetry planes.",
+            SimType.TURNING:
+                "Full car at yaw — asymmetric wheel RPMs, yaw moment & lateral force output.",
         }
 
         self._group = QButtonGroup(self._dialog)
@@ -623,6 +625,24 @@ class RamRacingCFDWindow(QMainWindow):
                     f"Min OQ         : {oq_min:>8.4f}",
                     f"Mean OQ        : {oq_mean:>8.4f}",
                     f"Note           : {oq_note}",
+                ]
+
+            # Cornering results (Turning sim only)
+            from simtypes.configs import SimType
+            if job.config.sim_type == SimType.TURNING:
+                yaw_mom = r.get("yaw_moment_lbf_ft", 0.0)
+                lat_f   = r.get("lateral_force_lbf",  0.0)
+                yaw_deg = r.get("yaw_angle_deg_used",  0.0)
+                turn_r  = r.get("turn_radius_m",       0.0)
+                tendency = "oversteer" if yaw_mom > 0 else "understeer"
+                lines += [
+                    "",
+                    "── Cornering ─────────────────────",
+                    f"Turn Radius    : {turn_r:>7.2f} m",
+                    f"Yaw Angle      : {yaw_deg:>7.2f}°",
+                    f"Yaw Moment     : {yaw_mom:>7.1f} lbf·ft",
+                    f"Lateral Force  : {lat_f:>7.1f} lbf",
+                    f"Tendency       : {tendency}",
                 ]
 
             if "note" in r:
