@@ -10,9 +10,10 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIcon
 from gui.app import RamRacingCFDWindow
 from gui.theme import QSS
+from utils.resource_path import resource_path
 
 
 def main():
@@ -23,19 +24,12 @@ def main():
 
     # Global stylesheet
     app.setStyleSheet(QSS)
-    
-    #Windows Icon
-    def _resource_path(relative):
-        import sys, os
-        if hasattr(sys, '_MEIPASS'):
-            return os.path.join(sys._MEIPASS, relative)
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative)
 
-    from PyQt6.QtGui import QIcon
-    icon_path = _resource_path(os.path.join("assets", "logo.png"))
+    # Window icon
+    icon_path = resource_path(os.path.join("assets", "logo.png"))
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
-    
+
     # Default font
     font = QFont("Segoe UI", 9)
     app.setFont(font)
