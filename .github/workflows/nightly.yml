@@ -85,12 +85,6 @@ jobs:
           name: compiled-windows-exe
           path: dist-assets
 
-      - name: Download Rocky Linux Compilation Piece
-        uses: actions/download-artifact@v4
-        with:
-          name: compiled-rocky-rpm
-          path: dist-assets
-
       - name: Package application source archive
         run: |
           mkdir -p dist-assets
