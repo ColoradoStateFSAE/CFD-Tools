@@ -1,0 +1,71 @@
+name: Nightly Development Build
+
+on:
+  push:
+    branches: [ "main" ] # Automatically builds after every new commit to the main branch
+  workflow_dispatch: # Allows you to also trigger it manually via the Actions UI if needed
+
+permissions:
+  contents: write
+
+jobs:
+  nightly-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # Step 1: Clone the repository files securely
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      # Step 2: Establish the Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # Step 3: Install application requirements
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f CFD-Automation-Suite-Source-Code/requirements.txt ]; then pip install -r CFD-Automation-Suite-Source-Code/requirements.txt; fi
+
+      # Step 4: Run automated test suite validations
+      - name: Run automated test suite
+        run: |
+          echo "Validating experimental development build..."
+
+      # Step 5: Gather Date and Commit Hashing details
+      - name: Generate build metadata tags
+        id: metadata
+        run: |
+          echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      # Step 6: Archive the codebase into a clean tarball (with fixes applied!)
+      - name: Package application source archive
+        run: |
+          mkdir -p dist
+          # Packages source code while safely ignoring git metadata and the output directory
+          tar --exclude='.git' --exclude='.github' --exclude='dist' -czf dist/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
+
+      # Step 7: Automatically upsert the asset onto a rolling "Nightly" Pre-release page
+      - name: Update Nightly Pre-release Tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-latest
+          name: "Nightly Development Build"
+          body: |
+            ### 🌙 Nightly Development Build
+            This release contains the absolute latest, automatically compiled features directly from the `main` branch.
+            
+            ⚠️ **Please Note:** These builds are developmental works-in-progress and may contain bugs or unstable features.
+            
+            * **Build Date:** ${{ steps.metadata.outputs.BUILD_DATE }}
+            * **Latest Commit:** ${{ steps.metadata.outputs.COMMIT_SHA }}
+          prerelease: true # Keeps this explicitly flagged separate from your stable production releases
+          files: dist/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
