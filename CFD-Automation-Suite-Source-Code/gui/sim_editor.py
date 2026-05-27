@@ -317,7 +317,7 @@ class SimEditorDialog(QDialog):
 
         note = QLabel(
             "Curvature correction is always OFF for Ramps 0–2 regardless of "
-            "this setting. It is only applied during Ramp 3."
+            "this setting. When enabled here it is applied during Ramp 3 only."
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
