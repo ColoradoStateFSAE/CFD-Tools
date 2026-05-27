@@ -41,8 +41,8 @@ jobs:
       - name: Package application source archive
         run: |
           mkdir -p dist
-          # Packages source code while ignoring hidden git/workflow system assets
-          tar --exclude='.git' --exclude='.github' -czf dist/app-release-${{ github.event.release.tag_name }}.tar.gz .
+          # Added --exclude='dist' to prevent tar from reading its own output file
+          tar --exclude='.git' --exclude='.github' --exclude='dist' -czf dist/app-release-${{ github.event.release.tag_name }}.tar.gz .
 
       # Step 6: Upload the packaged binary asset directly to the live GitHub Release page
       - name: Upload asset to GitHub Release
