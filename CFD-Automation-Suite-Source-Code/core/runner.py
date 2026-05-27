@@ -11,6 +11,16 @@ from typing import Callable, Optional
 log = logging.getLogger("fluent_runner")
 
 
+def mph_to_ms(mph: float) -> float:
+    """Convert miles per hour to metres per second."""
+    return mph * 0.44704
+
+
+def ms_to_mph(ms: float) -> float:
+    """Convert metres per second to miles per hour."""
+    return ms / 0.44704
+
+
 
 # ---------------------------------------------------------------------------
 # Ansys Fluent 2025 R2 (v252) / PyFluent 0.38 — primary target
@@ -605,6 +615,184 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
             pass
 
 
+
+# ---------------------------------------------------------------------------
+# Solver physics helpers
+# ---------------------------------------------------------------------------
+
+def _apply_geko_physics(solver, curvature_correction: bool = False,
+                        production_limiter: bool = True):
+    """Configure k-omega GEKO turbulence model."""
+    try:
+        visc = solver.setup.models.viscous
+        visc.model = "k-omega"
+        visc.k_omega_model = "geko"
+        try:
+            visc.k_omega_options.production_limiter = production_limiter
+        except Exception:
+            pass
+        try:
+            visc.k_omega_options.curvature_correction = curvature_correction
+        except Exception:
+            pass
+        log.info(f"  GEKO k-omega: CC={curvature_correction}, PL={production_limiter}")
+    except Exception as e:
+        log.warning(f"  _apply_geko_physics: {e}")
+
+
+def _set_boundary_conditions(solver, config):
+    """Apply velocity inlet, pressure outlet, symmetry and wall BCs."""
+    speed_ms = mph_to_ms(config.vehicle_speed_mph)
+    try:
+        # Inlet — velocity inlet
+        inlet = solver.setup.boundary_conditions.velocity_inlet["inlet"]
+        try:
+            inlet.momentum.velocity.value = speed_ms
+        except Exception:
+            inlet.momentum.velocity_magnitude.value = speed_ms
+        try:
+            inlet.turbulence.turbulent_intensity = 0.01
+            inlet.turbulence.turbulent_viscosity_ratio = 1.0
+        except Exception:
+            pass
+        log.info(f"  Inlet: {speed_ms:.2f} m/s")
+    except Exception as e:
+        log.warning(f"  Inlet BC: {e}")
+
+    try:
+        # Outlet — pressure outlet (0 Pa gauge)
+        outlet = solver.setup.boundary_conditions.pressure_outlet["outlet"]
+        try:
+            outlet.momentum.gauge_pressure.value = 0.0
+        except Exception:
+            pass
+        log.info("  Outlet: 0 Pa gauge")
+    except Exception as e:
+        log.warning(f"  Outlet BC: {e}")
+
+    try:
+        # Ground — moving wall at vehicle speed
+        ground = solver.setup.boundary_conditions.wall["ground"]
+        ground.momentum.wall_motion = "Moving Wall"
+        try:
+            ground.momentum.velocity.value = speed_ms
+        except Exception:
+            ground.momentum.wall_velocity.value = speed_ms
+        log.info(f"  Ground moving wall: {speed_ms:.2f} m/s")
+    except Exception as e:
+        log.warning(f"  Ground BC: {e}")
+
+    try:
+        # Symmetry
+        solver.setup.boundary_conditions.symmetry["symmetry"]
+        log.info("  Symmetry plane: OK")
+    except Exception as e:
+        log.debug(f"  Symmetry BC: {e}")
+
+    # Wheel MRF
+    if config.use_wheel_mrf:
+        for wheel in config.wheel_mrf_zones:
+            try:
+                omega = speed_ms / wheel.wheel_radius  # rad/s
+                mrf = solver.setup.cell_zone_conditions.fluid[wheel.zone_name]
+                mrf.general.frame_motion = True
+                mrf.general.rotation_axis_origin = [
+                    wheel.center_x, wheel.center_y, wheel.center_z]
+                mrf.general.rotation_axis_direction = [
+                    wheel.axis_x, wheel.axis_y, wheel.axis_z]
+                mrf.general.angular_velocity.value = omega
+                log.info(f"  Wheel MRF {wheel.name}: {omega:.1f} rad/s")
+            except Exception as e:
+                log.warning(f"  Wheel MRF {wheel.name}: {e}")
+
+
+def _configure_force_reports(solver, config):
+    """Set up lift/drag/moment report definitions for all aero surfaces."""
+    aero_zones = [
+        "frontwing", "rearwing", "undertray",
+        "fw", "rw", "fwb", "rwb", "chassis",
+    ]
+    # Filter to zones that actually exist in the mesh
+    try:
+        all_zones = list(solver.setup.boundary_conditions.wall.keys())
+        zones = [z for z in aero_zones if z in all_zones]
+        if not zones:
+            zones = aero_zones  # fall back to all, Fluent will warn on missing
+    except Exception:
+        zones = aero_zones
+
+    # Total downforce (negative lift = downforce, force vector points down -Y)
+    _add_report_lift(solver, "total_downforce", zones, [0, -1, 0])
+    # Total drag (force vector points downstream +X)
+    _add_report_drag(solver, "total_drag", zones, [1, 0, 0])
+    # Front axle moment (about front axle, for CoP)
+    _add_report_moment(solver, "moment_front_axle", zones,
+                       [0.0, 0.0, 0.0], [0, 0, 1])
+    # Per-element reports
+    element_map = {
+        "fw_downforce":  ("lift", ["fw", "fwb", "frontwing"], [0, -1, 0]),
+        "fw_drag":       ("drag", ["fw", "fwb", "frontwing"], [1, 0, 0]),
+        "rw_downforce":  ("lift", ["rw", "rwb", "rearwing"],  [0, -1, 0]),
+        "rw_drag":       ("drag", ["rw", "rwb", "rearwing"],  [1, 0, 0]),
+        "ut_downforce":  ("lift", ["undertray"],               [0, -1, 0]),
+        "ut_drag":       ("drag", ["undertray"],               [1, 0, 0]),
+    }
+    for name, (rtype, z, vec) in element_map.items():
+        if rtype == "lift":
+            _add_report_lift(solver, name, z, vec)
+        else:
+            _add_report_drag(solver, name, z, vec)
+    log.info(f"  Force reports configured on {len(zones)} zones")
+
+
+def _set_methods_first_order(solver):
+    """First-order spatial discretization for initial convergence."""
+    try:
+        m = solver.solution.methods
+        m.pressure_velocity_coupling.scheme = "SIMPLE"
+        try:
+            m.spatial_discretization.pressure = "Standard"
+            m.spatial_discretization.momentum = "First Order Upwind"
+            m.spatial_discretization.turbulent_kinetic_energy = "First Order Upwind"
+            m.spatial_discretization.specific_dissipation_rate = "First Order Upwind"
+        except Exception as e:
+            log.debug(f"  Methods (first order): {e}")
+    except Exception as e:
+        log.warning(f"  _set_methods_first_order: {e}")
+
+
+def _set_methods_ramp1(solver):
+    """Second order pressure + first order momentum (ramp 1)."""
+    try:
+        m = solver.solution.methods
+        m.pressure_velocity_coupling.scheme = "SIMPLE"
+        try:
+            m.spatial_discretization.pressure = "PRESTO!"
+            m.spatial_discretization.momentum = "Second Order Upwind"
+            m.spatial_discretization.turbulent_kinetic_energy = "First Order Upwind"
+            m.spatial_discretization.specific_dissipation_rate = "First Order Upwind"
+        except Exception as e:
+            log.debug(f"  Methods (ramp1): {e}")
+    except Exception as e:
+        log.warning(f"  _set_methods_ramp1: {e}")
+
+
+def _set_methods_ramp2(solver):
+    """Full second order discretization (ramp 2+)."""
+    try:
+        m = solver.solution.methods
+        m.pressure_velocity_coupling.scheme = "SIMPLEC"
+        try:
+            m.spatial_discretization.pressure = "PRESTO!"
+            m.spatial_discretization.momentum = "Second Order Upwind"
+            m.spatial_discretization.turbulent_kinetic_energy = "Second Order Upwind"
+            m.spatial_discretization.specific_dissipation_rate = "Second Order Upwind"
+        except Exception as e:
+            log.debug(f"  Methods (ramp2): {e}")
+    except Exception as e:
+        log.warning(f"  _set_methods_ramp2: {e}")
+
+
 def run_solver(config, mesh_file: str,
                progress_cb: Optional[Callable] = None):
     """
@@ -636,7 +824,7 @@ def run_solver(config, mesh_file: str,
     try:
         # Load mesh
         prog("Loading mesh...", 2)
-        solver.settings.file.read_case(file_name=import_file_name)
+        _read_mesh(solver, import_file_name)
         solver.mesh.check()
 
         # Validate mesh has volume elements
@@ -650,9 +838,8 @@ def run_solver(config, mesh_file: str,
         except Exception as e:
             log.warning(f"  Could not get mesh statistics: {e}")
 
-        # Units
-        solver.setup.general.units["force"] = "lbf"
-        solver.setup.general.units["velocity"] = "mph"
+        # Units — skip custom units, Fluent defaults (SI) work fine for force/moment output
+        # We convert results in post-processing instead
 
         # Reference values
         prog("Setting reference values...", 5)

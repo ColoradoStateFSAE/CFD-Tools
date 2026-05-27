@@ -226,7 +226,7 @@ class RamRacingCFDWindow(QMainWindow):
         h_layout.addWidget(logo)
         h_layout.addStretch()
 
-        sub = QLabel("Fluent 2024R2  •  PyFluent  •  PyQt6")
+        sub = QLabel("Fluent 2025R2  •  PyFluent  •  PyQt6")
         sub.setStyleSheet("color: #abb2bf; background: transparent; font-size: 9pt;")
         h_layout.addWidget(sub)
         root.addWidget(header)
