@@ -2,56 +2,150 @@ name: Nightly Development Build
 
 on:
   push:
-    branches: [ "main" ] # Automatically builds after every new commit to the main branch
-  workflow_dispatch: # Allows you to also trigger it manually via the Actions UI if needed
+    branches: [ "main" ] # Automatically compiles on every commit to main
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  nightly-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  # =========================================================================
+  # JOB 1: Compile the Windows Installer (.exe) with Metadata
+  # =========================================================================
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
 
     steps:
-      # Step 1: Clone the repository files securely
       - name: Checkout repository code
         uses: actions/checkout@v4
 
-      # Step 2: Establish the Python environment
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # Step 3: Install application requirements
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f CFD-Automation-Suite-Source-Code/requirements.txt ]; then pip install -r CFD-Automation-Suite-Source-Code/requirements.txt; fi
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+          if (Test-Path CFD-Automation-Suite-Source-Code/requirements.txt) { pip install -r CFD-Automation-Suite-Source-Code/requirements.txt }
 
-      # Step 4: Run automated test suite validations
-      - name: Run automated test suite
+      # Fetches and registers 'makensis' into the runner's path environment
+      - name: Install NSIS Compiler Engine
+        uses: negrutiu/nsis-install@v2
+
+      - name: Compile Windows Installer via NSIS
         run: |
-          echo "Validating experimental development build..."
+          makensis CFD-Automation-Suite-Source-Code/installer.nsi
 
-      # Step 5: Gather Date and Commit Hashing details
+      # Extracts date/hash inside Windows PowerShell and renames the resulting installer
+      - name: Rename Installer with Date and Commit Hash
+        shell: powershell
+        run: |
+          $date = Get-Date -Format "yyyyMMdd"
+          $sha = (git rev-parse --short HEAD).Trim()
+          mkdir dist-staged
+          
+          # Locates the compiled setup file from your NSIS build and stamps it
+          Get-ChildItem -Path . , dist, CFD-Automation-Suite-Source-Code -Filter *.exe -Recurse | Select-Object -First 1 | ForEach-Object {
+              Move-Item $_.FullName "dist-staged/setup-$date-$sha.exe" -Force
+          }
+
+      - name: Archive Windows Installer Piece
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-windows-exe
+          path: dist-staged/*.exe
+          retention-days: 1
+
+  # =========================================================================
+  # JOB 2: Compile the Rocky Linux Package (.rpm) using YOUR spec file
+  # =========================================================================
+  build-rocky-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: rockylinux:9
+
+    steps:
+      - name: Install Git and Core Build Tools
+        run: |
+          dnf clean all
+          dnf makecache
+          dnf install -y git rpm-build rpmdevtools python3.11 python3.11-pip gcc
+
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: |
+          python3.11 -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then python3.11 -m pip install -r requirements.txt; fi
+          if [ -f CFD-Automation-Suite-Source-Code/requirements.txt ]; then python3.11 -m pip install -r CFD-Automation-Suite-Source-Code/requirements.txt; fi
+
+      - name: Build Rocky Linux RPM Package
+        run: |
+          # 1. Initialize standard RPM packaging directories
+          rpmdev-setuptree
+          
+          # 2. Package source archive into the SOURCES folder
+          mkdir -p /root/rpmbuild/SOURCES
+          tar --exclude='.git' --exclude='.github' -czf /root/rpmbuild/SOURCES/cfd-tools-app.tar.gz .
+          
+          # 3. FIX: Copy YOUR exact repository spec file into the RPM build tree
+          cp CFD-Automation-Suite-Source-Code/RamRacingCFD.rpm.spec /root/rpmbuild/SPECS/
+          
+          # 4. Execute the rpm construction process using your spec file
+          rpmbuild -ba /root/rpmbuild/SPECS/RamRacingCFD.rpm.spec
+          
+          # 5. Move finished packages to a clean directory for staging export
+          mkdir -p dist-staged-rpm
+          cp /root/rpmbuild/RPMS/*/*.rpm dist-staged-rpm/
+
+      - name: Archive Rocky Linux RPM Piece
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-rocky-rpm
+          path: dist-staged-rpm/*.rpm
+          retention-days: 1
+
+  # =========================================================================
+  # JOB 3: Collect Stamped Assets and Publish
+  # =========================================================================
+  publish-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build-windows, build-rocky-linux]
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
       - name: Generate build metadata tags
         id: metadata
         run: |
           echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
           echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      # Step 6: Archive the codebase into a clean tarball (with fixes applied!)
+      - name: Download Windows Compilation Piece
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-windows-exe
+          path: dist-assets
+
+      - name: Download Rocky Linux Compilation Piece
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-rocky-rpm
+          path: dist-assets
+
       - name: Package application source archive
         run: |
-          mkdir -p dist
-          # Packages source code while safely ignoring git metadata and the output directory
-          tar --exclude='.git' --exclude='.github' --exclude='dist' -czf dist/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
+          mkdir -p dist-assets
+          tar --exclude='.git' --exclude='.github' --exclude='dist-assets' -czf dist-assets/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
 
-      # Step 7: Automatically upsert the asset onto a rolling "Nightly" Pre-release page
       - name: Update Nightly Pre-release Tag
         uses: softprops/action-gh-release@v2
         with:
@@ -65,7 +159,10 @@ jobs:
             
             * **Build Date:** ${{ steps.metadata.outputs.BUILD_DATE }}
             * **Latest Commit:** ${{ steps.metadata.outputs.COMMIT_SHA }}
-          prerelease: true # Keeps this explicitly flagged separate from your stable production releases
-          files: dist/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz
+          prerelease: true
+          files: |
+            dist-assets/*.tar.gz
+            dist-assets/*.exe
+            dist-assets/*.rpm
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
