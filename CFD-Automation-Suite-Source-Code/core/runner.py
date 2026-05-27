@@ -6,6 +6,8 @@ Requires: ansys-fluent-core (pip install ansys-fluent-core)
 """
 import math
 import logging
+import os
+import sys
 from typing import Callable, Optional
 
 log = logging.getLogger("fluent_runner")
@@ -53,7 +55,6 @@ def _get_pyfluent_version() -> tuple:
 
 def _ensure_awp_root():
     """Set AWP_ROOT252 if not already in env. Searches common install paths."""
-    import os, sys
     if os.environ.get(_AWP_KEY):
         log.info(f"  {_AWP_KEY}={os.environ[_AWP_KEY]}")
         return
@@ -198,32 +199,32 @@ def _set_task_args(task, args: dict):
 
     # Approach 1: direct attribute assignment — 0.38/252 primary method
     # Real Python attribute assignment syntax triggers gRPC descriptors.
-    success_count = 0
+    failed_keys = {}
     for key, value in args.items():
         try:
             setattr(args_obj, key, value)
             log.debug(f"  Set {key}={value!r}")
-            success_count += 1
         except Exception as e:
             log.debug(f"  setattr {key} failed: {e}")
+            failed_keys[key] = value
 
-    if success_count == len(args):
+    if not failed_keys:
         return  # all args set successfully
-    log.debug(f"  {success_count}/{len(args)} args set via setattr")
+    log.debug(f"  {len(args) - len(failed_keys)}/{len(args)} args set via setattr, retrying {list(failed_keys)} via fallbacks")
 
-    # Approach 2: dict-style update() — 0.28 fallback
+    # Approach 2: dict-style update() — 0.28 fallback (only unset keys)
     try:
-        args_obj.update(args)
+        args_obj.update(failed_keys)
         return
     except Exception as e:
         log.debug(f"  update() failed: {e}")
 
-    # Approach 3: update_dict
+    # Approach 3: update_dict (only unset keys)
     try:
-        args_obj.update_dict(args)
+        args_obj.update_dict(failed_keys)
         return
     except Exception as e:
-        log.warning(f"  All arg-setting methods failed for {list(args.keys())}: {e}")
+        log.warning(f"  All arg-setting methods failed for {list(failed_keys.keys())}: {e}")
 
 
 def _hybrid_init(solver):
@@ -441,7 +442,7 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
 
         # ── Step 2: Local Sizing ─────────────────────────────────────────
         # Curvature sizing — chassis/body
-        prog("Adding local sizing: chassis/body...", 28)
+        prog("Adding local sizing: chassis/body...", 22)
         tasks["Add Local Sizing"].Arguments = {
             "AddChild": "yes",
             "BOIControlName": "curvature_stuff",
@@ -452,7 +453,7 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
         tasks["Add Local Sizing"].AddChildAndUpdate()
 
         # Curvature sizing — aero elements
-        prog("Adding local sizing: aero elements...", 36)
+        prog("Adding local sizing: aero elements...", 28)
         tasks["Add Local Sizing"].Arguments = {
             "AddChild": "yes",
             "BOIControlName": "curvature_aero",
@@ -467,7 +468,7 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
 
         # Wheel sizing
         if config.use_wheel_mrf and config.wheel_mrf_zones:
-            prog("Adding local sizing: wheels...", 42)
+            prog("Adding local sizing: wheels...", 33)
             wheel_labels = [w.zone_name for w in config.wheel_mrf_zones]
             tasks["Add Local Sizing"].Arguments = {
                 "AddChild": "yes",
@@ -477,6 +478,25 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
                 "BOISize": 0.032,
             }
             tasks["Add Local Sizing"].AddChildAndUpdate()
+
+        # Near / Mid / Far volume refinement boxes (Tables 1-3, Fluent Procedure doc)
+        prog("Adding Near/Mid/Far refinement boxes...", 38)
+        near, mid, far = compute_refinement_boxes(
+            config.car_length_m, config.car_width_m, config.car_height_m,
+            half_sym=getattr(config, "is_half_symmetry", False),
+        )
+        _add_refinement_box(meshing, "boi_near", near)
+        _add_refinement_box(meshing, "boi_mid",  mid)
+        _add_refinement_box(meshing, "boi_far",  far)
+
+        # Per-wheel refinement boxes
+        if config.use_wheel_mrf and config.wheel_mrf_zones:
+            prog("Adding wheel refinement boxes...", 42)
+            for wheel in config.wheel_mrf_zones:
+                _add_wheel_refinement(
+                    meshing, wheel.name,
+                    wheel.center_x, wheel.center_y, wheel.center_z,
+                )
 
         # ── Step 3: Generate Surface Mesh ────────────────────────────────
         prog("Generating surface mesh...", 50)
@@ -587,7 +607,6 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
         except Exception as e:
             log.warning(f"  ImproveVolumeMesh skipped: {e}")
 
-        import os
         os.makedirs(config.output_dir, exist_ok=True)
         mesh_file = config.output_dir.rstrip("/\\") + "/mesh.msh.h5"
 
@@ -595,11 +614,8 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
             meshing.meshing.File.WriteMesh(FileName=mesh_file)
             log.info(f"  Mesh written via meshing.File.WriteMesh")
         except Exception as e:
-            log.debug(f"  WriteMesh failed: {e}")
-            try:
-                meshing.meshing.File.WriteMesh(FileName=mesh_file)
-            except Exception:
-                meshing.scheme_eval.string_eval(f'(write-mesh "{mesh_file}")')
+            log.debug(f"  WriteMesh failed: {e}, trying scheme_eval fallback")
+            meshing.scheme_eval.string_eval(f'(write-mesh "{mesh_file}")')
 
         prog(f"Mesh saved: {mesh_file}", 100)
         log.info(f"Meshing complete. File: {mesh_file}")
@@ -693,7 +709,11 @@ def _set_boundary_conditions(solver, config):
     if config.use_wheel_mrf:
         for wheel in config.wheel_mrf_zones:
             try:
-                omega = speed_ms / wheel.wheel_radius  # rad/s
+                if wheel.rpm > 0:
+                    omega = wheel.rpm * 2 * math.pi / 60  # explicit override
+                    log.info(f"  Wheel MRF {wheel.name}: using RPM override {wheel.rpm:.1f} → {omega:.2f} rad/s")
+                else:
+                    omega = speed_ms / wheel.wheel_radius  # auto-calculate
                 mrf = solver.setup.cell_zone_conditions.fluid[wheel.zone_name]
                 mrf.general.frame_motion = True
                 mrf.general.rotation_axis_origin = [
@@ -712,37 +732,53 @@ def _configure_force_reports(solver, config):
         "frontwing", "rearwing", "undertray",
         "fw", "rw", "fwb", "rwb", "chassis",
     ]
+    fw_zones  = ["fw", "fwb", "frontwing"]
+    rw_zones  = ["rw", "rwb", "rearwing"]
+    ut_zones  = ["undertray"]
+    all_aero  = fw_zones + rw_zones + ut_zones + ["chassis"]
+
     # Filter to zones that actually exist in the mesh
     try:
         all_zones = list(solver.setup.boundary_conditions.wall.keys())
-        zones = [z for z in aero_zones if z in all_zones]
-        if not zones:
-            zones = aero_zones  # fall back to all, Fluent will warn on missing
+        def _filter(zones):
+            filtered = [z for z in zones if z in all_zones]
+            return filtered if filtered else zones  # fall back if none matched
+        fw_zones  = _filter(fw_zones)
+        rw_zones  = _filter(rw_zones)
+        ut_zones  = _filter(ut_zones)
+        all_aero  = _filter(all_aero)
     except Exception:
-        zones = aero_zones
+        pass
 
-    # Total downforce (negative lift = downforce, force vector points down -Y)
-    _add_report_lift(solver, "total_downforce", zones, [0, -1, 0])
-    # Total drag (force vector points downstream +X)
-    _add_report_drag(solver, "total_drag", zones, [1, 0, 0])
-    # Front axle moment (about front axle, for CoP)
-    _add_report_moment(solver, "moment_front_axle", zones,
-                       [0.0, 0.0, 0.0], [0, 0, 1])
-    # Per-element reports
-    element_map = {
-        "fw_downforce":  ("lift", ["fw", "fwb", "frontwing"], [0, -1, 0]),
-        "fw_drag":       ("drag", ["fw", "fwb", "frontwing"], [1, 0, 0]),
-        "rw_downforce":  ("lift", ["rw", "rwb", "rearwing"],  [0, -1, 0]),
-        "rw_drag":       ("drag", ["rw", "rwb", "rearwing"],  [1, 0, 0]),
-        "ut_downforce":  ("lift", ["undertray"],               [0, -1, 0]),
-        "ut_drag":       ("drag", ["undertray"],               [1, 0, 0]),
-    }
-    for name, (rtype, z, vec) in element_map.items():
-        if rtype == "lift":
-            _add_report_lift(solver, name, z, vec)
-        else:
-            _add_report_drag(solver, name, z, vec)
-    log.info(f"  Force reports configured on {len(zones)} zones")
+    # ── Totals ──────────────────────────────────────────────────────────────
+    # Names match the keys used in _extract_results exactly.
+    _add_report_lift  (solver, "total_downforce", all_aero, [0, -1, 0])
+    _add_report_drag  (solver, "total_drag",      all_aero, [1,  0, 0])
+    _add_report_drag  (solver, "drag_aero",       fw_zones + rw_zones + ut_zones, [1, 0, 0])
+
+    # ── Per-element downforce ────────────────────────────────────────────────
+    _add_report_lift(solver, "downforce_fw", fw_zones, [0, -1, 0])
+    _add_report_lift(solver, "downforce_rw", rw_zones, [0, -1, 0])
+    _add_report_lift(solver, "downforce_ut", ut_zones, [0, -1, 0])
+
+    # ── Per-element drag ─────────────────────────────────────────────────────
+    _add_report_drag(solver, "drag_total", all_aero,  [1, 0, 0])
+    _add_report_drag(solver, "drag_rw",    rw_zones,  [1, 0, 0])
+
+    # ── Per-element pitching moments about front axle (Z axis, origin) ───────
+    # Used by _derive_cop in results_exporter to compute CoP without hand-measured
+    # geometry constants.  Axis = [0,0,1] (Z), center = [0,0,0] (front axle origin).
+    front_axle = [0.0, 0.0, 0.0]
+    z_axis     = [0,   0,   1  ]
+    _add_report_moment(solver, "moment_fw",    fw_zones, front_axle, z_axis)
+    _add_report_moment(solver, "moment_rw",    rw_zones, front_axle, z_axis)
+    _add_report_moment(solver, "moment_ut",    ut_zones, front_axle, z_axis)
+    _add_report_moment(solver, "moment_total", all_aero, front_axle, z_axis)
+
+    log.info(
+        f"  Force reports configured — "
+        f"FW zones: {fw_zones}  RW zones: {rw_zones}  UT zones: {ut_zones}"
+    )
 
 
 def _set_methods_first_order(solver):
@@ -762,7 +798,8 @@ def _set_methods_first_order(solver):
 
 
 def _set_methods_ramp1(solver):
-    """Second order pressure + first order momentum (ramp 1)."""
+    """Second order pressure (PRESTO!) + second order momentum (ramp 1).
+    Matches the Ram Racing procedure: 'Second order + Presto pressure'."""
     try:
         m = solver.solution.methods
         m.pressure_velocity_coupling.scheme = "SIMPLE"
@@ -816,7 +853,6 @@ def run_solver(config, mesh_file: str,
             progress_cb(msg, pct)
 
     prog("Launching Fluent solver...", 0)
-    import_file_name = (mesh_file)
     solver = _launch_fluent_solver(pyfluent, config)
 
 
@@ -824,7 +860,7 @@ def run_solver(config, mesh_file: str,
     try:
         # Load mesh
         prog("Loading mesh...", 2)
-        _read_mesh(solver, import_file_name)
+        _read_mesh(solver, mesh_file)
         solver.mesh.check()
 
         # Validate mesh has volume elements
@@ -888,10 +924,10 @@ def run_solver(config, mesh_file: str,
         prog(f"Ramp 2 done ({config.ramp2_iters} iters).", 72)
 
         # ── RAMP 3: Full Send ────────────────────────────────────────────
-        prog("Ramp 3: Full send (curvature correction ON)...", 75)
+        prog("Ramp 3: Full send (curvature correction per config)...", 75)
         _set_methods_ramp2(solver)  # same discretization scheme
         _apply_geko_physics(solver,
-                            curvature_correction=True,
+                            curvature_correction=config.use_curvature_correction,
                             production_limiter=config.use_production_limiter)
         _iterate(solver, config.ramp3_iters
         )
