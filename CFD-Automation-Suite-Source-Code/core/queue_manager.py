@@ -64,6 +64,11 @@ class SimulationQueue:
     """
     Thread-safe simulation queue.
     One job runs at a time; others wait.
+
+    Uses a threading.Event (_job_available) to signal the worker thread
+    when new jobs are added, eliminating the race condition where the
+    worker could exit between checking for a next job and a new job
+    being enqueued.
     """
 
     def __init__(self,
@@ -73,6 +78,8 @@ class SimulationQueue:
         self._lock = threading.Lock()
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        # Signalled whenever a QUEUED job becomes available, or on shutdown.
+        self._job_available = threading.Event()
         self._current_job: Optional[SimJob] = None
 
         # Callbacks fired on the worker thread; GUI should use .after() etc.
@@ -87,6 +94,8 @@ class SimulationQueue:
             self._queue.append(job)
         self._fire_queue_update()
         self._ensure_worker_running()
+        # Signal the worker thread that a job is available.
+        self._job_available.set()
         log.info(f"Queued: {job.display_name}")
         return job
 
@@ -133,6 +142,8 @@ class SimulationQueue:
 
     def shutdown(self):
         self._stop_event.set()
+        # Wake the worker so it can see the stop event and exit cleanly.
+        self._job_available.set()
 
     def save_log(self, path: str):
         """Save queue history to JSON."""
@@ -156,9 +167,20 @@ class SimulationQueue:
         log.info("Queue worker started.")
         while not self._stop_event.is_set():
             job = self._next_queued_job()
-            if job is None:
-                break
-            self._run_job(job)
+            if job is not None:
+                self._run_job(job)
+                continue
+            # No job available right now — wait for a signal before re-checking.
+            # This eliminates the race between "no job found" and "job just added".
+            self._job_available.clear()
+            # Re-check under the clear to avoid a missed wakeup:
+            # if add_job() set the event between our _next_queued_job() call
+            # and the clear() above, we'd block forever without this re-check.
+            job = self._next_queued_job()
+            if job is not None:
+                self._run_job(job)
+                continue
+            self._job_available.wait()
         log.info("Queue worker exited.")
 
     def _next_queued_job(self) -> Optional[SimJob]:
