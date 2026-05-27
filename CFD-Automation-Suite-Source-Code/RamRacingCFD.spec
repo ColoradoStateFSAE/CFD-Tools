@@ -157,11 +157,10 @@ all_hidden = (
         "gui.theme",
         "gui.sim_editor",
         "gui.wheel_editor",
+        "gui.settings_dialog",
         "utils.results_exporter",
+        "utils.resource_path",
         # misc
-        "reportlab",
-        "reportlab.platypus",
-        "reportlab.lib.pagesizes",
         "lxml",
         "lxml.etree",
         "PIL",
