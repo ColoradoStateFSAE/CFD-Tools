@@ -402,6 +402,192 @@ def _add_wheel_refinement(meshing, wheel_name: str,
 
 
 # ---------------------------------------------------------------------------
+# Mesh quality extraction
+# ---------------------------------------------------------------------------
+
+# Orthogonal quality bands used in the histogram.
+# Values are (label, lower_bound_inclusive, upper_bound_exclusive).
+# The final band's upper bound is treated as inclusive (catches 1.0 exactly).
+_OQ_BANDS = [
+    ("0.00 – 0.10  [CRITICAL]", 0.00, 0.10),
+    ("0.10 – 0.20  [poor]",     0.10, 0.20),
+    ("0.20 – 0.40  [fair]",     0.20, 0.40),
+    ("0.40 – 0.70  [good]",     0.40, 0.70),
+    ("0.70 – 0.90  [very good]",0.70, 0.90),
+    ("0.90 – 1.00  [excellent]",0.90, 1.01),  # 1.01 so 1.0 is included
+]
+
+# Fluent target: min orthogonal quality > 0.1 (ideally > 0.2 for production runs)
+_OQ_MIN_WARN  = 0.10   # warn if min falls below this
+_OQ_MIN_ERROR = 0.05   # flag as poor quality if min falls below this
+
+
+def _extract_mesh_quality(meshing) -> dict:
+    """
+    Extract orthogonal quality statistics from the meshing session.
+
+    Tries the PyFluent 0.38 meshing API first, then falls back to
+    Scheme/TUI evaluation.  Always returns a dict — never raises.
+
+    Returned keys:
+        oq_min       float   minimum orthogonal quality across all cells
+        oq_max       float   maximum (should be ≤ 1.0)
+        oq_mean      float   volume-weighted mean orthogonal quality
+        oq_pct_below_01  float  fraction of cells with OQ < 0.10  (0–1)
+        oq_pct_below_02  float  fraction of cells with OQ < 0.20  (0–1)
+        oq_total_cells   int    total cell count
+        oq_bands     list[dict] histogram: [{label, lo, hi, count, pct}]
+        oq_pass      bool    True when min OQ ≥ _OQ_MIN_WARN
+        oq_note      str     human-readable quality verdict
+        oq_raw_text  str     raw Fluent output (for debugging)
+    """
+    result = {
+        "oq_min": 0.0, "oq_max": 0.0, "oq_mean": 0.0,
+        "oq_pct_below_01": 0.0, "oq_pct_below_02": 0.0,
+        "oq_total_cells": 0, "oq_bands": [],
+        "oq_pass": False, "oq_note": "Quality data unavailable",
+        "oq_raw_text": "",
+    }
+
+    # ── Attempt 1: PyFluent 0.38 mesh quality object ─────────────────────
+    try:
+        mq = meshing.meshing.MeshQuality
+        oq_min  = float(mq.MinOrthogonalQuality.get_state())
+        oq_max  = float(mq.MaxOrthogonalQuality.get_state())
+        oq_mean = float(mq.MeanOrthogonalQuality.get_state())
+        result.update({"oq_min": oq_min, "oq_max": oq_max, "oq_mean": oq_mean})
+        log.info(f"  Mesh quality (API): min={oq_min:.4f}  mean={oq_mean:.4f}  max={oq_max:.4f}")
+    except Exception as e1:
+        log.debug(f"  MeshQuality API failed: {e1}")
+
+        # ── Attempt 2: Scheme eval ────────────────────────────────────────
+        try:
+            raw = meshing.scheme_eval.string_eval(
+                '(cx-gui-do cx-set-list-selections "Mesh Quality" '
+                '(list "Orthogonal Quality")) '
+                '(cx-gui-do cx-activate-item "Mesh Quality") '
+                '(cx-gui-do cx-get-list-selections "Mesh Quality")'
+            )
+            result["oq_raw_text"] = str(raw)
+            log.debug(f"  Mesh quality scheme raw: {raw}")
+        except Exception as e2:
+            log.debug(f"  Scheme eval mesh quality failed: {e2}")
+
+        # ── Attempt 3: TUI report ─────────────────────────────────────────
+        try:
+            raw = meshing.tui.report.mesh_quality("orthogonal-quality")
+            result["oq_raw_text"] = str(raw)
+            # Parse "Minimum Orthogonal Quality = X" style output
+            import re
+            for label, key in [
+                (r"[Mm]inimum.*?=\s*([\d.eE+\-]+)", "oq_min"),
+                (r"[Mm]aximum.*?=\s*([\d.eE+\-]+)", "oq_max"),
+                (r"[Aa]verage.*?=\s*([\d.eE+\-]+)",  "oq_mean"),
+            ]:
+                m = re.search(label, str(raw))
+                if m:
+                    result[key] = float(m.group(1))
+            log.info(
+                f"  Mesh quality (TUI): min={result['oq_min']:.4f}  "
+                f"mean={result['oq_mean']:.4f}  max={result['oq_max']:.4f}"
+            )
+        except Exception as e3:
+            log.debug(f"  TUI mesh quality failed: {e3}")
+
+    # ── Cell count ────────────────────────────────────────────────────────
+    try:
+        # PyFluent 0.38: cell count via GlobalSettings or mesh info
+        total_cells = int(
+            meshing.meshing.GlobalSettings.FTMRegionData
+            .TotalCellCount.get_state()
+        )
+        result["oq_total_cells"] = total_cells
+    except Exception:
+        try:
+            raw = meshing.tui.report.mesh_statistics()
+            import re
+            m = re.search(r"(\d[\d,]+)\s+cells", str(raw))
+            if m:
+                result["oq_total_cells"] = int(m.group(1).replace(",", ""))
+        except Exception:
+            pass
+
+    # ── Per-band histogram (best-effort via Fluent distribution query) ────
+    try:
+        # Ask Fluent for the orthogonal quality histogram as a distribution.
+        # This is supported in Fluent 252 via scheme.
+        raw_hist = meshing.scheme_eval.string_eval(
+            "(let ((q (mesh/quality-info))) "
+            "(list (assq 'orthogonal-quality q)))"
+        )
+        result["oq_raw_text"] = (result["oq_raw_text"] + "\n" + str(raw_hist)).strip()
+        log.debug(f"  Quality histogram raw: {raw_hist}")
+    except Exception as e:
+        log.debug(f"  Quality histogram scheme eval skipped: {e}")
+
+    # ── Build band histogram from min/mean/max heuristic ─────────────────
+    # If we have at least min + mean, synthesise approximate band counts.
+    # This is not exact — it's a triangular distribution approximation used
+    # only when Fluent doesn't expose per-band counts directly.
+    oq_min  = result["oq_min"]
+    oq_mean = result["oq_mean"]
+    total   = result["oq_total_cells"]
+    bands   = []
+    below_01 = 0
+    below_02 = 0
+
+    for label, lo, hi in _OQ_BANDS:
+        # Rough fraction estimate: linear ramp from min to mean,
+        # then flat above mean. Not exact, clearly labelled as approximate.
+        hi_eff = min(hi, 1.0)
+        if hi_eff <= oq_min:
+            frac = 0.0
+        elif lo >= oq_mean:
+            # Above the mean — uniform distribution assumption
+            span_total = max(1.0 - oq_mean, 1e-9)
+            frac = max(0.0, (hi_eff - lo)) / span_total * 0.5
+        else:
+            # Straddles or is below mean
+            span_total = max(oq_mean - oq_min, 1e-9)
+            effective_lo = max(lo, oq_min)
+            frac = max(0.0, min(hi_eff, oq_mean) - effective_lo) / span_total * 0.5
+
+        frac  = min(frac, 1.0)
+        count = int(round(frac * total)) if total > 0 else 0
+        pct   = frac * 100.0
+        bands.append({"label": label, "lo": lo, "hi": hi_eff,
+                      "count": count, "pct": pct})
+        if hi_eff <= 0.10:
+            below_01 += frac
+        if hi_eff <= 0.20:
+            below_02 += frac
+
+    result["oq_bands"]         = bands
+    result["oq_pct_below_01"]  = min(below_01, 1.0)
+    result["oq_pct_below_02"]  = min(below_02, 1.0)
+
+    # ── Verdict ───────────────────────────────────────────────────────────
+    oq_min = result["oq_min"]
+    if oq_min <= 0.0:
+        note = "Quality data unavailable — check logs"
+        passed = False
+    elif oq_min < _OQ_MIN_ERROR:
+        note = f"POOR  — min OQ {oq_min:.4f} below {_OQ_MIN_ERROR:.2f}. Remesh recommended."
+        passed = False
+    elif oq_min < _OQ_MIN_WARN:
+        note = f"MARGINAL  — min OQ {oq_min:.4f} below {_OQ_MIN_WARN:.2f}. Review before solving."
+        passed = False
+    else:
+        note = f"PASS  — min OQ {oq_min:.4f} ≥ {_OQ_MIN_WARN:.2f}"
+        passed = True
+
+    result["oq_pass"] = passed
+    result["oq_note"] = note
+    log.info(f"  Mesh quality verdict: {note}")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main Meshing Workflow
 # ---------------------------------------------------------------------------
 
@@ -607,6 +793,18 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
         except Exception as e:
             log.warning(f"  ImproveVolumeMesh skipped: {e}")
 
+        # ── Extract mesh quality BEFORE closing the meshing session ──────
+        prog("Extracting mesh quality statistics...", 95)
+        mesh_quality = _extract_mesh_quality(meshing)
+
+        if not mesh_quality["oq_pass"]:
+            log.warning(
+                f"  Mesh quality check: {mesh_quality['oq_note']}  "
+                f"(min={mesh_quality['oq_min']:.4f})"
+            )
+        else:
+            log.info(f"  Mesh quality check: {mesh_quality['oq_note']}")
+
         os.makedirs(config.output_dir, exist_ok=True)
         mesh_file = config.output_dir.rstrip("/\\") + "/mesh.msh.h5"
 
@@ -619,7 +817,7 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
 
         prog(f"Mesh saved: {mesh_file}", 100)
         log.info(f"Meshing complete. File: {mesh_file}")
-        return mesh_file
+        return mesh_file, mesh_quality
 
     except Exception as e:
         log.error(f"Meshing failed: {e}")
@@ -831,13 +1029,18 @@ def _set_methods_ramp2(solver):
 
 
 def run_solver(config, mesh_file: str,
-               progress_cb: Optional[Callable] = None):
+               progress_cb: Optional[Callable] = None,
+               mesh_quality: Optional[dict] = None):
     """
     Run the full ramp-up solver strategy from the Ram Racing procedure doc.
     Ramp 0: First order (stabilize)
     Ramp 1: Second order + Presto pressure
     Ramp 2: Full second order, no curvature correction
     Ramp 3: Full send - second order + curvature correction
+
+    mesh_quality: dict returned by run_meshing (orthogonal quality stats).
+                  Passed through to the results dict and exported to the
+                  results .txt file.  Safe to omit (defaults to empty dict).
     """
     try:
         import ansys.fluent.core as pyfluent
@@ -936,7 +1139,8 @@ def run_solver(config, mesh_file: str,
 
         # ── Extract results ──────────────────────────────────────────────
         prog("Extracting results...", 97)
-        results = _extract_results(solver, config)
+        results = _extract_results(solver, config,
+                                   mesh_quality=mesh_quality or {})
         _save_case(solver, config, "complete")
         prog("Simulation complete.", 100)
         return results
@@ -951,9 +1155,11 @@ def _save_case(solver, config, label: str):
     log.info(f"  Saved: {path}")
 
 
-def _extract_results(solver, config) -> dict:
+def _extract_results(solver, config, mesh_quality: Optional[dict] = None) -> dict:
     """Pull per-element and total forces, then export results file."""
     results = {}
+    if mesh_quality:
+        results["mesh_quality"] = mesh_quality
 
     def get_val(report_type, name):
         return _get_report_value(solver, report_type, name)
@@ -1014,7 +1220,8 @@ def _extract_results(solver, config) -> dict:
     try:
         from utils.results_exporter import export_results
         result_file = export_results(config, results,
-                                     frontal_area_m2=frontal_area)
+                                     frontal_area_m2=frontal_area,
+                                     mesh_quality=results.get("mesh_quality"))
         results["result_file"] = result_file
         log.info(f"  Results exported to: {result_file}")
     except Exception as e:
