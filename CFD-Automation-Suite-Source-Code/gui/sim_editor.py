@@ -75,6 +75,9 @@ class SimEditorDialog(QDialog):
         self._build_rampup_tab()
         if self.config.use_wheel_mrf:
             self._build_wheel_tab()
+        from simtypes.configs import SimType
+        if self.config.sim_type == SimType.TURNING:
+            self._build_turning_tab()
 
         # Button row
         btn_frame = QFrame()
@@ -486,6 +489,14 @@ class SimEditorDialog(QDialog):
         if hasattr(self, "chk_mrf"):
             self.chk_mrf.setChecked(c.use_wheel_mrf)
 
+        # Turning tab
+        if hasattr(self, "sb_turn_radius"):
+            self.sb_turn_radius.setValue(c.turn_radius_m)
+            self.sb_track_width.setValue(c.track_width_m)
+            self.chk_auto_yaw.setChecked(c.auto_yaw)
+            self.sb_yaw.setValue(c.yaw_angle_deg)
+            self._update_yaw_preview()
+
 
     def _write_to_config(self):
         c = self.config
@@ -521,6 +532,13 @@ class SimEditorDialog(QDialog):
         if hasattr(self, "chk_mrf"):
             c.use_wheel_mrf = self.chk_mrf.isChecked()
 
+        # Turning tab
+        if hasattr(self, "sb_turn_radius"):
+            c.turn_radius_m  = self.sb_turn_radius.value()
+            c.track_width_m  = self.sb_track_width.value()
+            c.auto_yaw       = self.chk_auto_yaw.isChecked()
+            c.yaw_angle_deg  = self.sb_yaw.value()
+
 
     def _accept(self):
         try:
@@ -534,6 +552,139 @@ class SimEditorDialog(QDialog):
             return
         self.accepted_ok = True
         self.accept()
+
+    # ── Turning tab ───────────────────────────────────────────────────────────
+
+    def _build_turning_tab(self):
+        w = self._scroll_tab("  Cornering  ")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setSpacing(9)
+        form.setContentsMargins(20, 16, 20, 16)
+
+        # Section heading
+        head = QLabel("Cornering Parameters")
+        head.setObjectName("subheading")
+        form.addRow(head)
+
+        # Turn radius
+        self.sb_turn_radius = QDoubleSpinBox()
+        self.sb_turn_radius.setRange(0.5, 500.0)
+        self.sb_turn_radius.setDecimals(2)
+        self.sb_turn_radius.setSingleStep(0.5)
+        self.sb_turn_radius.setSuffix(" m")
+        self.sb_turn_radius.setToolTip(
+            "Radius from the car centreline to the turn centre.\n"
+            "Typical autocross: 6–12 m.  Skidpad: 7.625 m (SAE)."
+        )
+        form.addRow("Turn Radius:", self.sb_turn_radius)
+
+        # Track width
+        self.sb_track_width = QDoubleSpinBox()
+        self.sb_track_width.setRange(0.1, 5.0)
+        self.sb_track_width.setDecimals(3)
+        self.sb_track_width.setSingleStep(0.05)
+        self.sb_track_width.setSuffix(" m")
+        self.sb_track_width.setToolTip(
+            "Lateral distance from car centreline to wheel centre.\n"
+            "Used to compute inner/outer wheel speed asymmetry."
+        )
+        form.addRow("Track Width (½ car):", self.sb_track_width)
+
+        form.addRow(self._hsep())
+
+        # Yaw angle — auto or manual
+        yaw_head = QLabel("Inlet Yaw Angle")
+        yaw_head.setObjectName("subheading")
+        form.addRow(yaw_head)
+
+        self.chk_auto_yaw = QCheckBox("Auto  (derived from speed ÷ radius)")
+        self.chk_auto_yaw.setToolTip(
+            "When enabled, yaw = atan(v / R).  Uncheck to set manually."
+        )
+        form.addRow("", self.chk_auto_yaw)
+
+        self.sb_yaw = QDoubleSpinBox()
+        self.sb_yaw.setRange(-89.0, 89.0)
+        self.sb_yaw.setDecimals(2)
+        self.sb_yaw.setSingleStep(0.5)
+        self.sb_yaw.setSuffix(" °")
+        self.sb_yaw.setToolTip(
+            "Manual yaw angle applied to the inlet velocity vector.\n"
+            "Positive = nose-right / left-hand turn.\n"
+            "Only used when Auto is unchecked."
+        )
+        form.addRow("Manual Yaw Angle:", self.sb_yaw)
+
+        # Preview label — shows the resolved yaw angle live
+        self._yaw_preview = QLabel("—")
+        self._yaw_preview.setObjectName("muted")
+        form.addRow("Resolved Yaw:", self._yaw_preview)
+
+        # Wire auto-yaw toggle and preview updates
+        self.chk_auto_yaw.toggled.connect(self._update_yaw_preview)
+        self.sb_turn_radius.valueChanged.connect(self._update_yaw_preview)
+        self.sb_speed.valueChanged.connect(self._update_yaw_preview)   # General tab
+        self.sb_yaw.valueChanged.connect(self._update_yaw_preview)
+
+        form.addRow(self._hsep())
+
+        # Wheel speed note
+        info_head = QLabel("Wheel Speed Asymmetry")
+        info_head.setObjectName("subheading")
+        form.addRow(info_head)
+
+        note = QLabel(
+            "Outer wheels travel a longer path than inner wheels.\n"
+            "RPMs are calculated automatically at solve time:\n\n"
+            "  v_outer = v_car × (R + track) / R\n"
+            "  v_inner = v_car × (R − track) / R\n"
+            "  ω = v / r_wheel\n\n"
+            "Left-side wheels (axis_z = +1) are outer wheels for a\n"
+            "positive yaw (left-hand turn).  Individual RPM overrides\n"
+            "in the Wheel MRF tab will take precedence."
+        )
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        form.addRow(self._hsep())
+
+        # Outputs note
+        out_head = QLabel("Additional Outputs")
+        out_head.setObjectName("subheading")
+        form.addRow(out_head)
+
+        out_note = QLabel(
+            "Yaw Moment (lbf·ft) — about car centroid, Y axis.\n"
+            "Lateral Force (lbf) — total side force, Z axis.\n\n"
+            "+ve yaw moment = oversteer tendency.\n"
+            "−ve yaw moment = understeer tendency."
+        )
+        out_note.setObjectName("muted")
+        out_note.setWordWrap(True)
+        form.addRow(out_note)
+
+        w.layout().addLayout(form)
+        w.layout().addStretch()
+
+    def _update_yaw_preview(self):
+        """Recompute and display the resolved yaw angle in the Cornering tab."""
+        if not hasattr(self, "chk_auto_yaw"):
+            return
+        if self.chk_auto_yaw.isChecked():
+            import math
+            speed_ms = self.sb_speed.value() * 0.44704
+            R = self.sb_turn_radius.value()
+            if R > 0:
+                yaw = math.degrees(math.atan2(speed_ms, R))
+                self._yaw_preview.setText(f"{yaw:.2f}°  (auto)")
+            else:
+                self._yaw_preview.setText("—  (invalid radius)")
+            self.sb_yaw.setEnabled(False)
+        else:
+            self._yaw_preview.setText(f"{self.sb_yaw.value():.2f}°  (manual)")
+            self.sb_yaw.setEnabled(True)
 
     # ── Utility widget builders ───────────────────────────────────────────────
 

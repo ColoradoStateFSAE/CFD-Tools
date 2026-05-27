@@ -856,25 +856,59 @@ def _apply_geko_physics(solver, curvature_correction: bool = False,
 
 def _set_boundary_conditions(solver, config):
     """Apply velocity inlet, pressure outlet, symmetry and wall BCs."""
-    speed_ms = mph_to_ms(config.vehicle_speed_mph)
+    from simtypes.configs import SimType
+    speed_ms  = mph_to_ms(config.vehicle_speed_mph)
+    is_turning = config.sim_type == SimType.TURNING
+
+    # ── Resolve yaw angle ─────────────────────────────────────────────────
+    yaw_deg = 0.0
+    if is_turning:
+        yaw_deg = config.effective_yaw_deg()
+        log.info(f"  Turning sim: yaw={yaw_deg:.2f}°  "
+                 f"radius={config.turn_radius_m:.1f} m")
+
+    yaw_rad  = math.radians(yaw_deg)
+    # Inlet velocity components: primary flow is −X, side component is +Z
+    # (positive yaw = nose-right = left-hand turn = flow comes from left side)
+    vx = speed_ms * math.cos(yaw_rad)
+    vz = speed_ms * math.sin(yaw_rad)
+
     try:
-        # Inlet — velocity inlet
         inlet = solver.setup.boundary_conditions.velocity_inlet["inlet"]
-        try:
-            inlet.momentum.velocity.value = speed_ms
-        except Exception:
-            inlet.momentum.velocity_magnitude.value = speed_ms
+        if is_turning and abs(yaw_deg) > 0.01:
+            # Set as velocity components rather than magnitude + direction
+            try:
+                inlet.momentum.velocity_specification_method = "Components"
+                inlet.momentum.x_velocity.value = -vx   # flow in −X direction
+                inlet.momentum.y_velocity.value = 0.0
+                inlet.momentum.z_velocity.value = vz
+                log.info(f"  Inlet components: Vx={-vx:.3f}  Vy=0  Vz={vz:.3f} m/s")
+            except Exception:
+                # Fallback: magnitude + yaw via direction cosines
+                inlet.momentum.velocity_magnitude.value = speed_ms
+                try:
+                    inlet.momentum.flow_direction_method = "Direction Cosines"
+                    inlet.momentum.x_component.value = -math.cos(yaw_rad)
+                    inlet.momentum.y_component.value = 0.0
+                    inlet.momentum.z_component.value =  math.sin(yaw_rad)
+                    log.info(f"  Inlet direction cosines applied for yaw={yaw_deg:.2f}°")
+                except Exception as e2:
+                    log.warning(f"  Inlet yaw direction cosines failed: {e2}")
+        else:
+            try:
+                inlet.momentum.velocity.value = speed_ms
+            except Exception:
+                inlet.momentum.velocity_magnitude.value = speed_ms
         try:
             inlet.turbulence.turbulent_intensity = 0.01
             inlet.turbulence.turbulent_viscosity_ratio = 1.0
         except Exception:
             pass
-        log.info(f"  Inlet: {speed_ms:.2f} m/s")
+        log.info(f"  Inlet: {speed_ms:.2f} m/s  yaw={yaw_deg:.2f}°")
     except Exception as e:
         log.warning(f"  Inlet BC: {e}")
 
     try:
-        # Outlet — pressure outlet (0 Pa gauge)
         outlet = solver.setup.boundary_conditions.pressure_outlet["outlet"]
         try:
             outlet.momentum.gauge_pressure.value = 0.0
@@ -885,7 +919,6 @@ def _set_boundary_conditions(solver, config):
         log.warning(f"  Outlet BC: {e}")
 
     try:
-        # Ground — moving wall at vehicle speed
         ground = solver.setup.boundary_conditions.wall["ground"]
         ground.momentum.wall_motion = "Moving Wall"
         try:
@@ -897,21 +930,38 @@ def _set_boundary_conditions(solver, config):
         log.warning(f"  Ground BC: {e}")
 
     try:
-        # Symmetry
         solver.setup.boundary_conditions.symmetry["symmetry"]
         log.info("  Symmetry plane: OK")
     except Exception as e:
         log.debug(f"  Symmetry BC: {e}")
 
-    # Wheel MRF
+    # ── Wheel MRF ─────────────────────────────────────────────────────────
     if config.use_wheel_mrf:
         for wheel in config.wheel_mrf_zones:
             try:
                 if wheel.rpm > 0:
-                    omega = wheel.rpm * 2 * math.pi / 60  # explicit override
-                    log.info(f"  Wheel MRF {wheel.name}: using RPM override {wheel.rpm:.1f} → {omega:.2f} rad/s")
+                    omega = wheel.rpm * 2 * math.pi / 60
+                    log.info(f"  Wheel MRF {wheel.name}: RPM override {wheel.rpm:.1f} → {omega:.2f} rad/s")
+                elif is_turning:
+                    # Asymmetric RPM: inner wheels slower, outer wheels faster.
+                    # "Left side" wheels (positive Z centre or axis_z=+1) are
+                    # the outer wheels for a left-hand (positive yaw) turn.
+                    # Determine inner/outer from the wheel's Z-axis sign.
+                    track = config.track_width_m
+                    R     = config.turn_radius_m
+                    is_outer = (wheel.axis_z > 0)   # left-side = outer for LH turn
+                    if yaw_deg < 0:                  # right-hand turn — flip
+                        is_outer = not is_outer
+                    path_radius = (R + track) if is_outer else (R - track)
+                    path_radius = max(path_radius, 0.01)   # guard against zero
+                    v_wheel     = speed_ms * path_radius / R
+                    omega       = v_wheel / wheel.wheel_radius
+                    log.info(
+                        f"  Wheel MRF {wheel.name} ({'outer' if is_outer else 'inner'}): "
+                        f"v={v_wheel:.3f} m/s  ω={omega:.2f} rad/s"
+                    )
                 else:
-                    omega = speed_ms / wheel.wheel_radius  # auto-calculate
+                    omega = speed_ms / wheel.wheel_radius
                 mrf = solver.setup.cell_zone_conditions.fluid[wheel.zone_name]
                 mrf.general.frame_motion = True
                 mrf.general.rotation_axis_origin = [
@@ -972,6 +1022,21 @@ def _configure_force_reports(solver, config):
     _add_report_moment(solver, "moment_rw",    rw_zones, front_axle, z_axis)
     _add_report_moment(solver, "moment_ut",    ut_zones, front_axle, z_axis)
     _add_report_moment(solver, "moment_total", all_aero, front_axle, z_axis)
+
+    # ── Turning-specific reports ──────────────────────────────────────────
+    # Yaw moment about car centroid (Y axis) and total lateral force (Z axis).
+    # Only registered when the sim is a TurningConfig; the keys are read in
+    # _extract_results only when present.
+    from simtypes.configs import SimType
+    if config.sim_type == SimType.TURNING:
+        # Centroid approximation: midpoint between axles in X, ground level in Y.
+        # Use half wheelbase for X; Y=0 (ground ref); Z=0 (centreline).
+        centroid_x = getattr(config, "wheelbase_in", 62.0) * 0.0254 / 2.0
+        centroid = [centroid_x, 0.0, 0.0]
+        y_axis   = [0, 1, 0]
+        _add_report_moment(solver, "yaw_moment",   all_aero, centroid, y_axis)
+        _add_report_lift  (solver, "lateral_force", all_aero, [0, 0, 1])  # +Z = right
+        log.info("  Turning reports: yaw_moment + lateral_force registered")
 
     log.info(
         f"  Force reports configured — "
@@ -1192,6 +1257,23 @@ def _extract_results(solver, config, mesh_quality: Optional[dict] = None) -> dic
 
     if config.is_half_symmetry:
         results["note"] = "Half-car sim — all forces doubled automatically."
+
+    # ── Turning-specific results ──────────────────────────────────────────
+    from simtypes.configs import SimType
+    if config.sim_type == SimType.TURNING:
+        # Yaw moment [lbf·m from Fluent] → convert to lbf·ft for reporting
+        M_TO_FT = 3.28084
+        raw_yaw  = get_val("moment", "yaw_moment")
+        raw_lat  = get_val("lift",   "lateral_force")
+        results["yaw_moment_lbf_ft"]  = raw_yaw * M_TO_FT
+        results["lateral_force_lbf"]  = raw_lat
+        results["yaw_angle_deg_used"] = config.effective_yaw_deg()
+        results["turn_radius_m"]      = config.turn_radius_m
+        log.info(
+            f"  Yaw moment={results['yaw_moment_lbf_ft']:.1f} lbf·ft  "
+            f"Lateral force={results['lateral_force_lbf']:.1f} lbf  "
+            f"Yaw={results['yaw_angle_deg_used']:.2f}°"
+        )
 
     # Extra user-defined zones
     for zone_def in config.extra_result_zones:

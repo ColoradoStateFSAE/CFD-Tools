@@ -13,6 +13,7 @@ class SimType(Enum):
     FRONT_WING_ONLY = "Front Wing Only"
     REAR_WING_ONLY = "Rear Wing Only"
     QUARTER_MODEL = "Quarter Model"
+    TURNING = "Turning"
 
 
 @dataclass
@@ -216,6 +217,82 @@ class QuarterModelConfig(BaseSimConfig):
         return True
 
 
+@dataclass
+class TurningConfig(BaseSimConfig):
+    """
+    Turning / cornering simulation — full car at a yaw angle.
+
+    Models the car mid-corner by rotating the inlet velocity vector by
+    ``yaw_angle_deg`` (positive = nose-right / left-hand turn) and
+    assigning asymmetric wheel RPMs based on the inner/outer path radii.
+
+    Derived quantities (computed in runner.py at solve time):
+        yaw_angle_deg   = atan2(vehicle_speed_mph * 0.44704, turn_radius_m)
+                          when ``auto_yaw`` is True
+        omega_outer     = v_outer / r_wheel      (outer wheels faster)
+        omega_inner     = v_inner / r_wheel      (inner wheels slower)
+
+    where
+        track_width_m   half-width of the car from centreline to wheel centre
+        v_outer = speed_ms * (turn_radius_m + track_width_m) / turn_radius_m
+        v_inner = speed_ms * (turn_radius_m - track_width_m) / turn_radius_m
+
+    Extra results reported:
+        yaw_moment_lbf_ft   aerodynamic yaw moment about car centroid (Y axis)
+        lateral_force_lbf   total side force (Z axis)
+    """
+    name: str = "Turning Sim"
+
+    # ── Cornering parameters ─────────────────────────────────────────────
+    turn_radius_m: float = 9.0          # radius to car centreline [m]; ~30 ft (autocross)
+    auto_yaw: bool = True               # derive yaw_angle_deg from speed + radius
+    yaw_angle_deg: float = 0.0          # used only when auto_yaw=False [deg]
+    track_width_m: float = 1.2          # lateral distance from centreline to wheel centre [m]
+
+    # ── Wheel zones — all 4 wheels, asymmetric RPM at solve time ────────
+    wheel_mrf_zones: List[WheelMRFConfig] = field(default_factory=lambda: [
+        WheelMRFConfig(name="FLW", zone_name="mrf_flw", wheel_radius=0.203,
+                       axis_z=1.0),
+        WheelMRFConfig(name="FRW", zone_name="mrf_frw", wheel_radius=0.203,
+                       axis_z=-1.0),
+        WheelMRFConfig(name="RLW", zone_name="mrf_rlw", wheel_radius=0.203,
+                       axis_z=1.0),
+        WheelMRFConfig(name="RRW", zone_name="mrf_rrw", wheel_radius=0.203,
+                       axis_z=-1.0),
+    ])
+
+    @property
+    def sim_type(self) -> SimType:
+        return SimType.TURNING
+
+    @property
+    def is_half_symmetry(self) -> bool:
+        return False
+
+    def effective_yaw_deg(self) -> float:
+        """Return the yaw angle that will actually be applied to the inlet."""
+        if self.auto_yaw and self.turn_radius_m > 0:
+            import math
+            speed_ms = self.vehicle_speed_mph * 0.44704
+            return math.degrees(math.atan2(speed_ms, self.turn_radius_m))
+        return self.yaw_angle_deg
+
+    def validate(self) -> List[str]:
+        errors = super().validate()
+        if self.turn_radius_m <= 0:
+            errors.append("Turn radius must be > 0.")
+        if self.track_width_m <= 0:
+            errors.append("Track width must be > 0.")
+        if self.track_width_m >= self.turn_radius_m:
+            errors.append(
+                "Track width must be less than turn radius "
+                "(inner wheel would be at or inside the turn centre)."
+            )
+        if not self.auto_yaw and not (-90 < self.yaw_angle_deg < 90):
+            errors.append("Manual yaw angle must be between −90° and +90°.")
+        return errors
+
+
 # Registry: maps SimType enum → config class
 SIM_TYPE_REGISTRY = {
     SimType.HALF_CAR: HalfCarConfig,
@@ -223,4 +300,5 @@ SIM_TYPE_REGISTRY = {
     SimType.FRONT_WING_ONLY: FrontWingConfig,
     SimType.REAR_WING_ONLY: RearWingConfig,
     SimType.QUARTER_MODEL: QuarterModelConfig,
+    SimType.TURNING: TurningConfig,
 }
