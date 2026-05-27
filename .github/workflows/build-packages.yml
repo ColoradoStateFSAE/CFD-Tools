@@ -1,0 +1,130 @@
+name: Cross-Platform Build & Package
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # =========================================================================
+  # JOB 1: Build the Windows Setup Installer (.exe)
+  # =========================================================================
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+          if (Test-Path CFD-Automation-Suite-Source-Code/requirements.txt) { pip install -r CFD-Automation-Suite-Source-Code/requirements.txt }
+
+      # Compiles the installer using the built-in NSIS compiler on the windows runner
+      - name: Compile Windows Installer via NSIS
+        run: |
+          makensis installer.nsi
+
+      - name: Upload Windows Setup Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            *.exe
+            dist/*.exe
+          retention-days: 14
+
+  # =========================================================================
+  # JOB 2: Build the Rocky Linux Package (.rpm)
+  # =========================================================================
+  build-rocky-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # We use a managed Rocky Linux container to handle native rpm building
+    container:
+      image: rockylinux:9
+
+    steps:
+      - name: Install Git and Core Build Tools
+        run: |
+          dnf clean all
+          dnf makecache
+          dnf install -y git rpm-build rpmdevtools python3.11 python3.11-pip gcc
+
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: |
+          python3.11 -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then python3.11 -m pip install -r requirements.txt; fi
+          if [ -f CFD-Automation-Suite-Source-Code/requirements.txt ]; then python3.11 -m pip install -r CFD-Automation-Suite-Source-Code/requirements.txt; fi
+
+      # Prepares the standard RPM building directories and packages your build
+      - name: Build Rocky Linux RPM Package
+        run: |
+          # 1. Setup rpm directory structure
+          rpmdev-setuptree
+          
+          # 2. Package source archive into the SOURCES folder
+          mkdir -p /root/rpmbuild/SOURCES
+          tar --exclude='.git' --exclude='.github' -czf /root/rpmbuild/SOURCES/cfd-tools-app.tar.gz .
+          
+          # 3. Create a bare-minimum spec file dynamically if one does not exist
+          if [ ! -f cfd-tools.spec ]; then
+            cat << 'EOF' > cfd-tools.spec
+          Name:           cfd-tools-app
+          Version:        1.0.0
+          Release:        1%{?dist}
+          Summary:        CSU Ram Racing FSAE CFD Automation Suite
+          License:        GPLv3
+          Source0:        cfd-tools-app.tar.gz
+          Requires:       python3.11
+          BuildArch:      noarch
+
+          %description
+          Automated CFD suite tools used by the aerodynamics subteam.
+
+          %prep
+          %setup -q -c
+
+          %install
+          mkdir -p %{buildroot}/opt/cfd-tools
+          cp -r * %{buildroot}/opt/cfd-tools/
+
+          %files
+          /opt/cfd-tools
+
+          %changelog
+          * Wed May 27 2026 GitHub Actions <actions@github.com> - 1.0.0-1
+          - Automated build package generation
+          EOF
+          fi
+          
+          # 4. Execute the rpm construction process
+          rpmbuild -ba cfd-tools.spec
+          
+          # 5. Move finished packages to a clean directory for export
+          mkdir -p dist-rpm
+          cp /root/rpmbuild/RPMS/*/*.rpm dist-rpm/
+
+      - name: Upload Rocky Linux RPM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocky-linux-rpm
+          path: dist-rpm/*.rpm
+          retention-days: 14
