@@ -205,8 +205,10 @@ class SimulationQueue:
         try:
             from core.runner import run_meshing, run_solver
             os.makedirs(job.config.output_dir, exist_ok=True)
-            mesh_file = run_meshing(job.config, progress_cb=progress_cb)
-            results = run_solver(job.config, mesh_file, progress_cb=progress_cb)
+            mesh_file, mesh_quality = run_meshing(job.config, progress_cb=progress_cb)
+            results = run_solver(job.config, mesh_file,
+                                 progress_cb=progress_cb,
+                                 mesh_quality=mesh_quality)
             job.results = results
             job.status = JobStatus.DONE
             log.info(f"Completed: {job.display_name}")
