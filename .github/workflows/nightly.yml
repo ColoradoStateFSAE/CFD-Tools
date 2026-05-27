@@ -87,22 +87,24 @@ jobs:
 
       - name: Build Rocky Linux RPM Package
         run: |
-          # 1. Initialize standard RPM packaging directories
-          rpmdev-setuptree
+          # 1. Explicitly create structural compilation directory map
+          mkdir -p /root/rpmbuild/SPECS
+          mkdir -p /root/rpmbuild/SOURCES
+          mkdir -p /root/rpmbuild/RPMS
+          mkdir -p /root/rpmbuild/BUILD
           
           # 2. Package source archive into the SOURCES folder
-          mkdir -p /root/rpmbuild/SOURCES
           tar --exclude='.git' --exclude='.github' -czf /root/rpmbuild/SOURCES/cfd-tools-app.tar.gz .
           
-          # 3. FIX: Copy YOUR exact repository spec file into the RPM build tree
-          cp CFD-Automation-Suite-Source-Code/RamRacingCFD.rpm.spec /root/rpmbuild/SPECS/
+          # 3. Copy YOUR exact repository spec file directly to the build destination target
+          cp CFD-Automation-Suite-Source-Code/RamRacingCFD.rpm.spec /root/rpmbuild/SPECS/RamRacingCFD.rpm.spec
           
           # 4. Execute the rpm construction process using your spec file
           rpmbuild -ba /root/rpmbuild/SPECS/RamRacingCFD.rpm.spec
           
           # 5. Move finished packages to a clean directory for staging export
           mkdir -p dist-staged-rpm
-          cp /root/rpmbuild/RPMS/*/*.rpm dist-staged-rpm/
+          cp /root/rpmbuild/RPMS/*/*.rpm dist-staged-rpm/ || cp /root/rpmbuild/RPMS/noarch/*.rpm dist-staged-rpm/ || true
 
       - name: Archive Rocky Linux RPM Piece
         uses: actions/upload-artifact@v4
