@@ -18,7 +18,6 @@ The **Ram Racing FSAE Aero CFD Tools Repo** is a all the documentation, matlab s
 ---
 
 ## License
-This project is licensed under the **MIT License**.  
 See `LICENSE` for details.
 
 ---
