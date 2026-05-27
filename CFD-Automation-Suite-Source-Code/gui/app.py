@@ -607,6 +607,24 @@ class RamRacingCFDWindow(QMainWindow):
                 f"Aero Drag      : {aero_drag:>8.2f} lbf",
                 f"L/D Ratio      : {r.get('ld_ratio', 0):>8.3f}",
             ]
+
+            # Mesh quality summary
+            mq = r.get("mesh_quality", {})
+            if mq:
+                oq_min  = mq.get("oq_min",  0.0)
+                oq_mean = mq.get("oq_mean", 0.0)
+                oq_note = mq.get("oq_note", "N/A")
+                passed  = mq.get("oq_pass", False)
+                verdict = "✔ PASS" if passed else "✘ CHECK"
+                lines += [
+                    "",
+                    "── Mesh Quality ──────────────────",
+                    f"Verdict        : {verdict}",
+                    f"Min OQ         : {oq_min:>8.4f}",
+                    f"Mean OQ        : {oq_mean:>8.4f}",
+                    f"Note           : {oq_note}",
+                ]
+
             if "note" in r:
                 lines += ["", r["note"]]
             if "result_file" in r:
