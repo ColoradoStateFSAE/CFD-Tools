@@ -2,56 +2,97 @@ name: Nightly Development Build
 
 on:
   push:
-    branches: [ "main" ] # Automatically builds after every new commit to the main branch
-  workflow_dispatch: # Allows you to also trigger it manually via the Actions UI if needed
+    branches: [ "main" ] # Automatically compiles on every commit to main
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  nightly-build:
+  # =========================================================================
+  # JOB 1: Compile the Windows Installer (.exe) with Metadata
+  # =========================================================================
+  build-windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
-      # Step 1: Clone the repository files securely
       - name: Checkout repository code
         uses: actions/checkout@v4
 
-      # Step 2: Establish the Python environment
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # Step 3: Install application requirements
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f CFD-Automation-Suite-Source-Code/requirements.txt ]; then pip install -r CFD-Automation-Suite-Source-Code/requirements.txt; fi
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+          if (Test-Path CFD-Automation-Suite-Source-Code/requirements.txt) { pip install -r CFD-Automation-Suite-Source-Code/requirements.txt }
 
-      # Step 4: Run automated test suite validations
-      - name: Run automated test suite
+      # Fetches and registers 'makensis' into the runner's path environment
+      - name: Install NSIS Compiler Engine
+        uses: negrutiu/nsis-install@v2
+
+      - name: Compile Windows Installer via NSIS
         run: |
-          echo "Validating experimental development build..."
+          makensis CFD-Automation-Suite-Source-Code/installer.nsi
 
-      # Step 5: Gather Date and Commit Hashing details
+      # Extracts date/hash inside Windows PowerShell and renames the resulting installer
+      - name: Rename Installer with Date and Commit Hash
+        shell: powershell
+        run: |
+          $date = Get-Date -Format "yyyyMMdd"
+          $sha = (git rev-parse --short HEAD).Trim()
+          mkdir dist-staged
+          
+          # Locates the compiled setup file from your NSIS build and stamps it
+          Get-ChildItem -Path . , dist, CFD-Automation-Suite-Source-Code -Filter *.exe -Recurse | Select-Object -First 1 | ForEach-Object {
+              Move-Item $_.FullName "dist-staged/setup-$date-$sha.exe" -Force
+          }
+
+      - name: Archive Windows Installer Piece
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-windows-exe
+          path: dist-staged/*.exe
+          retention-days: 1
+
+  # =========================================================================
+  # JOB 2: Collect Stamped Assets and Publish
+  # =========================================================================
+  publish-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build-windows]
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      # Enforce native bash environment variables
       - name: Generate build metadata tags
         id: metadata
+        shell: bash
         run: |
           echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
           echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      # Step 6: Archive the codebase into a clean tarball (with fixes applied!)
-      - name: Package application source archive
-        run: |
-          mkdir -p dist
-          # Packages source code while safely ignoring git metadata and the output directory
-          tar --exclude='.git' --exclude='.github' --exclude='dist' -czf dist/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
+      - name: Download Windows Compilation Piece
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-windows-exe
+          path: dist-assets
 
-      # Step 7: Automatically upsert the asset onto a rolling "Nightly" Pre-release page
+      # Explicit shell set to bash to ignore preexisting directories safely
+      - name: Package application source archive
+        shell: bash
+        run: |
+          mkdir -p dist-assets
+          tar --exclude='.git' --exclude='.github' --exclude='dist-assets' -czf dist-assets/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
+
       - name: Update Nightly Pre-release Tag
         uses: softprops/action-gh-release@v2
         with:
@@ -65,7 +106,9 @@ jobs:
             
             * **Build Date:** ${{ steps.metadata.outputs.BUILD_DATE }}
             * **Latest Commit:** ${{ steps.metadata.outputs.COMMIT_SHA }}
-          prerelease: true # Keeps this explicitly flagged separate from your stable production releases
-          files: dist/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz
+          prerelease: true
+          files: |
+            dist-assets/*.tar.gz
+            dist-assets/*.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
