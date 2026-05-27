@@ -244,6 +244,32 @@ def export_results(config, raw_results, frontal_area_m2=None,
     if extra_lines:
         lines += [sep, "  ADDITIONAL ZONES", sep] + extra_lines + [""]
 
+    # ── Cornering section (Turning sim only) ─────────────────────────────
+    from simtypes.configs import SimType
+    if config.sim_type == SimType.TURNING:
+        yaw_moment   = raw_results.get("yaw_moment_lbf_ft",  0.0)
+        lateral      = raw_results.get("lateral_force_lbf",  0.0)
+        yaw_used     = raw_results.get("yaw_angle_deg_used",  0.0)
+        turn_r       = raw_results.get("turn_radius_m",       0.0)
+        # Yaw moment sign convention: positive = oversteer tendency (nose rotates
+        # in direction of turn), negative = understeer tendency.
+        tendency = "oversteer tendency" if yaw_moment > 0 else "understeer tendency"
+        lines += [
+            sep,
+            "  CORNERING",
+            sep,
+            f"  {'Turn Radius':<32} {turn_r:>10.2f} m",
+            f"  {'Applied Yaw Angle':<32} {yaw_used:>10.2f} deg",
+            f"  {'Yaw Moment (about centroid)':<32} {yaw_moment:>10.2f} lbf.ft",
+            f"  {'Lateral Force (Z)':<32} {lateral:>10.2f} lbf",
+            f"  {'Tendency':<32} {'':>10}  {tendency}",
+            "",
+            "  Yaw moment sign convention:",
+            "  +ve = moment rotates nose into the turn  (oversteer tendency)",
+            "  -ve = moment rotates nose away from turn (understeer tendency)",
+            "",
+        ]
+
     lines += [
         sep,
         "  CoP METHOD",
