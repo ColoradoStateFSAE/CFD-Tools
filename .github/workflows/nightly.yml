@@ -94,35 +94,33 @@ jobs:
           mkdir -p /root/rpmbuild/SOURCES
           tar --exclude='.git' --exclude='.github' -czf /root/rpmbuild/SOURCES/cfd-tools-app.tar.gz .
           
-          # Injects the dynamic build date straight into the RPM release metadata tier
+          # Writing directly line-by-line avoiding tricky EOF indent blocks
           if [ ! -f cfd-tools.spec ]; then
-            cat << EOF > cfd-tools.spec
-          Name:           cfd-tools-app
-          Version:        1.0.0
-          Release:        ${BUILD_DATE}git${COMMIT_SHA}%{?dist}
-          Summary:        CSU Ram Racing FSAE CFD Automation Suite
-          License:        GPLv3
-          Source0:        cfd-tools-app.tar.gz
-          Requires:       python3.11
-          BuildArch:      noarch
-
-          %description
-          Automated CFD suite tools used by the aerodynamics subteam.
-
-          %prep
-          %setup -q -c
-
-          %install
-          mkdir -p %{buildroot}/opt/cfd-tools
-          cp -r * %{buildroot}/opt/cfd-tools/
-
-          %files
-          /opt/cfd-tools
-
-          %changelog
-          * Wed May 27 2026 GitHub Actions <actions@github.com> - 1.0.0
-          - Automated build package generation
-EOF
+            echo "Name:           cfd-tools-app" > cfd-tools.spec
+            echo "Version:        1.0.0" >> cfd-tools.spec
+            echo "Release:        ${BUILD_DATE}git${COMMIT_SHA}%{?dist}" >> cfd-tools.spec
+            echo "Summary:        CSU Ram Racing FSAE CFD Automation Suite" >> cfd-tools.spec
+            echo "License:        GPLv3" >> cfd-tools.spec
+            echo "Source0:        cfd-tools-app.tar.gz" >> cfd-tools.spec
+            echo "Requires:       python3.11" >> cfd-tools.spec
+            echo "BuildArch:      noarch" >> cfd-tools.spec
+            echo "" >> cfd-tools.spec
+            echo "%description" >> cfd-tools.spec
+            echo "Automated CFD suite tools used by the aerodynamics subteam." >> cfd-tools.spec
+            echo "" >> cfd-tools.spec
+            echo "%prep" >> cfd-tools.spec
+            echo "%setup -q -c" >> cfd-tools.spec
+            echo "" >> cfd-tools.spec
+            echo "%install" >> cfd-tools.spec
+            echo "mkdir -p %{buildroot}/opt/cfd-tools" >> cfd-tools.spec
+            echo "cp -r * %{buildroot}/opt/cfd-tools/" >> cfd-tools.spec
+            echo "" >> cfd-tools.spec
+            echo "%files" >> cfd-tools.spec
+            echo "/opt/cfd-tools" >> cfd-tools.spec
+            echo "" >> cfd-tools.spec
+            echo "%changelog" >> cfd-tools.spec
+            echo "* Wed May 27 2026 GitHub Actions <actions@github.com> - 1.0.0" >> cfd-tools.spec
+            echo "- Automated build package generation" >> cfd-tools.spec
           fi
           
           rpmbuild -ba cfd-tools.spec
