@@ -2,7 +2,7 @@ name: Nightly Development Build
 
 on:
   push:
-    branches: [ "main" ] # Automatically compiles on every commit to main
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -32,7 +32,6 @@ jobs:
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
           if (Test-Path CFD-Automation-Suite-Source-Code/requirements.txt) { pip install -r CFD-Automation-Suite-Source-Code/requirements.txt }
 
-      # Fetches and registers 'makensis' into the runner's path environment
       - name: Install NSIS Compiler Engine
         uses: negrutiu/nsis-install@v2
 
@@ -40,15 +39,12 @@ jobs:
         run: |
           makensis CFD-Automation-Suite-Source-Code/installer.nsi
 
-      # Extracts date/hash inside Windows PowerShell and renames the resulting installer
       - name: Rename Installer with Date and Commit Hash
         shell: powershell
         run: |
           $date = Get-Date -Format "yyyyMMdd"
           $sha = (git rev-parse --short HEAD).Trim()
           mkdir dist-staged
-          
-          # Locates the compiled setup file from your NSIS build and stamps it
           Get-ChildItem -Path . , dist, CFD-Automation-Suite-Source-Code -Filter *.exe -Recurse | Select-Object -First 1 | ForEach-Object {
               Move-Item $_.FullName "dist-staged/setup-$date-$sha.exe" -Force
           }
@@ -61,7 +57,7 @@ jobs:
           retention-days: 1
 
   # =========================================================================
-  # JOB 2: Collect Stamped Assets and Publish
+  # JOB 2: Delete Old Release, Then Publish Fresh One
   # =========================================================================
   publish-nightly:
     runs-on: ubuntu-latest
@@ -72,7 +68,6 @@ jobs:
       - name: Checkout repository code
         uses: actions/checkout@v4
 
-      # Enforce native bash environment variables
       - name: Generate build metadata tags
         id: metadata
         shell: bash
@@ -86,14 +81,29 @@ jobs:
           name: compiled-windows-exe
           path: dist-assets
 
-      # Explicit shell set to bash to ignore preexisting directories safely
       - name: Package application source archive
         shell: bash
         run: |
           mkdir -p dist-assets
-          tar --exclude='.git' --exclude='.github' --exclude='dist-assets' -czf dist-assets/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
+          tar --exclude='.git' --exclude='.github' --exclude='dist-assets' \
+            -czf dist-assets/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
 
-      - name: Update Nightly Pre-release Tag
+      # Deletes the release AND its tag so nothing old lingers.
+      # The `gh` CLI is pre-installed on all GitHub-hosted runners.
+      # The `|| true` prevents the step from failing if no prior release exists yet.
+      - name: Delete existing nightly release and tag
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete nightly-latest --yes --cleanup-tag || true
+
+      # Small pause to let GitHub's backend fully propagate the deletion
+      # before we immediately recreate the same tag name.
+      - name: Wait for deletion to propagate
+        run: sleep 5
+
+      - name: Publish fresh nightly release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-latest
@@ -101,9 +111,9 @@ jobs:
           body: |
             ### 🌙 Nightly Development Build
             This release contains the absolute latest, automatically compiled features directly from the `main` branch.
-            
+
             ⚠️ **Please Note:** These builds are developmental works-in-progress and may contain bugs or unstable features.
-            
+
             * **Build Date:** ${{ steps.metadata.outputs.BUILD_DATE }}
             * **Latest Commit:** ${{ steps.metadata.outputs.COMMIT_SHA }}
           prerelease: true
