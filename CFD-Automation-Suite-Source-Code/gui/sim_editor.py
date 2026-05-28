@@ -237,6 +237,35 @@ class SimEditorDialog(QDialog):
         form.setSpacing(9)
         form.setContentsMargins(20, 16, 20, 16)
 
+        # Issue #15: existing_mesh_path field — skip meshing and use pre-built mesh
+        skip_head = QLabel("Skip Meshing")
+        skip_head.setObjectName("subheading")
+        form.addRow(skip_head)
+
+        self.e_existing_mesh = QLineEdit()
+        self.e_existing_mesh.setPlaceholderText(
+            "Optional: path to existing .msh.h5 — leave blank to run full meshing pipeline…"
+        )
+        mesh_btn = QPushButton("Browse…")
+        mesh_btn.clicked.connect(
+            lambda: _browse_file(
+                self, self.e_existing_mesh,
+                "Select Existing Mesh File",
+                "Fluent Mesh (*.msh.h5 *.msh);;All Files (*)",
+            )
+        )
+        skip_note = QLabel(
+            "When set, the meshing pipeline is skipped entirely and this file is "
+            "loaded directly into the solver. Useful for iterating on solver "
+            "settings without re-meshing (saves ~90 min per run)."
+        )
+        skip_note.setObjectName("muted")
+        skip_note.setWordWrap(True)
+        form.addRow("Existing Mesh:", self._browse_row(self.e_existing_mesh, mesh_btn))
+        form.addRow(skip_note)
+
+        form.addRow(self._hsep())
+
         surf = QLabel("Surface Mesh")
         surf.setObjectName("subheading")
         form.addRow(surf)
@@ -471,6 +500,7 @@ class SimEditorDialog(QDialog):
         self.sb_ch.setValue(c.car_height_m)
         self.sb_wheelbase.setValue(c.wheelbase_in)
 
+        self.e_existing_mesh.setText(getattr(c, "existing_mesh_path", ""))
         self.sb_surf_min.setValue(c.surface_mesh_min)
         self.sb_surf_max.setValue(c.surface_mesh_max)
         self.sb_vol_min.setValue(c.volume_mesh_min)
@@ -514,6 +544,7 @@ class SimEditorDialog(QDialog):
         c.car_height_m      = self.sb_ch.value()
         c.wheelbase_in      = self.sb_wheelbase.value()
 
+        c.existing_mesh_path = self.e_existing_mesh.text().strip()
         c.surface_mesh_min  = self.sb_surf_min.value()
         c.surface_mesh_max  = self.sb_surf_max.value()
         c.volume_mesh_min   = self.sb_vol_min.value()
@@ -598,9 +629,11 @@ class SimEditorDialog(QDialog):
         yaw_head.setObjectName("subheading")
         form.addRow(yaw_head)
 
-        self.chk_auto_yaw = QCheckBox("Auto  (derived from speed ÷ radius)")
+        self.chk_auto_yaw = QCheckBox("Auto  (derived from speed and radius)")
         self.chk_auto_yaw.setToolTip(
-            "When enabled, yaw = atan(v / R).  Uncheck to set manually."
+            "When enabled, yaw = atan(v² / (g·R)).\n"
+            "This is the aerodynamic slip angle approximation.\n"
+            "Uncheck to set a manual yaw angle instead."
         )
         form.addRow("", self.chk_auto_yaw)
 
@@ -677,7 +710,9 @@ class SimEditorDialog(QDialog):
             speed_ms = self.sb_speed.value() * 0.44704
             R = self.sb_turn_radius.value()
             if R > 0:
-                yaw = math.degrees(math.atan2(speed_ms, R))
+                # Issue #11 fix: atan(v²/(g·R)) — aerodynamic slip angle
+                g = 9.81
+                yaw = math.degrees(math.atan(speed_ms ** 2 / (g * R)))
                 self._yaw_preview.setText(f"{yaw:.2f}°  (auto)")
             else:
                 self._yaw_preview.setText("—  (invalid radius)")
