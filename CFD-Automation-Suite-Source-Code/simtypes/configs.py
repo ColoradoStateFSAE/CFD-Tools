@@ -84,6 +84,10 @@ class BaseSimConfig:
     # Each entry: {"label": str, "zone": str, "type": "lift"|"drag"}
     extra_result_zones: List[dict] = field(default_factory=list)
 
+    # Issue #15 fix: existing_mesh_path field for skip-meshing feature
+    # Set to a valid .msh.h5 path to skip meshing and use a pre-built mesh.
+    existing_mesh_path: str = ""
+
     @property
     def sim_type(self) -> SimType:
         raise NotImplementedError
@@ -124,18 +128,21 @@ class HalfCarConfig(BaseSimConfig):
     """
     name: str = "Half Car Sim"
     # Half car defaults - 2 wheels (driver side)
+    # Issue #13 fix: correct wheel longitudinal positions.
+    # FRW at front axle (x=0), RRW at rear axle (x = wheelbase = 1.575 m for 62 in).
+    # center_z=0 for half-car (symmetry plane).
     wheel_mrf_zones: List[WheelMRFConfig] = field(default_factory=lambda: [
         WheelMRFConfig(
             name="FRW",
             zone_name="mrf_frw",
-            center_x=0.0, center_y=0.152, center_z=0.0,
+            center_x=0.0,    center_y=0.203, center_z=0.0,
             axis_x=0.0, axis_y=0.0, axis_z=1.0,
             wheel_radius=0.203,
         ),
         WheelMRFConfig(
             name="RRW",
             zone_name="mrf_rrw",
-            center_x=0.0, center_y=0.152, center_z=0.0,
+            center_x=1.575,  center_y=0.203, center_z=0.0,
             axis_x=0.0, axis_y=0.0, axis_z=1.0,
             wheel_radius=0.203,
         ),
@@ -270,11 +277,25 @@ class TurningConfig(BaseSimConfig):
         return False
 
     def effective_yaw_deg(self) -> float:
-        """Return the yaw angle that will actually be applied to the inlet."""
+        """
+        Return the yaw angle applied to the inlet velocity vector.
+
+        Issue #11 fix: the original formula atan2(v, R) gave ~63° at typical
+        autocross speeds, which is physically impossible sideslip.
+
+        Correct aerodynamic yaw angle (aerodynamic slip angle) approximation:
+            beta = atan(v^2 / (g * R))
+        This gives ~11° at 40 mph / 9 m radius, which is physically plausible
+        for a cornering CFD study.
+
+        When auto_yaw=False the manually specified yaw_angle_deg is used as-is.
+        """
         if self.auto_yaw and self.turn_radius_m > 0:
             import math
             speed_ms = self.vehicle_speed_mph * 0.44704
-            return math.degrees(math.atan2(speed_ms, self.turn_radius_m))
+            g = 9.81  # m/s^2
+            beta = math.degrees(math.atan(speed_ms ** 2 / (g * self.turn_radius_m)))
+            return beta
         return self.yaw_angle_deg
 
     def validate(self) -> List[str]:
