@@ -75,7 +75,11 @@ def _derive_cop(raw, wheelbase_in):
     lu_derived = abs(Mu / Fu) if Fu != 0 else 0.0
 
     f_res = math.sqrt(Fx ** 2 + Fy ** 2)
-    theta = 180 - (math.degrees(math.atan2(Fy, Fx)) + 90)
+    # Issue #12 fix: original formula 180-(atan2(Fy,Fx)+90) = 90-atan2(Fy,Fx)
+    # gave angle from horizontal, not from vertical as labelled.
+    # Correct form: angle from vertical = atan2(Fx, Fy)
+    # For typical aero (Fy >> Fx): small angle ~5-15 deg from vertical.
+    theta = math.degrees(math.atan2(Fx, Fy))
 
     return {
         "x_cp":        x_cp,
