@@ -205,7 +205,22 @@ class SimulationQueue:
         try:
             from core.runner import run_meshing, run_solver
             os.makedirs(job.config.output_dir, exist_ok=True)
-            mesh_file, mesh_quality = run_meshing(job.config, progress_cb=progress_cb)
+
+            # Issue #8 fix: respect existing_mesh_path — skip meshing if set
+            existing = getattr(job.config, "existing_mesh_path", "").strip()
+            if existing:
+                if not os.path.exists(existing):
+                    raise FileNotFoundError(
+                        f"Existing mesh not found: {existing}"
+                    )
+                log.info(f"Skipping meshing — using existing mesh: {existing}")
+                mesh_file    = existing
+                mesh_quality = {}
+            else:
+                mesh_file, mesh_quality = run_meshing(
+                    job.config, progress_cb=progress_cb
+                )
+
             results = run_solver(job.config, mesh_file,
                                  progress_cb=progress_cb,
                                  mesh_quality=mesh_quality)
