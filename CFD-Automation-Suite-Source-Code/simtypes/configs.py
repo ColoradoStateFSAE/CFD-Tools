@@ -234,8 +234,9 @@ class TurningConfig(BaseSimConfig):
     assigning asymmetric wheel RPMs based on the inner/outer path radii.
 
     Derived quantities (computed in runner.py at solve time):
-        yaw_angle_deg   = atan2(vehicle_speed_mph * 0.44704, turn_radius_m)
-                          when ``auto_yaw`` is True
+        yaw_angle_deg   = atan(v² / (g × R))   when ``auto_yaw`` is True
+                          where v = speed in m/s, g = 9.81 m/s², R = turn_radius_m
+                          (aerodynamic slip angle approximation — see Issue #11)
         omega_outer     = v_outer / r_wheel      (outer wheels faster)
         omega_inner     = v_inner / r_wheel      (inner wheels slower)
 
