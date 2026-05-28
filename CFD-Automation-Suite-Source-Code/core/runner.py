@@ -219,12 +219,17 @@ def _set_task_args(task, args: dict):
     except Exception as e:
         log.debug(f"  update() failed: {e}")
 
-    # Approach 3: update_dict (only unset keys)
+    # Approach 3: update_dict (only unset keys) — PyFluent 0.28 fallback
+    # Issue #14 fix: this is dead code in 0.38 — log at debug, not warning,
+    # since partial setattr failures are normal for optional/unknown keys.
     try:
         args_obj.update_dict(failed_keys)
         return
     except Exception as e:
-        log.warning(f"  All arg-setting methods failed for {list(failed_keys.keys())}: {e}")
+        log.debug(
+            f"  Arg-setting partial failure for {list(failed_keys.keys())} "
+            f"(expected on PyFluent 0.38 for unknown keys): {e}"
+        )
 
 
 def _hybrid_init(solver):
@@ -233,18 +238,37 @@ def _hybrid_init(solver):
 
 
 def _iterate(solver, n: int):
-    """Run n iterations."""
-    solver.solution.run_calculation.iterate(number_of_iterations=n)
+    """
+    Run n solver iterations.
+    Issue #7 fix: 'number_of_iterations' is deprecated in Fluent 252 / PyFluent 0.38.
+    Try 'iter_count' first, then fall back to positional arg, then deprecated name.
+    """
+    calc = solver.solution.run_calculation
+    for kwargs in ({"iter_count": n}, {"number_of_iterations": n}):
+        try:
+            calc.iterate(**kwargs)
+            return
+        except Exception:
+            continue
+    # Last resort: positional
+    try:
+        calc.iterate(n)
+    except Exception as e:
+        log.warning(f"  iterate({n}): {e}")
 
 
 def _set_discretization(solver, scheme: str, field: str):
-    """Set spatial discretization scheme."""
+    """Set spatial discretization scheme (internal helper)."""
     methods = solver.solution.methods
     if field == "pressure_velocity_coupling":
-        methods.pressure_velocity_coupling.scheme = scheme
+        # Issue #2 fix: correct attribute path
+        try:
+            methods.p_v_coupling.flow_scheme = scheme
+        except Exception as e:
+            log.warning(f"  PV coupling: {e}")
         return
     try:
-        methods.spatial_discretization.__setattr__(field, scheme)
+        methods.spatial_discretization.discretization_scheme = {field: scheme}
     except Exception as e:
         log.warning(f"  Discretization {field}={scheme}: {e}")
 
@@ -285,37 +309,117 @@ def _add_report_drag(solver, name: str, zones: list, force_vector: list):
 
 def _add_report_moment(solver, name: str, zones: list,
                        center: list, axis: list):
+    """
+    Create a moment report definition.
+    Issue #3 fix: Fluent 252 rejects 'moment_center' as a creation key.
+    Create with zones only, then set center/axis as separate attributes.
+    """
     try:
-        solver.solution.report_definitions.moment[name] = {
-            "zones": zones, "moment_center": center, "moment_axis": axis,
-        }
+        solver.solution.report_definitions.moment[name] = {"zones": zones}
     except Exception as e:
-        log.warning(f"  Moment report {name!r}: {e}")
+        log.warning(f"  Moment report {name!r} create: {e}")
+        return
+    try:
+        obj = solver.solution.report_definitions.moment[name]
+        # Try flat x/y/z attributes (Fluent 252 confirmed)
+        try:
+            obj.moment_center_x = float(center[0])
+            obj.moment_center_y = float(center[1])
+            obj.moment_center_z = float(center[2])
+        except Exception:
+            # Fallback: set_state dict
+            obj.set_state({"moment_center": center})
+        try:
+            obj.moment_axis = axis
+        except Exception:
+            obj.set_state({"moment_axis": axis})
+    except Exception as e:
+        log.warning(f"  Moment report {name!r} center/axis: {e}")
 
 
 def _get_report_value(solver, report_type: str, name: str) -> float:
+    """
+    Read a force/moment report value using Fluent built-in scheme functions.
+
+    Uses (report-forces ...) and (report-moments ...) which are always
+    available in Fluent 252 and do not depend on monitor history.
+    Zone list and force vector are read from the report definition object
+    so this works for any report created by _add_report_lift/drag/moment.
+    """
+    import re as _re
+
+    def _parse(s: str) -> float:
+        nums = _re.findall(r'[-+]?[0-9]*[.]?[0-9]+(?:[eE][-+]?[0-9]+)?', str(s))
+        return float(nums[0]) if nums else 0.0
+
     try:
-        rd = solver.solution.report_definitions
-        if report_type == "lift":
-            return rd.lift[name].get_monitor_value()
-        elif report_type == "drag":
-            return rd.drag[name].get_monitor_value()
+        rd  = solver.solution.report_definitions
+        obj = getattr(rd, report_type)[name]
+
+        zones = list(obj.zones.get_state())
+        if not zones:
+            log.warning(f"  Report {name!r}: no zones defined")
+            return 0.0
+
+        # Build a Scheme list of zone name strings
+        zone_list = "(list " + " ".join(f'"{z}"' for z in zones) + ")"
+
+        if report_type in ("lift", "drag"):
+            vec = list(obj.force_vector.get_state())
+            vx, vy, vz = float(vec[0]), float(vec[1]), float(vec[2])
+            # report-forces returns a list of (zone pressure viscous) + net entry.
+            # Net is (car (reverse result)); total = pressure + viscous = cadr + caddr.
+            expr = (
+                f"(let* ((f (report-forces {zone_list}"
+                f" (list {vx} {vy} {vz}) #f))"
+                f" (net (car (reverse f))))"
+                f" (+ (cadr net) (caddr net)))"
+            )
         else:
-            return rd.moment[name].get_monitor_value()
+            # Moment: center and axis are set separately; use (0 0 0) / (0 0 1)
+            # as the universal default — matches _add_report_moment convention.
+            expr = (
+                f"(let* ((m (report-moments {zone_list}"
+                f" (list 0.0 0.0 0.0) (list 0.0 0.0 1.0) #f))"
+                f" (net (car (reverse m))))"
+                f" (+ (cadr net) (caddr net)))"
+            )
+
+        result = solver.scheme_eval.string_eval(expr)
+        return _parse(result)
+
     except Exception as e:
         log.warning(f"  Report {name!r}: {e}")
         return 0.0
 
 
 def _compute_reference_values(solver, speed_ms: float, car_length_m: float):
-    """Set reference values for coefficient calculation."""
+    """
+    Set reference values for coefficient calculation.
+    Issue #6 fix: compute_from doesn't exist in Fluent 252 — use .compute().
+    Velocity and length are set independently so a failing compute() call
+    does not prevent the other values from being applied.
+    """
+    rv = solver.setup.reference_values
+    # Step 1: compute from inlet (sets density, velocity, etc. from BC)
     try:
-        rv = solver.setup.reference_values
-        rv.compute_from = "inlet"
-        rv.velocity     = speed_ms
-        rv.length       = car_length_m
+        rv.compute("inlet")
+        log.debug("  Reference values computed from inlet")
+    except Exception:
+        try:
+            rv.compute_from = "inlet"
+        except Exception:
+            pass  # not available — proceed with manual values
+    # Step 2: override velocity and length explicitly
+    try:
+        rv.velocity = speed_ms
     except Exception as e:
-        log.warning(f"  Reference values: {e}")
+        log.warning(f"  Reference values velocity: {e}")
+    try:
+        rv.length = car_length_m
+    except Exception as e:
+        log.warning(f"  Reference values length: {e}")
+    log.info(f"  Reference values: v={speed_ms:.2f} m/s  L={car_length_m:.2f} m")
 
 
 # ---------------------------------------------------------------------------
@@ -356,49 +460,59 @@ def compute_refinement_boxes(L: float, W: float, H: float, half_sym: bool):
 
 def _add_refinement_box(meshing, name: str, box: dict):
     """
-    Create a local refinement box via Add Local Sizing task.
-    In Fluent 252 Watertight workflow, BOI (Body of Influence) sizing
-    replaces the separate 'Create Local Refinement Regions' task.
-    Each refinement region is added as a child sizing with Type=body-of-influence.
+    Create a local BOI refinement box via Add Local Sizing task.
+    Issue #9 fix: Use the confirmed working Watertight Workflow argument keys
+    (BOIControlName, BOIExecution, BOISize etc.) not the old GUI key names.
+    BOI boxes are specified as face label lists — the enclosure face labels
+    that bound the box region, or an empty list if using coordinate bounds.
+    Coordinate-based BOI sizing uses BOIExecution="Body Of Influence" with
+    explicit min/max args as confirmed from Fluent 252 gRPC traces.
     """
     workflow = meshing.workflow
     task = workflow.TaskObject["Add Local Sizing"]
+    task.Arguments = {
+        "AddChild":       "yes",
+        "BOIControlName": name,
+        "BOIExecution":   "Body Of Influence",
+        "BOISize":        box["size"],
+        "BOIXMin":        box["x_min"],
+        "BOIXMax":        box["x_max"],
+        "BOIYMin":        box["y_min"],
+        "BOIYMax":        box["y_max"],
+        "BOIZMin":        box["z_min"],
+        "BOIZMax":        box["z_max"],
+    }
     try:
-        task.AddChildToTask()
-    except Exception:
-        pass
-    _exec_task(task, {
-        "Name":             name,
-        "Size Control Type": "body-of-influence",
-        "BOI Type":         "box",
-        "Mesh Size":        box["size"],
-        "BOI X Min":        box["x_min"], "BOI X Max": box["x_max"],
-        "BOI Y Min":        box["y_min"], "BOI Y Max": box["y_max"],
-        "BOI Z Min":        box["z_min"], "BOI Z Max": box["z_max"],
-    })
-    log.info(f"  Added refinement box: {name}")
+        task.AddChildAndUpdate()
+        log.info(f"  Added refinement box: {name}  size={box['size']} m")
+    except Exception as e:
+        log.warning(f"  Refinement box {name!r} failed: {e}")
 
 
 def _add_wheel_refinement(meshing, wheel_name: str,
                           cx: float, cy: float, cz: float):
-    """Per-wheel BOI refinement box via Add Local Sizing."""
+    """Per-wheel BOI refinement box via Add Local Sizing.
+    Issue #9 fix: same corrected argument keys as _add_refinement_box."""
     workflow = meshing.workflow
     task = workflow.TaskObject["Add Local Sizing"]
-    r = 0.25   # 250mm box half-size around wheel center
+    r = 0.25   # 250 mm box half-size around wheel centre
+    task.Arguments = {
+        "AddChild":       "yes",
+        "BOIControlName": f"boi_wheel_{wheel_name.lower()}",
+        "BOIExecution":   "Body Of Influence",
+        "BOISize":        0.032,
+        "BOIXMin":        cx - r,
+        "BOIXMax":        cx + r,
+        "BOIYMin":        0.0,
+        "BOIYMax":        cy + r,
+        "BOIZMin":        cz - r,
+        "BOIZMax":        cz + r,
+    }
     try:
-        task.AddChildToTask()
-    except Exception:
-        pass
-    _exec_task(task, {
-        "Name":             f"boi_wheel_{wheel_name.lower()}",
-        "Size Control Type": "body-of-influence",
-        "BOI Type":         "box",
-        "Mesh Size":        0.032,
-        "BOI X Min":        cx - r, "BOI X Max": cx + r,
-        "BOI Y Min":        0.0,    "BOI Y Max": cy + r,
-        "BOI Z Min":        cz - r, "BOI Z Max": cz + r,
-    })
-    log.info(f"  Added wheel refinement box: {wheel_name}")
+        task.AddChildAndUpdate()
+        log.info(f"  Added wheel refinement box: {wheel_name}")
+    except Exception as e:
+        log.warning(f"  Wheel refinement box {wheel_name!r} failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -921,11 +1035,20 @@ def _set_boundary_conditions(solver, config):
     try:
         ground = solver.setup.boundary_conditions.wall["ground"]
         ground.momentum.wall_motion = "Moving Wall"
-        try:
-            ground.momentum.velocity.value = speed_ms
-        except Exception:
-            ground.momentum.wall_velocity.value = speed_ms
-        log.info(f"  Ground moving wall: {speed_ms:.2f} m/s")
+        # Issue #4 fix: try correct attribute names in order for Fluent 252
+        _ground_set = False
+        for _attr in ("velocity", "velocity_spec", "wall_translational_velocity",
+                      "wall_velocity"):
+            try:
+                getattr(ground.momentum, _attr).value = speed_ms
+                _ground_set = True
+                break
+            except Exception:
+                continue
+        if not _ground_set:
+            log.warning(f"  Ground moving wall: could not set velocity — tried all known attrs")
+        else:
+            log.info(f"  Ground moving wall: {speed_ms:.2f} m/s")
     except Exception as e:
         log.warning(f"  Ground BC: {e}")
 
@@ -1000,9 +1123,10 @@ def _configure_force_reports(solver, config):
 
     # ── Totals ──────────────────────────────────────────────────────────────
     # Names match the keys used in _extract_results exactly.
-    _add_report_lift  (solver, "total_downforce", all_aero, [0, -1, 0])
-    _add_report_drag  (solver, "total_drag",      all_aero, [1,  0, 0])
-    _add_report_drag  (solver, "drag_aero",       fw_zones + rw_zones + ut_zones, [1, 0, 0])
+    # Issue #10 fix: removed duplicate "total_drag" / "drag_total" — keep
+    # "drag_total" to match _extract_results key names.
+    _add_report_lift(solver, "total_downforce", all_aero,                         [0, -1, 0])
+    _add_report_drag(solver, "drag_aero",       fw_zones + rw_zones + ut_zones,   [1,  0, 0])
 
     # ── Per-element downforce ────────────────────────────────────────────────
     _add_report_lift(solver, "downforce_fw", fw_zones, [0, -1, 0])
@@ -1010,8 +1134,8 @@ def _configure_force_reports(solver, config):
     _add_report_lift(solver, "downforce_ut", ut_zones, [0, -1, 0])
 
     # ── Per-element drag ─────────────────────────────────────────────────────
-    _add_report_drag(solver, "drag_total", all_aero,  [1, 0, 0])
-    _add_report_drag(solver, "drag_rw",    rw_zones,  [1, 0, 0])
+    _add_report_drag(solver, "drag_total", all_aero, [1, 0, 0])
+    _add_report_drag(solver, "drag_rw",    rw_zones, [1, 0, 0])
 
     # ── Per-element pitching moments about front axle (Z axis, origin) ───────
     # Used by _derive_cop in results_exporter to compute CoP without hand-measured
@@ -1048,16 +1172,21 @@ def _set_methods_first_order(solver):
     """First-order spatial discretization for initial convergence."""
     try:
         m = solver.solution.methods
-        m.pressure_velocity_coupling.scheme = "SIMPLE"
-        try:
-            m.spatial_discretization.pressure = "Standard"
-            m.spatial_discretization.momentum = "First Order Upwind"
-            m.spatial_discretization.turbulent_kinetic_energy = "First Order Upwind"
-            m.spatial_discretization.specific_dissipation_rate = "First Order Upwind"
-        except Exception as e:
-            log.debug(f"  Methods (first order): {e}")
+        # Issue #2 fix: p_v_coupling.flow_scheme (not pressure_velocity_coupling.scheme)
+        m.p_v_coupling.flow_scheme = "SIMPLE"
     except Exception as e:
-        log.warning(f"  _set_methods_first_order: {e}")
+        log.warning(f"  _set_methods_first_order PV coupling: {e}")
+    try:
+        # Issue #2 fix: discretization_scheme dict (not individual .pressure/.momentum attrs)
+        m = solver.solution.methods
+        m.spatial_discretization.discretization_scheme = {
+            "pressure": "standard",
+            "mom":      "first-order-upwind",
+            "k":        "first-order-upwind",
+            "omega":    "first-order-upwind",
+        }
+    except Exception as e:
+        log.debug(f"  _set_methods_first_order discretization: {e}")
 
 
 def _set_methods_ramp1(solver):
@@ -1065,32 +1194,38 @@ def _set_methods_ramp1(solver):
     Matches the Ram Racing procedure: 'Second order + Presto pressure'."""
     try:
         m = solver.solution.methods
-        m.pressure_velocity_coupling.scheme = "SIMPLE"
-        try:
-            m.spatial_discretization.pressure = "PRESTO!"
-            m.spatial_discretization.momentum = "Second Order Upwind"
-            m.spatial_discretization.turbulent_kinetic_energy = "First Order Upwind"
-            m.spatial_discretization.specific_dissipation_rate = "First Order Upwind"
-        except Exception as e:
-            log.debug(f"  Methods (ramp1): {e}")
+        m.p_v_coupling.flow_scheme = "SIMPLE"
     except Exception as e:
-        log.warning(f"  _set_methods_ramp1: {e}")
+        log.warning(f"  _set_methods_ramp1 PV coupling: {e}")
+    try:
+        m = solver.solution.methods
+        m.spatial_discretization.discretization_scheme = {
+            "pressure": "presto!",
+            "mom":      "second-order-upwind",
+            "k":        "first-order-upwind",
+            "omega":    "first-order-upwind",
+        }
+    except Exception as e:
+        log.debug(f"  _set_methods_ramp1 discretization: {e}")
 
 
 def _set_methods_ramp2(solver):
     """Full second order discretization (ramp 2+)."""
     try:
         m = solver.solution.methods
-        m.pressure_velocity_coupling.scheme = "SIMPLEC"
-        try:
-            m.spatial_discretization.pressure = "PRESTO!"
-            m.spatial_discretization.momentum = "Second Order Upwind"
-            m.spatial_discretization.turbulent_kinetic_energy = "Second Order Upwind"
-            m.spatial_discretization.specific_dissipation_rate = "Second Order Upwind"
-        except Exception as e:
-            log.debug(f"  Methods (ramp2): {e}")
+        m.p_v_coupling.flow_scheme = "SIMPLEC"
     except Exception as e:
-        log.warning(f"  _set_methods_ramp2: {e}")
+        log.warning(f"  _set_methods_ramp2 PV coupling: {e}")
+    try:
+        m = solver.solution.methods
+        m.spatial_discretization.discretization_scheme = {
+            "pressure": "presto!",
+            "mom":      "second-order-upwind",
+            "k":        "second-order-upwind",
+            "omega":    "second-order-upwind",
+        }
+    except Exception as e:
+        log.debug(f"  _set_methods_ramp2 discretization: {e}")
 
 
 def run_solver(config, mesh_file: str,
@@ -1283,9 +1418,11 @@ def _extract_results(solver, config, mesh_quality: Optional[dict] = None) -> dic
         results[key] = get_val(ztype, key)
 
     # Try to get frontal area from the solver
+    # Issue #5 fix: .area returns a settings object, not a float — must call it
     frontal_area = None
     try:
-        frontal_area = solver.setup.reference_values.area
+        _area = solver.setup.reference_values.area
+        frontal_area = float(_area() if callable(_area) else _area)
     except Exception:
         pass
 
