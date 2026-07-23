@@ -74,7 +74,7 @@ class BaseSimConfig:
 
     # Wheelbase for CoP % calculation [in] — RR26 default 62.0 in
     # CoP arm lengths (Lf, Lr, Lu) are derived from simulation moment data
-    wheelbase_in: float = 62.0
+    wheelbase_m: float = 1.575
 
     # Fluent launch timeout [seconds] — increase for slow HPC startup
     # 60s is the PyFluent default; 300s recommended for cluster machines
@@ -246,8 +246,8 @@ class TurningConfig(BaseSimConfig):
         v_inner = speed_ms * (turn_radius_m - track_width_m) / turn_radius_m
 
     Extra results reported:
-        yaw_moment_lbf_ft   aerodynamic yaw moment about car centroid (Y axis)
-        lateral_force_lbf   total side force (Z axis)
+        yaw_moment          aerodynamic yaw moment about car centroid [N*m]
+        lateral_force       total side force [N]
     """
     name: str = "Turning Sim"
 
