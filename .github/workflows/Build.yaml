@@ -27,8 +27,17 @@ jobs:
 
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller --name CFDAutomationSuite --windowed --onedir main.py
-          # --onedir is usually better for NSIS packaging than --onefile
+          pyinstaller --name RamRacingCFD --windowed --onedir main.py `
+            --collect-all PyQt6 `
+            --add-data "utils\Wheel_MRF_Setup_Guide.pdf;utils"
+          # --add-data copies the PDF into dist\RamRacingCFD\utils\
+          # so $INSTDIR\utils\Wheel_MRF_Setup_Guide.pdf exists after install
+
+      - name: Verify expected assets exist
+        run: |
+          if (!(Test-Path "assets\logo.ico")) { throw "Missing assets\logo.ico" }
+          if (!(Test-Path "Documentation\LICENSE.txt")) { throw "Missing Documentation\LICENSE.txt" }
+          if (!(Test-Path "dist\RamRacingCFD\utils\Wheel_MRF_Setup_Guide.pdf")) { throw "PDF not bundled into dist" }
 
       - name: Install NSIS
         run: choco install nsis -y
@@ -40,12 +49,11 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CFDAutomationSuite-Setup
-          path: installer\CFDAutomationSuite-Setup.exe
+          name: RamRacingCFD-Setup
+          path: installer\RamRacingCFD-Setup.exe
 
-      # Optional: attach to a GitHub Release when triggered by a tag push
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: installer\CFDAutomationSuite-Setup.exe
+          files: installer\RamRacingCFD-Setup.exe
