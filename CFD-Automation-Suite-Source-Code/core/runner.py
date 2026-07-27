@@ -9,7 +9,6 @@ import math
 import logging
 import os
 import sys
-from collections import deque
 from typing import Callable, Optional
 
 log = logging.getLogger("fluent_runner")
@@ -534,34 +533,208 @@ def compute_refinement_boxes(L: float, W: float, H: float, half_sym: bool):
     return near, mid, far
 
 
-def _add_refinement_box(watertight, name: str, box: dict):
+def _get_refinement_task(meshing, watertight):
     """
-    Create a local BOI refinement box via the Enhanced Meshing Workflow.
-    Uses the 2026 R1 attribute-based API: watertight.add_local_sizing_wtm
-    with boi_execution="Body Of Influence".
-    """
-    try:
-        sizing = watertight.add_local_sizing_wtm
-        sizing.add_child = "yes"
-        sizing.boi_control_name = name
-        sizing.boi_execution = "Body Of Influence"
-        sizing.boi_size = box["size"]
-        sizing.boi_zoneor_label = "label"
-        # BOI box coordinate bounds (if supported in 2026 R1 watertight)
-        for attr, key in [
-            ("boi_x_min", "x_min"), ("boi_x_max", "x_max"),
-            ("boi_y_min", "y_min"), ("boi_y_max", "y_max"),
-            ("boi_z_min", "z_min"), ("boi_z_max", "z_max"),
-        ]:
-            try:
-                setattr(sizing, attr, box[key])
-            except Exception:
-                pass
-        sizing.add_child_and_update(defer_update=False)
-        log.info(f"  Added refinement box: {name}  size={box['size']} m")
-    except Exception as e:
-        log.warning(f"  Refinement box {name!r} failed: {e}")
+    Return the "Create Local Refinement Regions" task, inserting it into
+    the workflow first if necessary.
 
+    2026 R1 Enhanced Workflow exposes tasks as attributes and requires
+    optional tasks to be inserted via insertable_tasks before use.
+    Falls back to the legacy TaskObject dict API if needed.
+    """
+    # 1. Already present on the enhanced workflow?
+    for attr in ("create_local_refinement_regions",
+                 "local_refinement_regions",
+                 "create_local_refinement_region"):
+        task = getattr(watertight, attr, None)
+        if task is not None:
+            return ("enhanced", task)
+
+    # 2. Insert it via insertable_tasks
+    for parent_attr in ("import_geometry", "add_local_sizing_wtm",
+                        "create_surface_mesh"):
+        parent = getattr(watertight, parent_attr, None)
+        if parent is None:
+            continue
+        insertables = getattr(parent, "insertable_tasks", None)
+        if insertables is None:
+            continue
+        for task_attr in ("create_local_refinement_regions",
+                          "local_refinement_regions",
+                          "create_local_refinement_region"):
+            inserter = getattr(insertables, task_attr, None)
+            if inserter is None:
+                continue
+            try:
+                inserter.insert()
+                task = getattr(watertight, task_attr, None)
+                if task is not None:
+                    log.debug(f"  Inserted task: {task_attr}")
+                    return ("enhanced", task)
+            except Exception as e:
+                log.debug(f"  Insert {task_attr}: {e}")
+
+    # 3. Legacy TaskObject fallback
+    try:
+        task = meshing.workflow.TaskObject["Create Local Refinement Regions"]
+        return ("legacy", task)
+    except Exception as e:
+        log.debug(f"  Legacy TaskObject lookup: {e}")
+
+    return (None, None)
+
+
+def _set_task_property(task, name, value):
+    """Set a task property, handling both set_state() and plain setattr."""
+    obj = getattr(task, name, None)
+    if obj is None:
+        return False
+    try:
+        if hasattr(obj, "set_state"):
+            obj.set_state(value)
+        else:
+            setattr(task, name, value)
+        return True
+    except Exception:
+        try:
+            setattr(task, name, value)
+            return True
+        except Exception:
+            return False
+
+
+def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
+    """
+    Create a coordinate-specified local refinement box.
+
+    Box coordinates come from compute_refinement_boxes(), which implements
+    Tables 1-3 of the Ram Racing Fluent Procedure document (the same
+    formulas as localrefinementregion.m).
+
+    Returns True if the region was created.
+    """
+    mode, task = _get_refinement_task(meshing, watertight)
+
+    if mode is None:
+        log.warning(f"  Refinement box {name!r}: task not available in workflow")
+        return False
+
+    if mode == "legacy":
+        try:
+            task.Arguments.update({
+                "LocalRefinementRegionName":     name,
+                "Type":                          "box",
+                "CoordinateSpecificationMethod": "directly-specify-coordinates",
+                "MeshSize":                      box["size"],
+                "XMin": box["x_min"], "XMax": box["x_max"],
+                "YMin": box["y_min"], "YMax": box["y_max"],
+                "ZMin": box["z_min"], "ZMax": box["z_max"],
+            })
+            task.Execute()
+            log.info(
+                f"  Added refinement box: {name}  size={box['size']} m  "
+                f"X[{box['x_min']:.2f}, {box['x_max']:.2f}]  "
+                f"Y[{box['y_min']:.2f}, {box['y_max']:.2f}]  "
+                f"Z[{box['z_min']:.2f}, {box['z_max']:.2f}]"
+            )
+            return True
+        except Exception as e:
+            log.warning(f"  Refinement box {name!r} (legacy): {e}")
+            return False
+
+    # Enhanced workflow — snake_case properties
+    props = [
+        ("local_refinement_region_name",     name),
+        ("region_name",                      name),
+        ("type",                             "box"),
+        ("region_type",                      "box"),
+        ("coordinate_specification_method",  "directly-specify-coordinates"),
+        ("mesh_size",                        box["size"]),
+        ("x_min", box["x_min"]), ("x_max", box["x_max"]),
+        ("y_min", box["y_min"]), ("y_max", box["y_max"]),
+        ("z_min", box["z_min"]), ("z_max", box["z_max"]),
+    ]
+    n_set = 0
+    for prop, value in props:
+        if _set_task_property(task, prop, value):
+            n_set += 1
+
+    if n_set == 0:
+        log.warning(
+            f"  Refinement box {name!r}: no properties could be set "
+            f"(available: {[a for a in dir(task) if not a.startswith('_')][:15]})"
+        )
+        return False
+
+    try:
+        task()
+        log.info(
+            f"  Added refinement box: {name}  size={box['size']} m  "
+            f"X[{box['x_min']:.2f}, {box['x_max']:.2f}]  "
+            f"Y[{box['y_min']:.2f}, {box['y_max']:.2f}]  "
+            f"Z[{box['z_min']:.2f}, {box['z_max']:.2f}]"
+        )
+        return True
+    except Exception as e:
+        log.warning(f"  Refinement box {name!r} execute: {e}")
+        return False
+
+
+def _add_wheel_refinement(meshing, watertight, wheel_name: str,
+                          cx: float, cy: float, cz: float) -> bool:
+    """
+    Per-wheel local refinement box.
+
+    Uses relative-to-body-size specification per Table 4 of the Fluent
+    Procedure document: 0.032 m mesh size, box sized relative to the
+    wheel body rather than absolute coordinates.
+    """
+    mode, task = _get_refinement_task(meshing, watertight)
+    if mode is None:
+        return False
+
+    region_name = f"wheel_{wheel_name.lower()}"
+
+    if mode == "legacy":
+        try:
+            task.Arguments.update({
+                "LocalRefinementRegionName":     region_name,
+                "Type":                          "box",
+                "CoordinateSpecificationMethod": "relative-to-body-size",
+                "MeshSize":                      0.032,
+                "XMin": 0.1, "XMax": 1.0,
+                "YMin": 0.0, "YMax": 0.1,
+                "ZMin": 0.1, "ZMax": 0.1,
+            })
+            task.Execute()
+            log.info(f"  Added wheel refinement box: {wheel_name}")
+            return True
+        except Exception as e:
+            log.warning(f"  Wheel refinement {wheel_name!r} (legacy): {e}")
+            return False
+
+    props = [
+        ("local_refinement_region_name",    region_name),
+        ("region_name",                     region_name),
+        ("type",                            "box"),
+        ("region_type",                     "box"),
+        ("coordinate_specification_method", "relative-to-body-size"),
+        ("mesh_size",                       0.032),
+        ("x_min", 0.1), ("x_max", 1.0),
+        ("y_min", 0.0), ("y_max", 0.1),
+        ("z_min", 0.1), ("z_max", 0.1),
+    ]
+    n_set = sum(1 for p, v in props if _set_task_property(task, p, v))
+    if n_set == 0:
+        return False
+
+    try:
+        task()
+        log.info(f"  Added wheel refinement box: {wheel_name}")
+        return True
+    except Exception as e:
+        log.warning(f"  Wheel refinement {wheel_name!r} execute: {e}")
+        return False
 
 def _add_wheel_refinement(watertight, wheel_name: str,
                           cx: float, cy: float, cz: float):
@@ -842,24 +1015,30 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
             sizing.add_child_and_update(defer_update=False)
 
         # Near / Mid / Far volume refinement boxes
+        # Coordinates from compute_refinement_boxes() — Tables 1-3 of the
+        # Ram Racing Fluent Procedure doc, same formulas as
+        # MATLAB-Scripts/localrefinementregion.m
         prog("Adding Near/Mid/Far refinement boxes...", 38)
-        try:
-            near, mid, far = compute_refinement_boxes(
-                config.car_length_m, config.car_width_m, config.car_height_m,
-                half_sym=getattr(config, "is_half_symmetry", False),
+        near, mid, far = compute_refinement_boxes(
+            config.car_length_m, config.car_width_m, config.car_height_m,
+            half_sym=getattr(config, "is_half_symmetry", False),
+        )
+        n_boxes = 0
+        n_boxes += _add_refinement_box(meshing, watertight, "boi_near", near)
+        n_boxes += _add_refinement_box(meshing, watertight, "boi_mid",  mid)
+        n_boxes += _add_refinement_box(meshing, watertight, "boi_far",  far)
+        if n_boxes < 3:
+            log.warning(
+                f"  Only {n_boxes}/3 refinement boxes created — "
+                f"mesh will be coarser in the near field than intended"
             )
-            _add_refinement_box(watertight, "boi_near", near)
-            _add_refinement_box(watertight, "boi_mid",  mid)
-            _add_refinement_box(watertight, "boi_far",  far)
-        except Exception as e:
-            log.warning(f"  Refinement boxes skipped: {e}")
 
-        # Per-wheel refinement boxes
+        # Per-wheel refinement boxes (Table 4)
         if config.use_wheel_mrf and config.wheel_mrf_zones:
             prog("Adding wheel refinement boxes...", 42)
             for wheel in config.wheel_mrf_zones:
                 _add_wheel_refinement(
-                    watertight, wheel.name,
+                    meshing, watertight, wheel.name,
                     wheel.center_x, wheel.center_y, wheel.center_z,
                 )
 
@@ -1682,4 +1861,3 @@ def _extract_results(solver, config, mesh_quality=None):
         log.warning(f"  Results export failed: {e}")
 
     return results
-
