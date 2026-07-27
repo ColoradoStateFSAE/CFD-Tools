@@ -8,29 +8,38 @@ on:
 permissions:
   contents: write
 
+env:
+  SRC_DIR: CFD-Automation-Suite-Source-Code
+
 jobs:
   # =========================================================================
-  # JOB 1: Build the self-contained app with PyInstaller, then package
+  # JOB 1: Build the app with PyInstaller, then wrap it in an NSIS installer
+  #
+  #   PyInstaller produces dist/RamRacingCFD/ — a self-contained bundle
+  #   containing the exe, the Python runtime, PyQt6, and PyFluent.
+  #   NSIS then packages that folder into RamRacingCFD-Setup.exe.
+  #
+  #   Running NSIS WITHOUT PyInstaller first produces an installer that
+  #   only contains .py source files and cannot run. That was the old bug.
   # =========================================================================
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     defaults:
       run:
-        working-directory: CFD-Automation-Suite-Source-Code
+        working-directory: ${{ env.SRC_DIR }}
 
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
-      # ── Install all Python dependencies ──────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -39,93 +48,89 @@ jobs:
           pip install pyinstaller
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-      # ── Verify critical imports work ─────────────────────────────────
+      # ── Fail fast if the source itself is broken ─────────────────────────
       - name: Verify imports
         run: |
-          python -c "import PyQt6.QtWidgets; print('PyQt6 OK')"
-          python -c "import ansys.fluent.core; print('PyFluent OK')"
-          python -c "from simtypes.configs import HalfCarConfig; print('Configs OK')"
-          python -c "from core.runner import run_meshing; print('Runner OK')"
+          python -c "import PyQt6.QtWidgets;          print('PyQt6 OK')"
+          python -c "import ansys.fluent.core;        print('PyFluent OK')"
+          python -c "import simtypes.configs;         print('Configs OK')"
+          python -c "import core.runner;              print('Runner OK')"
+          python -c "import core.queue_manager;       print('Queue OK')"
+          python -c "import utils.results_exporter;   print('Exporter OK')"
 
-      # ── Build with PyInstaller ───────────────────────────────────────
-      # This creates dist/RamRacingCFD/ containing the self-contained
-      # executable + all bundled dependencies. No Python install needed
-      # on the target machine.
-      - name: Build with PyInstaller
+      # ── Build the self-contained application ─────────────────────────────
+      - name: Build application with PyInstaller
         run: |
-          pyinstaller --clean RamRacingCFD.spec 2>&1 | Tee-Object -FilePath build.log
+          pyinstaller --clean --noconfirm RamRacingCFD.spec
 
-          # Verify the exe was actually created and has real content
-          if (!(Test-Path "dist\RamRacingCFD\RamRacingCFD.exe")) {
-            Write-Error "BUILD FAILED — RamRacingCFD.exe not found"
-            Get-Content build.log | Select-Object -Last 50
+          if (-not (Test-Path "dist\RamRacingCFD\RamRacingCFD.exe")) {
+            Write-Error "PyInstaller did not produce RamRacingCFD.exe"
             exit 1
           }
 
-          $size = (Get-Item "dist\RamRacingCFD\RamRacingCFD.exe").Length / 1MB
-          if ($size -lt 1) {
-            Write-Error "BUILD FAILED — exe is only $([math]::Round($size, 2)) MB (expected >10 MB)"
+          $bundle = Get-ChildItem -Recurse "dist\RamRacingCFD" |
+                    Measure-Object -Property Length -Sum
+          $mb = [math]::Round($bundle.Sum / 1MB, 1)
+
+          Write-Output "Bundle: $($bundle.Count) files, $mb MB"
+
+          # A real bundle with Python + Qt + PyFluent is >50 MB.
+          # Anything smaller means dependencies were not collected.
+          if ($mb -lt 30) {
+            Write-Error "Bundle is only $mb MB — dependencies were not bundled"
             exit 1
           }
 
-          Write-Output "Build successful:"
-          Get-ChildItem dist\RamRacingCFD\ | Measure-Object -Property Length -Sum | ForEach-Object {
-            Write-Output "  $($_.Count) files, $([math]::Round($_.Sum / 1MB, 1)) MB total"
+      # ── Wrap the bundle in an installer ──────────────────────────────────
+      - name: Install NSIS Compiler Engine
+        uses: negrutiu/nsis-install@v2
+
+      - name: Compile Windows Installer via NSIS
+        run: |
+          makensis installer.nsi
+
+          if (-not (Test-Path "RamRacingCFD-Setup.exe")) {
+            Write-Error "NSIS did not produce RamRacingCFD-Setup.exe"
+            exit 1
           }
 
-      # ── Create portable zip (no installer needed) ───────────────────
-      - name: Create portable zip
+          $setupMb = [math]::Round((Get-Item "RamRacingCFD-Setup.exe").Length / 1MB, 1)
+          Write-Output "Installer: $setupMb MB"
+
+          # The installer must be large enough to contain the bundle.
+          if ($setupMb -lt 20) {
+            Write-Error "Installer is only $setupMb MB — it does not contain the app bundle"
+            exit 1
+          }
+
+      # ── Stage both deliverables with date + commit metadata ──────────────
+      - name: Stage artifacts with date and commit hash
         shell: powershell
         run: |
           $date = Get-Date -Format "yyyyMMdd"
-          $sha = (git rev-parse --short HEAD).Trim()
-          $zipName = "RamRacingCFD-$date-$sha-portable.zip"
-          Compress-Archive -Path dist\RamRacingCFD\* -DestinationPath "..\$zipName"
-          Write-Output "Created $zipName ($([math]::Round((Get-Item ..\$zipName).Length / 1MB, 1)) MB)"
+          $sha  = (git rev-parse --short HEAD).Trim()
 
-      # ── Create NSIS installer (optional — wraps the PyInstaller bundle) ──
-      - name: Install NSIS
-        uses: negrutiu/nsis-install@v2
+          New-Item -ItemType Directory -Force -Path "..\dist-staged" | Out-Null
 
-      - name: Build NSIS installer
-        shell: powershell
-        run: |
-          # Only build NSIS installer if the .nsi file exists
-          if (Test-Path "installer.nsi") {
-            makensis installer.nsi
-            $date = Get-Date -Format "yyyyMMdd"
-            $sha = (git rev-parse --short HEAD).Trim()
-            # Find the generated exe and rename it
-            Get-ChildItem -Filter *.exe -Exclude RamRacingCFD.exe | Select-Object -First 1 | ForEach-Object {
-              Move-Item $_.FullName "..\RamRacingCFD-$date-$sha-setup.exe" -Force
-              Write-Output "Installer: RamRacingCFD-$date-$sha-setup.exe"
-            }
-          } else {
-            Write-Output "No installer.nsi found — skipping NSIS build"
-          }
+          Move-Item "RamRacingCFD-Setup.exe" `
+                    "..\dist-staged\RamRacingCFD-setup-$date-$sha.exe" -Force
 
-      # ── Stage all artifacts ──────────────────────────────────────────
-      - name: Stage distribution files
-        shell: powershell
-        run: |
-          mkdir -Force ..\dist-staged
-          # Move zip
-          Get-ChildItem ..\ -Filter "RamRacingCFD-*-portable.zip" | Move-Item -Destination ..\dist-staged\
-          # Move installer exe (if it exists)
-          Get-ChildItem ..\ -Filter "RamRacingCFD-*-setup.exe" | Move-Item -Destination ..\dist-staged\
-          # List what we're uploading
-          Write-Output "Distribution files:"
-          Get-ChildItem ..\dist-staged\
+          Compress-Archive -Path "dist\RamRacingCFD\*" `
+                           -DestinationPath "..\dist-staged\RamRacingCFD-portable-$date-$sha.zip"
 
-      - name: Upload artifacts
+          Get-ChildItem "..\dist-staged" |
+            Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,1)}} |
+            Format-Table -AutoSize
+
+      - name: Archive Windows build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: windows-build
+          name: compiled-windows-build
           path: dist-staged/*
-          retention-days: 30
+          retention-days: 1
 
   # =========================================================================
-  # JOB 2: Publish Release
+  # JOB 2: Delete Old Release, Then Publish Fresh One
   # =========================================================================
   publish-nightly:
     runs-on: ubuntu-latest
@@ -136,48 +141,71 @@ jobs:
       - name: Checkout repository code
         uses: actions/checkout@v4
 
-      - name: Generate build metadata
+      - name: Generate build metadata tags
         id: metadata
+        shell: bash
         run: |
           echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
           echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      - name: Download Windows build
+      - name: Download Windows build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: windows-build
+          name: compiled-windows-build
           path: dist-assets
 
-      - name: List distribution assets
+      - name: Package application source archive
+        shell: bash
+        run: |
+          mkdir -p dist-assets
+          tar --exclude='.git' --exclude='.github' --exclude='dist-assets' \
+            -czf dist-assets/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
+
+      - name: List release assets
         run: ls -lh dist-assets/
 
-      # Delete old release so there's only ever one nightly
-      - name: Delete existing nightly release
+      # Deletes the release AND its tag so nothing old lingers.
+      # The `gh` CLI is pre-installed on all GitHub-hosted runners.
+      # The `|| true` prevents the step from failing if no prior release exists yet.
+      - name: Delete existing nightly release and tag
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release delete nightly-latest --yes --cleanup-tag || true
+        run: |
+          gh release delete nightly-latest --yes --cleanup-tag || true
 
+      # Small pause to let GitHub's backend fully propagate the deletion
+      # before we immediately recreate the same tag name.
       - name: Wait for deletion to propagate
         run: sleep 5
 
-      - name: Publish nightly release
+      - name: Publish fresh nightly release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly-latest
           name: "Nightly Development Build"
           body: |
-            ### Nightly Development Build
+            ### 🌙 Nightly Development Build
+            This release contains the absolute latest, automatically compiled features directly from the `main` branch.
 
-            **Portable zip** — unzip anywhere and run `RamRacingCFD.exe`. No Python install required.
-            Requires Ansys Fluent 2026 R1 installed separately.
+            ⚠️ **Please Note:** These builds are developmental works-in-progress and may contain bugs or unstable features.
+
+            **Downloads**
+            | File | Use |
+            |------|-----|
+            | `RamRacingCFD-setup-*.exe` | Full installer — adds Start Menu entry, sets `AWP_ROOT261` |
+            | `RamRacingCFD-portable-*.zip` | Portable — unzip anywhere, run `RamRacingCFD.exe` |
+            | `app-nightly-*.tar.gz` | Source archive |
+
+            Python is **not** required — the runtime and all dependencies are bundled.
+            Ansys Fluent 2026 R1 (v261) must be installed and licensed separately.
 
             * **Build Date:** ${{ steps.metadata.outputs.BUILD_DATE }}
-            * **Commit:** ${{ steps.metadata.outputs.COMMIT_SHA }}
-
-            ---
-            These builds are from `main` and may contain bugs or incomplete features.
+            * **Latest Commit:** ${{ steps.metadata.outputs.COMMIT_SHA }}
           prerelease: true
           files: |
-            dist-assets/*
+            dist-assets/*.tar.gz
+            dist-assets/*.exe
+            dist-assets/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
