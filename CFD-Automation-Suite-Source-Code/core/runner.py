@@ -9,6 +9,7 @@ import math
 import logging
 import os
 import sys
+from collections import deque
 from typing import Callable, Optional
 
 log = logging.getLogger("fluent_runner")
