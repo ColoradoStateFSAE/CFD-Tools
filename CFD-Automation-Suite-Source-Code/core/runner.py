@@ -68,6 +68,59 @@ REAR_SUS_LABELS  = ["rear-suspension",  "rearsus"]
 DOMAIN_LABELS = ["inlet", "outlet", "walls", "ground", "symmetry"]
 
 
+# ---------------------------------------------------------------------------
+# Local sizing controls -- Fluent Procedure doc Step 4
+#
+# All three are Curvature size controls, not plain face sizes. The curvature
+# normal angle is what actually drives refinement on curved aero surfaces.
+# ---------------------------------------------------------------------------
+
+SIZING_STUFF = {           # curvature_stuff -- anything not wheels or aero
+    "growth_rate":            1.2,
+    "size_control_type":      "curvature",
+    "local_min_size":         0.001,
+    "max_size":               0.064,
+    "curvature_normal_angle": 12,
+    "scope_to":               "faces-and-edges",
+}
+SIZING_AERO = {            # curvature_aero -- front wing, rear wing, undertray
+    "growth_rate":            1.2,
+    "size_control_type":      "curvature",
+    "local_min_size":         0.0005,
+    "max_size":               0.008,
+    "curvature_normal_angle": 9,
+    "scope_to":               "faces-and-edges",
+}
+SIZING_WHEELS = {          # curvature_wheels -- wheels + wheel blocks
+    "growth_rate":            1.2,
+    "size_control_type":      "curvature",
+    "local_min_size":         0.0005,
+    "max_size":               0.032,
+    "curvature_normal_angle": 18,
+    "scope_to":               "faces",          # faces only, not edges
+}
+
+# Surface mesh -- Step 5
+SURFACE_MESH = {
+    "growth_rate":              1.2,
+    "size_functions":           "Curvature & Proximity",
+    "curvature_normal_angle":   18,
+    "cells_per_gap":            1,
+    "scope_proximity_to":       "faces-and-edges",
+    "separate_by_angle":        "No",
+}
+
+# Improve surface mesh -- Step 6
+SURFACE_FACE_QUALITY_LIMIT = 0.7
+
+# Volume mesh -- Step 11
+VOLUME_PEEL_LAYERS = 1
+
+# Improve volume mesh -- Step 12
+VOLUME_QUALITY_METHOD = "Orthogonal"
+VOLUME_QUALITY_LIMIT  = 0.2
+
+
 def _wheel_labels(half_sym: bool) -> dict:
     """
     Return {"front": [...], "rear": [...]} wheel labels for the geometry type.
@@ -560,15 +613,97 @@ def _get_report_value(solver, report_type: str, name: str) -> float:
         return 0.0
 
 
-def _compute_reference_values(solver, speed_ms: float, car_length_m: float):
+def _compute_projected_area(solver, config) -> float:
     """
-    Set reference values for coefficient calculation.
-    Issue #6 fix: compute_from doesn't exist in Fluent 252 — use .compute().
-    Velocity and length are set independently so a failing compute() call
-    does not prevent the other values from being applied.
+    Doc Step 2.1.e -- compute the frontal area via Results > Projected Area.
+
+    Minimum feature size 0.0001 m, X direction, scoped to every vehicle
+    surface. Without this the reference area stays at Fluent's default of
+    1 m^2 and every coefficient (Cl, Cd) is wrong by that factor.
+
+    Returns the area in m^2, or 0.0 if it could not be computed.
+    """
+    half_sym = getattr(config, "is_half_symmetry", False)
+
+    # Every vehicle surface, filtered to what's actually in the mesh
+    candidates = (AERO_LABELS + BODY_LABELS
+                  + FRONT_SUS_LABELS + REAR_SUS_LABELS
+                  + _all_wheel_labels(half_sym))
+    try:
+        walls = list(solver.setup.boundary_conditions.wall.keys())
+        zones = [z for z in candidates if z in walls]
+    except Exception:
+        zones = candidates
+    if not zones:
+        log.warning("  Projected area: no vehicle zones found")
+        return 0.0
+
+    MIN_FEATURE = 0.0001   # m
+
+    # Settings API
+    try:
+        pa = solver.results.report.projected_surface_area
+        pa.min_feature_size = MIN_FEATURE
+        pa.projection_direction = [1, 0, 0]   # X direction
+        pa.surfaces = zones
+        area = float(pa.compute())
+        if area > 0:
+            log.info(f"  Projected area: {area:.5f} m^2 over {len(zones)} zones")
+            return area
+    except Exception as e:
+        log.debug(f"  Projected area (settings API): {e}")
+
+    # TUI
+    try:
+        result = solver.tui.report.projected_surface_area(
+            *zones, "()", "x", str(MIN_FEATURE)
+        )
+        import re
+        m = re.search(r"([-+]?[0-9]*[.]?[0-9]+(?:[eE][-+]?[0-9]+)?)",
+                      str(result))
+        if m:
+            area = float(m.group(1))
+            if area > 0:
+                log.info(f"  Projected area (TUI): {area:.5f} m^2")
+                return area
+    except Exception as e:
+        log.debug(f"  Projected area (TUI): {e}")
+
+    # Scheme eval
+    try:
+        zone_list = " ".join(f'"{z}"' for z in zones)
+        raw = solver.scheme_eval.string_eval(
+            f'(compute-projected-area (list {zone_list}) '
+            f"'(1 0 0) {MIN_FEATURE})"
+        )
+        import re
+        m = re.search(r"([-+]?[0-9]*[.]?[0-9]+(?:[eE][-+]?[0-9]+)?)", str(raw))
+        if m:
+            area = float(m.group(1))
+            if area > 0:
+                log.info(f"  Projected area (scheme): {area:.5f} m^2")
+                return area
+    except Exception as e:
+        log.debug(f"  Projected area (scheme): {e}")
+
+    log.warning(
+        "  Projected area could not be computed -- Cl/Cd will use the "
+        "existing reference area and may be wrong"
+    )
+    return 0.0
+
+
+def _compute_reference_values(solver, speed_ms: float, car_length_m: float,
+                              config=None):
+    """
+    Doc Step 2.1 -- reference values.
+
+    Compute From: Inlet, Velocity, Length = car length, Reference Zone =
+    enclosure, Area = computed projected area.
     """
     rv = solver.setup.reference_values
-    # Step 1: compute from inlet (sets density, velocity, etc. from BC)
+
+    # Compute from inlet -- sets density, viscosity, pressure from the BC
     try:
         rv.compute("inlet")
         log.debug("  Reference values computed from inlet")
@@ -576,8 +711,22 @@ def _compute_reference_values(solver, speed_ms: float, car_length_m: float):
         try:
             rv.compute_from = "inlet"
         except Exception:
-            pass  # not available — proceed with manual values
-    # Step 2: override velocity and length explicitly
+            pass
+
+    # Reference zone = the enclosure
+    try:
+        fluid_zones = list(solver.setup.cell_zone_conditions.fluid.keys())
+        enclosure = next(
+            (z for z in fluid_zones if "enclosure" in z.lower()),
+            fluid_zones[0] if fluid_zones else None,
+        )
+        if enclosure:
+            rv.zone = enclosure
+            log.info(f"  Reference zone: {enclosure}")
+    except Exception as e:
+        log.debug(f"  Reference zone: {e}")
+
+    # Velocity and length
     try:
         rv.velocity = speed_ms
     except Exception as e:
@@ -586,7 +735,22 @@ def _compute_reference_values(solver, speed_ms: float, car_length_m: float):
         rv.length = car_length_m
     except Exception as e:
         log.warning(f"  Reference values length: {e}")
-    log.info(f"  Reference values: v={speed_ms:.2f} m/s  L={car_length_m:.2f} m")
+
+    # Frontal area from projected area computation
+    area = 0.0
+    if config is not None:
+        area = _compute_projected_area(solver, config)
+        if area > 0:
+            try:
+                rv.area = area
+            except Exception as e:
+                log.warning(f"  Reference values area: {e}")
+
+    log.info(
+        f"  Reference values: v={speed_ms:.2f} m/s  L={car_length_m:.3f} m"
+        + (f"  A={area:.5f} m^2" if area > 0 else "  A=(not set)")
+    )
+    return area
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +994,101 @@ def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
 
     log.info(f"  Added refinement box: {name}  size={box['size']} m  {extents}")
     return True
+
+
+def _update_boundaries(watertight) -> bool:
+    """
+    Doc Step 8 -- assign boundary types by label.
+
+    Fluent auto-assigns from name patterns (*inlet* -> velocity-inlet etc),
+    but that silently misses anything not matching, so the types are set
+    explicitly here. Everything on the car and the ground is a wall.
+    """
+    task = getattr(watertight, "update_boundaries", None)
+    if task is None:
+        log.warning("  Update Boundaries task not available")
+        return False
+
+    type_map = {
+        "inlet":    "velocity-inlet",
+        "outlet":   "pressure-outlet",
+        "symmetry": "symmetry",
+    }
+
+    try:
+        labels = list(task.boundary_label_list.get_state() or [])
+    except Exception:
+        labels = []
+
+    if labels:
+        types = [type_map.get(l, "wall") for l in labels]
+        try:
+            task.boundary_label_type_list.set_state(types)
+            log.info(f"  Boundary types set for {len(labels)} labels")
+            for l, t in zip(labels, types):
+                if t != "wall":
+                    log.info(f"    {l:12s} -> {t}")
+        except Exception as e:
+            log.debug(f"  boundary_label_type_list: {e}")
+    try:
+        task.selection_type = "label"
+    except Exception:
+        pass
+
+    try:
+        task()
+        return True
+    except Exception as e:
+        log.warning(f"  Update Boundaries: {e}")
+        return False
+
+
+def _update_regions(watertight) -> int:
+    """
+    Doc Step 9 -- set region types.
+
+    The enclosure is the fluid region. Anything else Fluent found is a
+    leftover body and must be set to solid, otherwise the volume mesher
+    tries to fill it. Returns the number of solid regions found so the
+    volume mesh step can disable Generate Solid Regions accordingly.
+    """
+    task = getattr(watertight, "update_regions", None)
+    if task is None:
+        log.warning("  Update Regions task not available")
+        return 0
+
+    n_solid = 0
+    try:
+        names = list(task.old_region_name_list.get_state()
+                     or task.region_name_list.get_state() or [])
+    except Exception:
+        names = []
+
+    if names:
+        types = []
+        for n in names:
+            if "enclosure" in n.lower():
+                types.append("fluid")
+            else:
+                types.append("solid")
+                n_solid += 1
+        try:
+            task.region_type_list.set_state(types)
+            log.info(f"  Regions: {list(zip(names, types))}")
+        except Exception as e:
+            log.debug(f"  region_type_list: {e}")
+
+        if n_solid:
+            log.warning(
+                f"  {n_solid} non-enclosure region(s) set to solid -- "
+                f"Generate Solid Regions will be disabled"
+            )
+
+    try:
+        task()
+    except Exception as e:
+        log.warning(f"  Update Regions: {e}")
+    return n_solid
 
 
 def _add_wheel_refinement(meshing, watertight, wheel_name: str,
@@ -1138,8 +1397,10 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
         import_geometry.length_unit.set_state("m")
         import_geometry()
 
-        # ── Step 2: Local Sizing ─────────────────────────────────────────
-        sizing = watertight.add_local_sizing_wtm
+        # ── Step 2: Local Sizing (doc Step 4) ────────────────────────────
+        # All three are Curvature controls. Face Size alone does not refine
+        # curved aero surfaces -- the curvature normal angle is what does.
+        sizing   = watertight.add_local_sizing_wtm
         half_sym = getattr(config, "is_half_symmetry", False)
         wheels   = _wheel_labels(half_sym)
 
@@ -1147,54 +1408,55 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
         log.info(f"  Front wheel labels: {wheels['front']}")
         log.info(f"  Rear wheel labels:  {wheels['rear']}")
 
-        # curvature_stuff -- everything that isn't wheels or aero
-        prog("Adding local sizing: chassis/body...", 22)
-        stuff_labels = _filter_existing_labels(
-            watertight, BODY_LABELS + FRONT_SUS_LABELS + REAR_SUS_LABELS
-        )
-        if stuff_labels:
+        def _add_curvature_sizing(control_name, labels, params, pct, desc):
+            """Add one Curvature size control scoped to the given labels."""
+            labels = _filter_existing_labels(watertight, labels)
+            if not labels:
+                log.warning(f"    {control_name}: no matching labels, skipped")
+                return False
+            prog(f"Adding local sizing: {desc}...", pct)
             sizing.add_child = "yes"
-            sizing.boi_control_name = "curvature_stuff"
-            sizing.boi_execution = "Face Size"
-            sizing.boi_face_label_list = stuff_labels
-            sizing.boi_size = config.surface_mesh_max
+            sizing.boi_control_name = control_name
+            sizing.boi_execution    = "Curvature"
             sizing.boi_zoneor_label = "label"
-            sizing.add_child_and_update(defer_update=False)
-            log.info(f"    curvature_stuff -> {stuff_labels}")
-        else:
-            log.warning("    curvature_stuff: no matching labels, skipped")
+            sizing.boi_face_label_list = labels
+            for attr, key in [
+                ("boi_growth_rate",           "growth_rate"),
+                ("boi_size_control_type",     "size_control_type"),
+                ("boi_min_size",              "local_min_size"),
+                ("boi_max_size",              "max_size"),
+                ("boi_curvature_normal_angle","curvature_normal_angle"),
+                ("boi_scope_to",              "scope_to"),
+            ]:
+                try:
+                    setattr(sizing, attr, params[key])
+                except Exception as e:
+                    log.debug(f"    {control_name}.{attr}: {e}")
+            try:
+                sizing.add_child_and_update(defer_update=False)
+            except TypeError:
+                sizing.add_child_and_update()
+            log.info(
+                f"    {control_name} -> {labels}  "
+                f"[min {params['local_min_size']} / max {params['max_size']} m, "
+                f"CNA {params['curvature_normal_angle']}deg, "
+                f"scope {params['scope_to']}]"
+            )
+            return True
 
-        # curvature_aero -- front wing, rear wing, undertray
-        prog("Adding local sizing: aero elements...", 28)
-        aero_labels = _filter_existing_labels(watertight, AERO_LABELS)
-        if aero_labels:
-            sizing.add_child = "yes"
-            sizing.boi_control_name = "curvature_aero"
-            sizing.boi_execution = "Face Size"
-            sizing.boi_face_label_list = aero_labels
-            sizing.boi_size = 0.008
-            sizing.boi_zoneor_label = "label"
-            sizing.add_child_and_update(defer_update=False)
-            log.info(f"    curvature_aero -> {aero_labels}")
-        else:
-            log.warning("    curvature_aero: no matching labels, skipped")
-
-        # curvature_wheels -- wheels and wheel blocks
-        prog("Adding local sizing: wheels...", 33)
-        wheel_labels = _filter_existing_labels(
-            watertight, _all_wheel_labels(half_sym)
+        _add_curvature_sizing(
+            "curvature_stuff",
+            BODY_LABELS + FRONT_SUS_LABELS + REAR_SUS_LABELS,
+            SIZING_STUFF, 22, "chassis/body",
         )
-        if wheel_labels:
-            sizing.add_child = "yes"
-            sizing.boi_control_name = "curvature_wheels"
-            sizing.boi_execution = "Face Size"
-            sizing.boi_face_label_list = wheel_labels
-            sizing.boi_size = 0.032
-            sizing.boi_zoneor_label = "label"
-            sizing.add_child_and_update(defer_update=False)
-            log.info(f"    curvature_wheels -> {wheel_labels}")
-        else:
-            log.warning("    curvature_wheels: no matching labels, skipped")
+        _add_curvature_sizing(
+            "curvature_aero", AERO_LABELS,
+            SIZING_AERO, 28, "aero elements",
+        )
+        _add_curvature_sizing(
+            "curvature_wheels", _all_wheel_labels(half_sym),
+            SIZING_WHEELS, 33, "wheels",
+        )
 
         # Near / Mid / Far volume refinement boxes -- Tables 1-3.
         # Pure coordinate boxes, no label selection (see doc screenshot).
@@ -1225,41 +1487,115 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
                     meshing, watertight, wheel.name, half_sym,
                 )
 
-        # ── Step 3: Generate Surface Mesh ────────────────────────────────
+        # ── Step 3: Generate Surface Mesh (doc Step 5) ───────────────────
         prog("Generating surface mesh...", 50)
         surface_mesh = watertight.create_surface_mesh
-        surface_mesh.cfd_surface_mesh_controls.min_size = config.surface_mesh_min
-        surface_mesh.cfd_surface_mesh_controls.max_size = config.surface_mesh_max
+        ctrl = surface_mesh.cfd_surface_mesh_controls
+        ctrl.min_size = config.surface_mesh_min
+        ctrl.max_size = config.surface_mesh_max
+        for attr, value in [
+            ("growth_rate",            SURFACE_MESH["growth_rate"]),
+            ("size_functions",         SURFACE_MESH["size_functions"]),
+            ("curvature_normal_angle", SURFACE_MESH["curvature_normal_angle"]),
+            ("cells_per_gap",          SURFACE_MESH["cells_per_gap"]),
+            ("scope_proximity_to",     SURFACE_MESH["scope_proximity_to"]),
+        ]:
+            try:
+                setattr(ctrl, attr, value)
+            except Exception as e:
+                log.debug(f"  surface mesh {attr}: {e}")
         try:
-            surface_mesh.cfd_surface_mesh_controls.scope_proximity_to = "faces-and-edges"
-        except Exception:
-            pass
+            surface_mesh.separate_out_boundary_zones_by_angle = \
+                SURFACE_MESH["separate_by_angle"]
+        except Exception as e:
+            log.debug(f"  separate_out_boundary_zones_by_angle: {e}")
+        log.info(
+            f"  Surface mesh: min {config.surface_mesh_min} / "
+            f"max {config.surface_mesh_max} m, "
+            f"CNA {SURFACE_MESH['curvature_normal_angle']}deg, "
+            f"{SURFACE_MESH['size_functions']}"
+        )
         surface_mesh()
 
-        # ── Step 4: Describe Geometry ────────────────────────────────────
+        # ── Improve Surface Mesh (doc Step 6) ────────────────────────────
+        prog("Improving surface mesh...", 56)
+        improved = False
+        for attr in ("improve_surface_mesh", "improve_surface_mesh_wtm"):
+            task = getattr(watertight, attr, None)
+            if task is None:
+                # Optional task -- insert it if the workflow supports it
+                try:
+                    watertight.create_surface_mesh.insertable_tasks \
+                        .improve_surface_mesh.insert()
+                    task = getattr(watertight, attr, None)
+                except Exception:
+                    task = None
+            if task is None:
+                continue
+            try:
+                task.face_quality_limit = SURFACE_FACE_QUALITY_LIMIT
+            except Exception as e:
+                log.debug(f"  face_quality_limit: {e}")
+            try:
+                task()
+                log.info(
+                    f"  Surface mesh improved "
+                    f"(face quality limit {SURFACE_FACE_QUALITY_LIMIT})"
+                )
+                improved = True
+                break
+            except Exception as e:
+                log.debug(f"  {attr}(): {e}")
+        if not improved:
+            log.warning("  Improve Surface Mesh task unavailable -- skipped")
+
+        # ── Step 4: Describe Geometry (doc Step 7) ───────────────────────
         prog("Describing geometry...", 60)
         describe = watertight.describe_geometry
         describe.update_child_tasks(setup_type_changed=False)
         describe.setup_type = "fluid"
+        # Doc: all three answers are No
+        for attr, value in [
+            ("wall_to_internal",     "No"),
+            ("invoke_share_topology", "No"),
+            ("multizone",             "No"),
+        ]:
+            try:
+                setattr(describe, attr, value)
+            except Exception as e:
+                log.debug(f"  describe.{attr}: {e}")
         describe.update_child_tasks(setup_type_changed=True)
         describe()
 
-        # ── Step 5: Update Regions ───────────────────────────────────────
-        prog("Updating regions...", 72)
-        watertight.update_regions()
+        # ── Update Boundaries (doc Step 8) ───────────────────────────────
+        prog("Updating boundaries...", 66)
+        _update_boundaries(watertight)
 
-        # ── Step 6: Add Boundary Layers ──────────────────────────────────
+        # ── Step 5: Update Regions (doc Step 9) ──────────────────────────
+        prog("Updating regions...", 72)
+        n_solid = _update_regions(watertight)
+
+        # ── Step 6: Add Boundary Layers (doc Step 10) ────────────────────
         prog("Adding boundary layers...", 76)
         bl = watertight.add_boundary_layers
         bl.add_child_to_task()
-        try:
-            bl.control_name.set_state("last-ratio_1")
-            bl.number_of_layers = config.bl_num_layers
-            bl.first_height = config.bl_first_height
-            bl.transition_ratio = config.bl_transition_ratio
-            bl.offset_method_type = "last-ratio"
-        except Exception as e:
-            log.debug(f"  BL params: {e}")
+        for attr, value in [
+            ("control_name",       "last-ratio_1"),
+            ("offset_method_type", "last-ratio"),
+            ("number_of_layers",   config.bl_num_layers),
+            ("transition_ratio",   config.bl_transition_ratio),
+            ("first_height",       config.bl_first_height),
+            ("add_in",             "fluid-regions"),
+            ("grow_on",            "selected-zones"),
+        ]:
+            try:
+                obj = getattr(bl, attr)
+                if hasattr(obj, "set_state"):
+                    obj.set_state(value)
+                else:
+                    setattr(bl, attr, value)
+            except Exception as e:
+                log.debug(f"  BL {attr}: {e}")
         try:
             # Doc Step 10: select all the aerodynamic devices and the ground
             bl_zones = _filter_existing_labels(
@@ -1267,7 +1603,12 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
                 AERO_LABELS + _all_wheel_labels(half_sym) + ["ground"],
             )
             bl.zone_selection_list.set_state(bl_zones)
-            log.info(f"  Boundary layers on: {bl_zones}")
+            log.info(
+                f"  Boundary layers: {config.bl_num_layers} layers, "
+                f"last-ratio {config.bl_transition_ratio}, "
+                f"first height {config.bl_first_height} m"
+            )
+            log.info(f"    grown on: {bl_zones}")
         except Exception as e:
             log.debug(f"  BL zone selection: {e}")
         bl.insert_compound_child_task()
@@ -1275,18 +1616,49 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
             watertight.add_boundary_layers_child_1()
         except Exception as e:
             log.debug(f"  BL child execute: {e}")
-            # Fallback: try executing without child
             try:
                 bl()
             except Exception:
                 pass
 
-        # ── Step 7: Generate Volume Mesh ─────────────────────────────────
+        # ── Step 7: Generate Volume Mesh (doc Step 11) ───────────────────
         prog("Generating volume mesh (this takes a while)...", 82)
         vol_mesh = watertight.create_volume_mesh_wtm
         vol_mesh.volume_fill.set_state("poly-hexcore")
         vol_mesh.volume_fill_controls.hex_max_cell_length.set_state(
             config.volume_mesh_max
+        )
+        for obj, attr, value in [
+            (vol_mesh.volume_fill_controls, "hex_min_cell_length",
+             config.volume_mesh_min),
+            (vol_mesh.volume_fill_controls, "peel_layers",
+             VOLUME_PEEL_LAYERS),
+            (vol_mesh, "solver_name",            "Fluent"),
+            (vol_mesh, "enable_parallel_meshing", True),
+        ]:
+            try:
+                target = getattr(obj, attr)
+                if hasattr(target, "set_state"):
+                    target.set_state(value)
+                else:
+                    setattr(obj, attr, value)
+            except Exception as e:
+                log.debug(f"  volume mesh {attr}: {e}")
+
+        # Doc: if any region was set to solid, do not generate solid regions
+        if n_solid:
+            for attr in ("generate_solid_regions",
+                         "prism_preferences_generate_solid_regions"):
+                try:
+                    setattr(vol_mesh, attr, False)
+                    log.info("  Generate Solid Regions disabled")
+                    break
+                except Exception:
+                    continue
+
+        log.info(
+            f"  Volume mesh: poly-hexcore, peel {VOLUME_PEEL_LAYERS}, "
+            f"min {config.volume_mesh_min} / max {config.volume_mesh_max} m"
         )
         vol_mesh()
 
@@ -1428,10 +1800,37 @@ def _set_boundary_conditions(solver, config):
     try:
         ground = solver.setup.boundary_conditions.wall["ground"]
         ground.momentum.wall_motion = "Moving Wall"
-        # Issue #4 fix: try correct attribute names in order for Fluent 252
+
+        # Doc: Relative to Adjacent Cell Zone, Translational, X = 1, car speed.
+        # +X is the flow direction, so the ground moves with the freestream.
+        for attr, value in [
+            ("relative_to_adjacent_cell_zone", True),
+            ("motion_type",                    "Translational"),
+            ("translation_direction_x",        1.0),
+            ("translation_direction_y",        0.0),
+            ("translation_direction_z",        0.0),
+        ]:
+            try:
+                obj = getattr(ground.momentum, attr)
+                if hasattr(obj, "set_state"):
+                    obj.set_state(value)
+                else:
+                    setattr(ground.momentum, attr, value)
+            except Exception as e:
+                log.debug(f"  ground.{attr}: {e}")
+
+        # Direction as a vector, if the API takes it that way instead
+        for attr in ("translation_direction", "wall_translation_direction"):
+            try:
+                getattr(ground.momentum, attr).set_state([1.0, 0.0, 0.0])
+                break
+            except Exception:
+                continue
+
         _ground_set = False
-        for _attr in ("velocity", "velocity_spec", "wall_translational_velocity",
-                      "wall_velocity"):
+        for _attr in ("velocity", "velocity_spec",
+                      "wall_translational_velocity", "wall_velocity",
+                      "motion_speed"):
             try:
                 getattr(ground.momentum, _attr).value = speed_ms
                 _ground_set = True
@@ -1439,9 +1838,12 @@ def _set_boundary_conditions(solver, config):
             except Exception:
                 continue
         if not _ground_set:
-            log.warning(f"  Ground moving wall: could not set velocity — tried all known attrs")
+            log.warning("  Ground moving wall: could not set velocity")
         else:
-            log.info(f"  Ground moving wall: {speed_ms:.2f} m/s")
+            log.info(
+                f"  Ground: moving wall, translational +X, "
+                f"{speed_ms:.2f} m/s, relative to adjacent cell zone"
+            )
     except Exception as e:
         log.warning(f"  Ground BC: {e}")
 
@@ -1773,23 +2175,26 @@ def run_solver(config, mesh_file: str,
         except Exception as e:
             log.warning(f"  Could not get mesh statistics: {e}")
 
-        # Units — skip custom units, Fluent defaults (SI) work fine for force/moment output
-        # We convert results in post-processing instead
+        # Units — Fluent defaults (SI) throughout; conversions happen in
+        # post-processing, not here.
 
-        # Reference values
-        prog("Setting reference values...", 5)
         speed_ms = mph_to_ms(config.vehicle_speed_mph)
-        _compute_reference_values(solver, speed_ms, config.car_length_m)
 
-        # Physics - initial (no curvature correction)
-        prog("Configuring physics (GEKO k-omega)...", 8)
+        # Physics — initial pass, curvature correction off (doc Step 2.3)
+        prog("Configuring physics (GEKO k-omega)...", 5)
         _apply_geko_physics(solver,
                             curvature_correction=False,
                             production_limiter=config.use_production_limiter)
 
-        # Boundary conditions
-        prog("Setting boundary conditions...", 12)
+        # Boundary conditions (doc Step 2.4) -- must come before reference
+        # values, since "Compute From: Inlet" reads the inlet BC.
+        prog("Setting boundary conditions...", 8)
         _set_boundary_conditions(solver, config)
+
+        # Reference values (doc Step 2.1), including the projected frontal area
+        prog("Setting reference values + projected area...", 12)
+        _compute_reference_values(solver, speed_ms, config.car_length_m,
+                                  config=config)
 
         # Force reports
         _configure_force_reports(solver, config)
