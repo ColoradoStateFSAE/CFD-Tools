@@ -206,7 +206,8 @@ class SimulationQueue:
 
         stages = ["solve"] if skip_mesh else ["mesh", "solve"]
         for stage in stages:
-            path = journal_path(key, stage)
+            path = journal_path(key, stage,
+                                getattr(config, "journal_dir", ""))
             if not os.path.isfile(path):
                 raise FileNotFoundError(
                     f"No {stage} journal for {config.sim_type.value}.\n"
