@@ -38,6 +38,97 @@ _PV        = "26.1"          # product_version string for launch_fluent()
 FLUENT_LAUNCH_TIMEOUT = 300  # seconds — increase for slow HPC startup
 
 
+# ---------------------------------------------------------------------------
+# Named selections
+#
+# These must match the labels created in Ansys Discovery exactly.
+#
+# Coordinate convention (Fluent Procedure doc):
+#   +X  toward the rear of the car  = flow direction  -> drag  = [ 1, 0, 0]
+#   +Y  up                                            -> downforce = [0, -1, 0]
+#   +Z  driver's left                                 -> half-car lives at z >= 0
+#
+# Wheel labels differ between full car and half car:
+#   Full car   flw / frw / rlw / rrw   + blocks  flwb / frwb / rlwb / rrwb
+#   Half car   fw  / rw                + blocks  fwb  / rwb
+# ---------------------------------------------------------------------------
+
+AERO_LABELS = ["frontwing", "rearwing", "undertray"]
+
+# Body / chassis. sidepod is only present in some geometries and is filtered
+# out automatically when absent.
+BODY_LABELS = ["chassis", "sidepod"]
+
+# Suspension — not yet in every geometry. Add these named selections in
+# Discovery to get the fz_frontsus / fz_rearsus reports populated.
+FRONT_SUS_LABELS = ["front-suspension", "frontsus", "control-arms"]
+REAR_SUS_LABELS  = ["rear-suspension",  "rearsus"]
+
+# Domain boundaries — never part of the car force reports
+DOMAIN_LABELS = ["inlet", "outlet", "walls", "ground", "symmetry"]
+
+
+def _wheel_labels(half_sym: bool) -> dict:
+    """
+    Return {"front": [...], "rear": [...]} wheel labels for the geometry type.
+
+    Half car is the driver's left side (+Z), so it carries one wheel per axle
+    and the labels drop the left/right prefix.
+    """
+    if half_sym:
+        return {
+            "front": ["fw", "fwb"],
+            "rear":  ["rw", "rwb"],
+        }
+    return {
+        "front": ["flw", "frw", "flwb", "frwb"],
+        "rear":  ["rlw", "rrw", "rlwb", "rrwb"],
+    }
+
+
+def _all_wheel_labels(half_sym: bool) -> list:
+    """All wheel + wheel-block labels, front and rear."""
+    w = _wheel_labels(half_sym)
+    return w["front"] + w["rear"]
+
+
+def _car_surface_labels(half_sym: bool) -> list:
+    """Every label that makes up the car."""
+    return (AERO_LABELS + BODY_LABELS
+            + FRONT_SUS_LABELS + REAR_SUS_LABELS
+            + _all_wheel_labels(half_sym))
+
+
+def _filter_existing_labels(watertight, labels: list) -> list:
+    """
+    Return only the labels present in the imported geometry.
+
+    Optional labels (sidepod, suspension) and the unused half/full wheel set
+    are dropped here rather than being passed to Fluent, which would fail with
+    "does not evaluate to valid zone(s)".
+    """
+    try:
+        sizing = watertight.add_local_sizing_wtm
+        for accessor in (
+            lambda: list(sizing.boi_face_label_list.allowed_values()),
+            lambda: list(sizing.boi_face_label_list.get_attr("allowedValues")),
+        ):
+            try:
+                available = accessor()
+                if available:
+                    kept    = [l for l in labels if l in available]
+                    dropped = [l for l in labels if l not in available]
+                    if dropped:
+                        log.debug(f"  Labels not in geometry, skipped: {dropped}")
+                    return kept
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Could not query — pass through unchanged
+    return labels
+
+
 def _get_pyfluent_version() -> tuple:
     """Returns (major, minor) e.g. (0, 38)."""
     try:
@@ -687,9 +778,13 @@ def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
     """
     Create a coordinate-specified local refinement region.
 
-    Box coordinates come from compute_refinement_boxes(), implementing
-    Tables 1-3 of the Ram Racing Fluent Procedure doc -- the same formulas
-    as MATLAB-Scripts/localrefinementregion.m.
+    Per Tables 1-3 of the Fluent Procedure doc, these are pure coordinate
+    boxes -- Type=box, CoordinateSpecificationMethod=directly-specify-coordinates,
+    Mesh Size, and the six bounds. There is NO label/zone selection: the box
+    is defined in absolute space, not relative to any body.
+
+    Coordinates come from compute_refinement_boxes(), the same formulas as
+    MATLAB-Scripts/localrefinementregion.m.
 
     Returns True if the region was created.
     """
@@ -707,6 +802,7 @@ def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
         "YMin": box["y_min"], "YMax": box["y_max"],
         "ZMin": box["z_min"], "ZMax": box["z_max"],
     }
+
     extents = (
         f"X[{box['x_min']:.2f}, {box['x_max']:.2f}]  "
         f"Y[{box['y_min']:.2f}, {box['y_max']:.2f}]  "
@@ -737,16 +833,44 @@ def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
 
 
 def _add_wheel_refinement(meshing, watertight, wheel_name: str,
-                          cx: float, cy: float, cz: float) -> bool:
+                          half_sym: bool = False,
+                          labels: list = None) -> bool:
     """
-    Per-wheel local refinement region.
+    Per-wheel local refinement region -- Table 4.
 
-    Uses relative-to-body-size specification per Table 4 of the Fluent
-    Procedure doc: 0.032 m mesh size, box sized relative to the wheel body
-    rather than absolute coordinates.
+    Uses relative-to-body-size: 0.032 m mesh size, box bounds expressed as
+    fractions of the wheel body. Because the bounds are relative, this DOES
+    need a body to be relative to, so the wheel's own labels are passed in.
+
+    Wheel naming depends on geometry type:
+        Full car  FLW -> flw + flwb,  FRW -> frw + frwb, etc.
+        Half car  FRW/FLW -> fw + fwb,  RRW/RLW -> rw + rwb
     """
     mode, task = _get_refinement_task(meshing, watertight)
     if mode is None:
+        return False
+
+    if labels is None:
+        name = wheel_name.strip().lower()
+        if half_sym:
+            # Half car has a single wheel per axle: fw / rw
+            labels = ["fw", "fwb"] if name.startswith("f") else ["rw", "rwb"]
+        else:
+            # Full car: flw / frw / rlw / rrw plus matching blocks
+            base = name if name in ("flw", "frw", "rlw", "rrw") else None
+            if base is None:
+                # Accept FLW / Front-Left / etc.
+                front = name.startswith("f")
+                left  = "l" in name[1:2] or "left" in name
+                base  = ("f" if front else "r") + ("l" if left else "r") + "w"
+            labels = [base, base + "b"]
+
+    labels = _filter_existing_labels(watertight, labels)
+    if not labels:
+        log.warning(
+            f"  Wheel refinement {wheel_name!r}: no matching wheel labels "
+            f"in geometry -- skipped"
+        )
         return False
 
     region_name = f"wheel_{wheel_name.lower()}"
@@ -758,13 +882,17 @@ def _add_wheel_refinement(meshing, watertight, wheel_name: str,
         "XMin": 0.1, "XMax": 1.0,
         "YMin": 0.0, "YMax": 0.1,
         "ZMin": 0.1, "ZMax": 0.1,
+        "SelectionType":      "label",
+        "LabelSelectionList": labels,
+        "ZoneSelectionList":  labels,
+        "ZoneLocation":       labels,
     }
 
     if mode == "legacy":
         try:
             task.Arguments.update(args)
             task.Execute()
-            log.info(f"  Added wheel refinement box: {wheel_name}")
+            log.info(f"  Added wheel refinement box: {wheel_name}  labels={labels}")
             return True
         except Exception as e:
             log.warning(f"  Wheel refinement {wheel_name!r} (legacy): {e}")
@@ -772,12 +900,13 @@ def _add_wheel_refinement(meshing, watertight, wheel_name: str,
 
     if not _apply_task_arguments(task, args):
         log.warning(f"  Wheel refinement {wheel_name!r}: could not set arguments")
+        _dump_task_arguments(task, f"Wheel refinement {wheel_name!r}")
         return False
     if not _execute_task(task):
         log.warning(f"  Wheel refinement {wheel_name!r}: execute failed")
         return False
 
-    log.info(f"  Added wheel refinement box: {wheel_name}")
+    log.info(f"  Added wheel refinement box: {wheel_name}  labels={labels}")
     return True
 
 
@@ -1011,34 +1140,51 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
 
         # ── Step 2: Local Sizing ─────────────────────────────────────────
         sizing = watertight.add_local_sizing_wtm
+        half_sym = getattr(config, "is_half_symmetry", False)
+        wheels   = _wheel_labels(half_sym)
 
-        # Curvature sizing — chassis/body
+        log.info(f"  Geometry type: {'half car' if half_sym else 'full car'}")
+        log.info(f"  Front wheel labels: {wheels['front']}")
+        log.info(f"  Rear wheel labels:  {wheels['rear']}")
+
+        # curvature_stuff -- everything that isn't wheels or aero
         prog("Adding local sizing: chassis/body...", 22)
-        sizing.add_child = "yes"
-        sizing.boi_control_name = "curvature_stuff"
-        sizing.boi_execution = "Face Size"
-        sizing.boi_face_label_list = ["chassis", "driver", "control-arms"]
-        sizing.boi_size = config.surface_mesh_max
-        sizing.boi_zoneor_label = "label"
-        sizing.add_child_and_update(defer_update=False)
+        stuff_labels = _filter_existing_labels(
+            watertight, BODY_LABELS + FRONT_SUS_LABELS + REAR_SUS_LABELS
+        )
+        if stuff_labels:
+            sizing.add_child = "yes"
+            sizing.boi_control_name = "curvature_stuff"
+            sizing.boi_execution = "Face Size"
+            sizing.boi_face_label_list = stuff_labels
+            sizing.boi_size = config.surface_mesh_max
+            sizing.boi_zoneor_label = "label"
+            sizing.add_child_and_update(defer_update=False)
+            log.info(f"    curvature_stuff -> {stuff_labels}")
+        else:
+            log.warning("    curvature_stuff: no matching labels, skipped")
 
-        # Curvature sizing — aero elements
+        # curvature_aero -- front wing, rear wing, undertray
         prog("Adding local sizing: aero elements...", 28)
-        sizing.add_child = "yes"
-        sizing.boi_control_name = "curvature_aero"
-        sizing.boi_execution = "Face Size"
-        sizing.boi_face_label_list = [
-            "front-wing", "rear-wing", "undertray",
-            "fw", "rw", "fwb", "rwb",
-        ]
-        sizing.boi_size = 0.008
-        sizing.boi_zoneor_label = "label"
-        sizing.add_child_and_update(defer_update=False)
+        aero_labels = _filter_existing_labels(watertight, AERO_LABELS)
+        if aero_labels:
+            sizing.add_child = "yes"
+            sizing.boi_control_name = "curvature_aero"
+            sizing.boi_execution = "Face Size"
+            sizing.boi_face_label_list = aero_labels
+            sizing.boi_size = 0.008
+            sizing.boi_zoneor_label = "label"
+            sizing.add_child_and_update(defer_update=False)
+            log.info(f"    curvature_aero -> {aero_labels}")
+        else:
+            log.warning("    curvature_aero: no matching labels, skipped")
 
-        # Wheel sizing
-        if config.use_wheel_mrf and config.wheel_mrf_zones:
-            prog("Adding local sizing: wheels...", 33)
-            wheel_labels = [w.zone_name for w in config.wheel_mrf_zones]
+        # curvature_wheels -- wheels and wheel blocks
+        prog("Adding local sizing: wheels...", 33)
+        wheel_labels = _filter_existing_labels(
+            watertight, _all_wheel_labels(half_sym)
+        )
+        if wheel_labels:
             sizing.add_child = "yes"
             sizing.boi_control_name = "curvature_wheels"
             sizing.boi_execution = "Face Size"
@@ -1046,32 +1192,37 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
             sizing.boi_size = 0.032
             sizing.boi_zoneor_label = "label"
             sizing.add_child_and_update(defer_update=False)
+            log.info(f"    curvature_wheels -> {wheel_labels}")
+        else:
+            log.warning("    curvature_wheels: no matching labels, skipped")
 
-        # Near / Mid / Far volume refinement boxes
-        # Coordinates from compute_refinement_boxes() -- Tables 1-3 of the
-        # Fluent Procedure doc, same formulas as localrefinementregion.m
+        # Near / Mid / Far volume refinement boxes -- Tables 1-3.
+        # Pure coordinate boxes, no label selection (see doc screenshot).
         prog("Adding Near/Mid/Far refinement boxes...", 38)
         near, mid, far = compute_refinement_boxes(
             config.car_length_m, config.car_width_m, config.car_height_m,
             half_sym=getattr(config, "is_half_symmetry", False),
         )
         n_boxes = 0
-        n_boxes += _add_refinement_box(meshing, watertight, "local-refinement-nearfield", near)
-        n_boxes += _add_refinement_box(meshing, watertight, "local-refinement-midfield",  mid)
-        n_boxes += _add_refinement_box(meshing, watertight, "local-refinement-farfield",  far)
+        n_boxes += _add_refinement_box(meshing, watertight,
+                                       "local-refinement-nearfield", near)
+        n_boxes += _add_refinement_box(meshing, watertight,
+                                       "local-refinement-midfield",  mid)
+        n_boxes += _add_refinement_box(meshing, watertight,
+                                       "local-refinement-farfield",  far)
         if n_boxes < 3:
             log.warning(
                 f"  Only {n_boxes}/3 refinement boxes created -- near-field "
                 f"mesh will be coarser than intended"
             )
 
-        # Per-wheel refinement boxes (Table 4)
+        # Per-wheel refinement boxes -- Table 4.
+        # relative-to-body-size needs a body, so these DO take labels.
         if config.use_wheel_mrf and config.wheel_mrf_zones:
             prog("Adding wheel refinement boxes...", 42)
             for wheel in config.wheel_mrf_zones:
                 _add_wheel_refinement(
-                    meshing, watertight, wheel.name,
-                    wheel.center_x, wheel.center_y, wheel.center_z,
+                    meshing, watertight, wheel.name, half_sym,
                 )
 
         # ── Step 3: Generate Surface Mesh ────────────────────────────────
@@ -1110,13 +1261,15 @@ def run_meshing(config, progress_cb: Optional[Callable] = None):
         except Exception as e:
             log.debug(f"  BL params: {e}")
         try:
-            aero_and_ground = [
-                "front-wing", "rear-wing", "undertray",
-                "fw", "rw", "fwb", "rwb", "ground",
-            ]
-            bl.zone_selection_list.set_state(aero_and_ground)
-        except Exception:
-            pass
+            # Doc Step 10: select all the aerodynamic devices and the ground
+            bl_zones = _filter_existing_labels(
+                watertight,
+                AERO_LABELS + _all_wheel_labels(half_sym) + ["ground"],
+            )
+            bl.zone_selection_list.set_state(bl_zones)
+            log.info(f"  Boundary layers on: {bl_zones}")
+        except Exception as e:
+            log.debug(f"  BL zone selection: {e}")
         bl.insert_compound_child_task()
         try:
             watertight.add_boundary_layers_child_1()
@@ -1367,57 +1520,62 @@ def _configure_force_reports(solver, config):
       cop_pct         % front aero balance
     """
     # ── Zone definitions ─────────────────────────────────────────────────
+    # Labels must match the Discovery named selections exactly.
+    half_sym = getattr(config, "is_half_symmetry", False)
+    wheels   = _wheel_labels(half_sym)
+
     frontwing_zones = ["frontwing"]
     rearwing_zones  = ["rearwing"]
     undertray_zones = ["undertray"]
-    chassis_zones   = ["chassis"]
-    suspension_zones_front = ["front-suspension", "frontsuspension"]
-    suspension_zones_rear  = ["rear-suspension", "rearsuspension"]
+    body_zones      = list(BODY_LABELS)          # chassis (+ sidepod if present)
+    suspension_zones_front = list(FRONT_SUS_LABELS)
+    suspension_zones_rear  = list(REAR_SUS_LABELS)
 
-    # Wheel zones — from MRF config or default names
-    wheel_zones_front = []
-    wheel_zones_rear  = []
-    if config.use_wheel_mrf and config.wheel_mrf_zones:
-        for w in config.wheel_mrf_zones:
-            if "f" in w.name.lower()[:2]:   # FRW, FLW
-                wheel_zones_front.append(w.zone_name)
-            else:                            # RRW, RLW
-                wheel_zones_rear.append(w.zone_name)
-    # fw/fwb = front wheel zones, rw/rwb = rear wheel zones
-    wheel_zones_front = ["fw", "fwb"] + wheel_zones_front
-    wheel_zones_rear  = ["rw", "rwb"] + wheel_zones_rear
+    # Wheels + wheel blocks. Full car: flw/frw/rlw/rrw + *b
+    #                        Half car: fw/rw + *b
+    wheel_zones_front = list(wheels["front"])
+    wheel_zones_rear  = list(wheels["rear"])
 
     # All car zones combined
     all_zones = (frontwing_zones + rearwing_zones + undertray_zones +
-                 chassis_zones + suspension_zones_front + suspension_zones_rear +
+                 body_zones + suspension_zones_front + suspension_zones_rear +
                  wheel_zones_front + wheel_zones_rear)
 
-    # Filter to zones that actually exist in the mesh
+    # Keep only zones that actually exist in the mesh. Unlike the meshing
+    # side there is no fallback here -- a report scoped to a missing zone
+    # reads zero and silently corrupts the totals.
     try:
         mesh_walls = list(solver.setup.boundary_conditions.wall.keys())
-        def _filt(zones):
-            filtered = [z for z in zones if z in mesh_walls]
-            return filtered if filtered else zones
-        frontwing_zones        = _filt(frontwing_zones)
-        rearwing_zones         = _filt(rearwing_zones)
-        undertray_zones        = _filt(undertray_zones)
-        chassis_zones          = _filt(chassis_zones)
-        suspension_zones_front = _filt(suspension_zones_front)
-        suspension_zones_rear  = _filt(suspension_zones_rear)
-        wheel_zones_front      = _filt(wheel_zones_front)
-        wheel_zones_rear       = _filt(wheel_zones_rear)
-        all_zones              = _filt(all_zones)
-    except Exception:
-        pass
 
-    log.info(f"  Zone map:")
-    log.info(f"    frontwing: {frontwing_zones}")
-    log.info(f"    rearwing:  {rearwing_zones}")
-    log.info(f"    undertray: {undertray_zones}")
-    log.info(f"    front_wheel: {wheel_zones_front}")
-    log.info(f"    rear_wheel:  {wheel_zones_rear}")
-    log.info(f"    front_sus:   {suspension_zones_front}")
-    log.info(f"    rear_sus:    {suspension_zones_rear}")
+        def _filt(zones, label):
+            kept    = [z for z in zones if z in mesh_walls]
+            dropped = [z for z in zones if z not in mesh_walls]
+            if dropped:
+                log.debug(f"    {label}: not in mesh, dropped {dropped}")
+            return kept
+
+        frontwing_zones        = _filt(frontwing_zones, "frontwing")
+        rearwing_zones         = _filt(rearwing_zones, "rearwing")
+        undertray_zones        = _filt(undertray_zones, "undertray")
+        body_zones             = _filt(body_zones, "body")
+        suspension_zones_front = _filt(suspension_zones_front, "front_sus")
+        suspension_zones_rear  = _filt(suspension_zones_rear, "rear_sus")
+        wheel_zones_front      = _filt(wheel_zones_front, "front_wheel")
+        wheel_zones_rear       = _filt(wheel_zones_rear, "rear_wheel")
+        all_zones              = _filt(all_zones, "all")
+    except Exception as e:
+        log.debug(f"  Zone filtering skipped: {e}")
+
+    log.info(f"  Zone map ({'half car' if half_sym else 'full car'}):")
+    log.info(f"    frontwing:    {frontwing_zones}")
+    log.info(f"    rearwing:     {rearwing_zones}")
+    log.info(f"    undertray:    {undertray_zones}")
+    log.info(f"    body/chassis: {body_zones}")
+    log.info(f"    front wheel:  {wheel_zones_front}")
+    log.info(f"    rear wheel:   {wheel_zones_rear}")
+    log.info(f"    front sus:    {suspension_zones_front or '(none)'}")
+    log.info(f"    rear sus:     {suspension_zones_rear or '(none)'}")
+    log.info(f"    TOTAL:        {len(all_zones)} zones")
 
     DOWN = [0, -1, 0]
     DRAG = [1,  0, 0]
@@ -1469,8 +1627,8 @@ def _configure_force_reports(solver, config):
     _add_report_drag(solver, "fx_rearsus", suspension_zones_rear, DRAG)
 
     # ── Per-element: body/chassis ────────────────────────────────────────
-    _add_report_lift(solver, "fz_body", chassis_zones, DOWN)
-    _add_report_drag(solver, "fx_body", chassis_zones, DRAG)
+    _add_report_lift(solver, "fz_body", body_zones, DOWN)
+    _add_report_drag(solver, "fx_body", body_zones, DRAG)
 
     # ── Moments for CoP calculation ──────────────────────────────────────
     # Moment about front axle origin, Z-axis (pitch moment)
