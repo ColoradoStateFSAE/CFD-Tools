@@ -78,6 +78,7 @@ class SimEditorDialog(QDialog):
         from simtypes.configs import SimType
         if self.config.sim_type == SimType.TURNING:
             self._build_turning_tab()
+        self._build_journals_tab()
 
         # Button row
         btn_frame = QFrame()
@@ -501,6 +502,9 @@ class SimEditorDialog(QDialog):
         self.sb_wheelbase.setValue(c.wheelbase_in)
 
         self.e_existing_mesh.setText(getattr(c, "existing_mesh_path", ""))
+        if hasattr(self, "e_journal_dir"):
+            self.e_journal_dir.setText(getattr(c, "journal_dir", ""))
+            self._refresh_journal_status()
         self.sb_surf_min.setValue(c.surface_mesh_min)
         self.sb_surf_max.setValue(c.surface_mesh_max)
         self.sb_vol_min.setValue(c.volume_mesh_min)
@@ -545,6 +549,8 @@ class SimEditorDialog(QDialog):
         c.wheelbase_in      = self.sb_wheelbase.value()
 
         c.existing_mesh_path = self.e_existing_mesh.text().strip()
+        if hasattr(self, "e_journal_dir"):
+            c.journal_dir = self.e_journal_dir.text().strip()
         c.surface_mesh_min  = self.sb_surf_min.value()
         c.surface_mesh_max  = self.sb_surf_max.value()
         c.volume_mesh_min   = self.sb_vol_min.value()
@@ -737,6 +743,104 @@ class SimEditorDialog(QDialog):
 
         self.tabs.addTab(scroll, title)
         return page
+
+    # ── Journals tab ──────────────────────────────────────────────────────────
+
+    def _build_journals_tab(self):
+        """
+        Show which recorded journals this simulation will run, and allow
+        pointing at a different folder for one-off variants.
+        """
+        w = self._scroll_tab("  Journals  ")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setSpacing(9)
+        form.setContentsMargins(20, 16, 20, 16)
+
+        head = QLabel("Recorded Fluent Journals")
+        head.setObjectName("subheading")
+        form.addRow(head)
+
+        note = QLabel(
+            "The Fluent workflow lives in recorded journals rather than in "
+            "code. The suite substitutes this simulation's values into them "
+            "and runs them. Re-record a journal after an Ansys upgrade "
+            "instead of editing Python."
+        )
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        form.addRow(self._hsep())
+
+        # Resolved paths, refreshed whenever the override changes
+        self.lbl_mesh_journal  = QLabel("—")
+        self.lbl_solve_journal = QLabel("—")
+        for lbl in (self.lbl_mesh_journal, self.lbl_solve_journal):
+            lbl.setWordWrap(True)
+            lbl.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+        form.addRow("Mesh journal:",  self.lbl_mesh_journal)
+        form.addRow("Solve journal:", self.lbl_solve_journal)
+
+        form.addRow(self._hsep())
+
+        override_head = QLabel("Override")
+        override_head.setObjectName("subheading")
+        form.addRow(override_head)
+
+        self.e_journal_dir = QLineEdit()
+        self.e_journal_dir.setPlaceholderText(
+            "Optional: folder containing mesh.py and solve.py — leave blank "
+            "to use the installed journals"
+        )
+        self.e_journal_dir.textChanged.connect(self._refresh_journal_status)
+        dir_btn = QPushButton("Browse…")
+        dir_btn.clicked.connect(
+            lambda: _browse_dir(self, self.e_journal_dir,
+                                "Select Journal Folder")
+        )
+        form.addRow("Journal folder:",
+                    self._browse_row(self.e_journal_dir, dir_btn))
+
+        override_note = QLabel(
+            "Use this to test a modified journal without disturbing the "
+            "installed set. The folder must contain both mesh.py and solve.py."
+        )
+        override_note.setObjectName("muted")
+        override_note.setWordWrap(True)
+        form.addRow(override_note)
+
+        w.layout().addLayout(form)
+        w.layout().addStretch()
+
+        self._refresh_journal_status()
+
+    def _refresh_journal_status(self):
+        """Update the resolved journal paths and flag any that are missing."""
+        import os
+        try:
+            from core.journal_params import sim_type_key
+            from utils.resource_path import journal_path
+        except Exception as exc:
+            self.lbl_mesh_journal.setText(f"unavailable ({exc})")
+            self.lbl_solve_journal.setText("")
+            return
+
+        key = sim_type_key(self.config.sim_type)
+        override = self.e_journal_dir.text().strip()
+
+        for stage, label in (("mesh",  self.lbl_mesh_journal),
+                             ("solve", self.lbl_solve_journal)):
+            path = journal_path(key, stage, override)
+            if os.path.isfile(path):
+                label.setText(path)
+                label.setStyleSheet("color: #98c379;")          # found
+            else:
+                label.setText(f"{path}\n  NOT RECORDED — this simulation "
+                              f"cannot run until it exists")
+                label.setStyleSheet("color: #e06c75;")          # missing
 
     def _browse_row(self, edit: QLineEdit, btn: QPushButton) -> QWidget:
         row = QWidget()

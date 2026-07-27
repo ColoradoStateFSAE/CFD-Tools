@@ -190,6 +190,37 @@ class SimulationQueue:
                     return job
         return None
 
+    def _preflight_journals(self, config, skip_mesh: bool = False) -> None:
+        """
+        Verify the journals this job needs exist and render cleanly.
+
+        Runs before Fluent is launched so a missing journal or an unknown
+        {{TOKEN}} fails in seconds rather than after a 90 minute mesh.
+        Raises with a message naming the file and the fix.
+        """
+        from core import journal_params, journal_runner
+        from utils.resource_path import journal_path
+
+        key    = journal_params.sim_type_key(config.sim_type)
+        tokens = journal_params.build(config)
+
+        stages = ["solve"] if skip_mesh else ["mesh", "solve"]
+        for stage in stages:
+            path = journal_path(key, stage)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(
+                    f"No {stage} journal for {config.sim_type.value}.\n"
+                    f"Expected: {path}\n"
+                    f"Record it with:  python tools/record_journal.py "
+                    f"--sim-type {key} --stage {stage}"
+                )
+            # Render only — this catches unknown placeholders
+            journal_runner.render(
+                journal_runner.load(path), tokens, f"{key}/{stage}.py"
+            )
+
+        log.info(f"Journals OK: {', '.join(stages)} for {key}")
+
     def _run_job(self, job: SimJob):
         self._current_job = job
         job.status = JobStatus.RUNNING
@@ -206,8 +237,13 @@ class SimulationQueue:
             from core.runner import run_meshing, run_solver
             os.makedirs(job.config.output_dir, exist_ok=True)
 
-            # Issue #8 fix: respect existing_mesh_path — skip meshing if set
             existing = getattr(job.config, "existing_mesh_path", "").strip()
+
+            # Preflight: confirm the journals exist and render before Fluent
+            # is launched. Catching a typo'd placeholder here costs seconds;
+            # catching it mid-run costs the whole meshing pass.
+            self._preflight_journals(job.config, skip_mesh=bool(existing))
+
             if existing:
                 if not os.path.exists(existing):
                     raise FileNotFoundError(

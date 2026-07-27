@@ -1,48 +1,45 @@
-# RamRacingCFD.spec — Cross-platform build (Windows + Linux)
-# Python 3.12 / PyQt6 / PyFluent 0.39 / Ansys 2026 R1 (v261)
+# RamRacingCFD.spec — cross-platform PyInstaller build
+# Python 3.12 / PyQt6 / PyFluent 0.39 / Ansys Fluent 2026 R1 (v261)
 #
 # Build:
-#   source .venv/bin/activate          (Linux)
-#   .\.venv\Scripts\Activate.ps1       (Windows)
-#   rm -rf build dist                  (or: rmdir /s /q build dist)
 #   pyinstaller --clean RamRacingCFD.spec
 #
-# Run:
-#   export AWP_ROOT261=/path/to/ansys_inc/v261    (Linux)
-#   set AWP_ROOT261=C:\path\to\ANSYS Inc\v261     (Windows)
-#   ./dist/RamRacingCFD/RamRacingCFD              (Linux)
-#   dist\RamRacingCFD\RamRacingCFD.exe             (Windows)
+# Output:
+#   dist/RamRacingCFD/RamRacingCFD[.exe]
+#   dist/RamRacingCFD/journals/           <- editable, next to the exe
+#
+# The journals live BESIDE the executable rather than inside _internal so the
+# aero team can re-record them after an Ansys upgrade without rebuilding.
+# utils.resource_path.journals_dir() looks there first.
 
-import sys
 import os
+import shutil
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metadata
 
 block_cipher = None
+PROJECT_ROOT = Path(".").resolve()
 
-# ── Collect ansys packages (includes all data files like cfg.yaml) ────────────
-ansys_datas = []
-ansys_bins  = []
-ansys_hidden = []
-for pkg in [
+# ── Ansys packages ───────────────────────────────────────────────────────────
+ansys_datas, ansys_bins, ansys_hidden = [], [], []
+for pkg in (
     "ansys.fluent.core",
     "ansys.units",
     "ansys.api.fluent",
     "ansys.platform",
     "ansys.tools.common",
-]:
+):
     try:
         d, b, h = collect_all(pkg)
         ansys_datas  += d
         ansys_bins   += b
         ansys_hidden += h
     except Exception:
-        pass  # package not installed
+        pass  # not installed — skip
 
-# Package metadata — needed by packages that call importlib.metadata.version()
-from PyInstaller.utils.hooks import copy_metadata
+# Metadata for packages that call importlib.metadata.version() at import time
 meta_datas = []
-for pkg in [
+for pkg in (
     "ansys-platform-instancemanagement",
     "ansys-fluent-core",
     "ansys-units",
@@ -55,37 +52,47 @@ for pkg in [
     "grpcio",
     "numpy",
     "pandas",
-]:
+):
     try:
         meta_datas += copy_metadata(pkg)
     except Exception:
         pass
 
-grpc_h  = collect_submodules("grpc")
-proto_h = collect_submodules("google.protobuf")
-
-# ── Application data files ────────────────────────────────────────────────────
+# ── Application data ─────────────────────────────────────────────────────────
 app_datas = []
-
-# Only include files that actually exist (prevents build failure in CI)
-optional_files = [
-    ("assets/logo.png",                  "assets"),
-    ("utils/Wheel_MRF_Setup_Guide.pdf",  "utils"),
-]
-for src, dest in optional_files:
+for src, dest in (
+    ("assets/logo.png",                 "assets"),
+    ("assets/logo.ico",                 "assets"),
+    ("utils/Wheel_MRF_Setup_Guide.pdf", "utils"),
+):
     if os.path.exists(src):
         app_datas.append((src, dest))
-        print(f"  Including: {src}")
+        print(f"  bundling  {src}")
     else:
-        print(f"  Skipping (not found): {src}")
+        print(f"  skipping  {src}  (not found)")
 
-all_datas = meta_datas + ansys_datas + app_datas
+# Journals are bundled as a fallback; the editable copy is placed beside the
+# executable after COLLECT, below.
+journal_count = 0
+journals_root = PROJECT_ROOT / "journals"
+if journals_root.is_dir():
+    for path in journals_root.rglob("*"):
+        if path.is_file() and path.suffix in (".py", ".md"):
+            rel_dir = path.parent.relative_to(PROJECT_ROOT)
+            app_datas.append((str(path), str(rel_dir)))
+            journal_count += 1
+    print(f"  bundling  journals/  ({journal_count} files)")
+else:
+    print("  WARNING   journals/ not found — the build will not be able to "
+          "mesh or solve")
 
-all_binaries = ansys_bins
-
-all_hidden = list(set(
-    ansys_hidden + grpc_h + proto_h + [
-        # grpc / protobuf core
+# ── Hidden imports ───────────────────────────────────────────────────────────
+all_hidden = sorted(set(
+    ansys_hidden
+    + collect_submodules("grpc")
+    + collect_submodules("google.protobuf")
+    + [
+        # grpc / protobuf internals
         "grpc",
         "grpc._cython",
         "grpc._cython.cygrpc",
@@ -94,20 +101,22 @@ all_hidden = list(set(
         "google.protobuf.descriptor_pool",
         "google.protobuf.reflection",
         "google.protobuf.symbol_database",
-        # our modules
-        "simtypes",
-        "simtypes.configs",
+        # application packages
         "core",
         "core.runner",
         "core.queue_manager",
+        "core.journal_params",
+        "core.journal_runner",
+        "simtypes",
+        "simtypes.configs",
         "gui",
         "gui.app",
-        "gui.theme",
         "gui.sim_editor",
         "gui.wheel_editor",
         "gui.settings_dialog",
-        "gui.resource_path",
+        "gui.theme",
         "utils",
+        "utils.resource_path",
         "utils.results_exporter",
         # misc
         "lxml",
@@ -119,9 +128,9 @@ all_hidden = list(set(
 
 a = Analysis(
     ["main.py"],
-    pathex=[str(Path(".").resolve())],
-    binaries=all_binaries,
-    datas=all_datas,
+    pathex=[str(PROJECT_ROOT)],
+    binaries=ansys_bins,
+    datas=meta_datas + ansys_datas + app_datas,
     hiddenimports=all_hidden,
     hookspath=[],
     hooksconfig={},
@@ -143,19 +152,21 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+icon_file = "assets/logo.ico" if os.path.exists("assets/logo.ico") else None
+
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
     name="RamRacingCFD",
-    icon=None,
+    icon=icon_file,
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,            # don't strip on Windows
+    strip=False,          # stripping corrupts Windows DLLs
     upx=False,
     upx_exclude=["*"],
-    console=True,           # show console for debugging — set False for release
+    console=True,         # set False once the build is verified
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
@@ -172,3 +183,18 @@ coll = COLLECT(
     upx_exclude=["*"],
     name="RamRacingCFD",
 )
+
+# ── Editable journals beside the executable ──────────────────────────────────
+# PyInstaller 6 puts bundled data under _internal/. Journals are re-recorded
+# by the team, so a second copy goes in the dist root where journals_dir()
+# finds it first and where it can be edited without a rebuild.
+if journals_root.is_dir():
+    dist_journals = PROJECT_ROOT / "dist" / "RamRacingCFD" / "journals"
+    if dist_journals.exists():
+        shutil.rmtree(dist_journals)
+    shutil.copytree(
+        journals_root,
+        dist_journals,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    print(f"\n  editable journals -> {dist_journals}")

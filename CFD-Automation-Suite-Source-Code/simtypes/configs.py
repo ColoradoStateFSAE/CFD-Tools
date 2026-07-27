@@ -88,6 +88,12 @@ class BaseSimConfig:
     # Set to a valid .msh.h5 path to skip meshing and use a pre-built mesh.
     existing_mesh_path: str = ""
 
+    # Journal override. Empty means journals/<sim_type>/ resolved by
+    # utils.resource_path.journals_dir(). Set to an absolute directory
+    # containing mesh.py and solve.py to run a variant without touching
+    # the installed journals.
+    journal_dir: str = ""
+
     @property
     def sim_type(self) -> SimType:
         raise NotImplementedError

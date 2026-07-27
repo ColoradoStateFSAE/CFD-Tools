@@ -1,15 +1,17 @@
 ; =============================================================================
 ;  Ram Racing CFD Automation Suite - Windows Installer
-;  Colorado State University FSAE - Aerodynamics Subteam
+;  Colorado State University FSAE | Aerodynamics Subteam
 ;
-;  IMPORTANT: This script packages the PyInstaller output, NOT raw source.
-;  You must run PyInstaller BEFORE compiling this installer:
+;  BUILD ORDER MATTERS. Run PyInstaller first:
 ;
 ;      pyinstaller --clean RamRacingCFD.spec
 ;      makensis installer.nsi
 ;
-;  Expects: dist\RamRacingCFD\RamRacingCFD.exe to exist
-;  Output:  RamRacingCFD-Setup.exe
+;  This packages dist\RamRacingCFD\ -- the self-contained PyInstaller bundle,
+;  including the editable journals\ folder. Running makensis alone produces an
+;  installer containing only .py source files, which cannot run.
+;
+;  Output: RamRacingCFD-Setup.exe
 ; =============================================================================
 
 Unicode True
@@ -19,20 +21,17 @@ Unicode True
 !include "FileFunc.nsh"
 !include "x64.nsh"
 
-; ─── Product metadata ────────────────────────────────────────────────────────
-!define PRODUCT_NAME        "Ram Racing CFD Automation Suite"
-!define PRODUCT_SHORT       "RamRacingCFD"
-!define PRODUCT_VERSION     "0.1.0"
-!define PRODUCT_PUBLISHER   "Colorado State University FSAE - Ram Racing"
-!define PRODUCT_WEB_SITE    "https://github.com/ColoradoStateFSAE/CFD-Tools"
-!define PRODUCT_EXE         "RamRacingCFD.exe"
-!define PRODUCT_DIR_REGKEY  "Software\Microsoft\Windows\CurrentVersion\App Paths\${PRODUCT_EXE}"
-!define PRODUCT_UNINST_KEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_SHORT}"
+!define PRODUCT_NAME       "Ram Racing CFD Automation Suite"
+!define PRODUCT_SHORT      "RamRacingCFD"
+!define PRODUCT_VERSION    "3.0.0"
+!define PRODUCT_PUBLISHER  "Colorado State University FSAE - Ram Racing"
+!define PRODUCT_WEB_SITE   "https://github.com/ColoradoStateFSAE/CFD-Tools"
+!define PRODUCT_EXE        "RamRacingCFD.exe"
+!define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${PRODUCT_EXE}"
+!define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_SHORT}"
 
-; ─── Source directory (PyInstaller output) ───────────────────────────────────
 !define BUILD_DIR "dist\RamRacingCFD"
 
-; ─── Installer configuration ─────────────────────────────────────────────────
 Name          "${PRODUCT_NAME}"
 OutFile       "RamRacingCFD-Setup.exe"
 InstallDir    "$PROGRAMFILES64\Ram Racing\CFD Automation Suite"
@@ -42,8 +41,7 @@ ShowInstDetails   show
 ShowUnInstDetails show
 SetCompressor /SOLID lzma
 
-; ─── Version info block (shows in file properties) ───────────────────────────
-VIProductVersion "0.0.2.0"
+VIProductVersion "3.0.0.0"
 VIAddVersionKey "ProductName"     "${PRODUCT_NAME}"
 VIAddVersionKey "CompanyName"     "${PRODUCT_PUBLISHER}"
 VIAddVersionKey "FileDescription" "${PRODUCT_NAME} Installer"
@@ -51,53 +49,49 @@ VIAddVersionKey "FileVersion"     "${PRODUCT_VERSION}"
 VIAddVersionKey "ProductVersion"  "${PRODUCT_VERSION}"
 VIAddVersionKey "LegalCopyright"  "(c) Colorado State University FSAE"
 
-; ─── Modern UI configuration ─────────────────────────────────────────────────
+; ─── UI ──────────────────────────────────────────────────────────────────────
 !define MUI_ABORTWARNING
-!define MUI_ICON   "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
+!define MUI_ICON   "assets\logo.ico"
 !define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
 
-; Welcome page text
 !define MUI_WELCOMEPAGE_TITLE "Ram Racing CFD Automation Suite"
-!define MUI_WELCOMEPAGE_TEXT  "This will install the Ram Racing CFD Automation Suite on your computer.$\r$\n$\r$\nThis application automates Ansys Fluent meshing and solving workflows for FSAE aerodynamics.$\r$\n$\r$\nRequirements:$\r$\n  - Ansys Fluent 2026 R1 (v261) installed and licensed$\r$\n  - 64-bit Windows 10 or later$\r$\n  - ~500 MB free disk space$\r$\n$\r$\nPython is NOT required - all dependencies are bundled.$\r$\n$\r$\nClick Next to continue."
+!define MUI_WELCOMEPAGE_TEXT  "This will install the Ram Racing CFD Automation Suite.$\r$\n$\r$\nThe suite automates Ansys Fluent meshing and solving for FSAE aerodynamics by running recorded Fluent journals.$\r$\n$\r$\nRequirements:$\r$\n  - Ansys Fluent 2026 R1 (v261), installed and licensed$\r$\n  - 64-bit Windows 10 or later$\r$\n  - ~500 MB free disk space$\r$\n$\r$\nPython is NOT required; the runtime and all dependencies are bundled.$\r$\n$\r$\nThe journals folder is installed alongside the program so it can be re-recorded after an Ansys upgrade without reinstalling.$\r$\n$\r$\nClick Next to continue."
 
-; Finish page
 !define MUI_FINISHPAGE_RUN            "$INSTDIR\${PRODUCT_EXE}"
 !define MUI_FINISHPAGE_RUN_TEXT       "Launch Ram Racing CFD now"
-!define MUI_FINISHPAGE_SHOWREADME     "$INSTDIR\README.md"
-!define MUI_FINISHPAGE_SHOWREADME_TEXT "View README"
+!define MUI_FINISHPAGE_SHOWREADME     "$INSTDIR\journals\README.md"
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "Open the journals guide"
 !define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED
-!define MUI_FINISHPAGE_LINK           "Ram Racing CFD-Tools on GitHub"
+!define MUI_FINISHPAGE_LINK           "CFD-Tools on GitHub"
 !define MUI_FINISHPAGE_LINK_LOCATION  "${PRODUCT_WEB_SITE}"
 
-; ─── Installer pages ─────────────────────────────────────────────────────────
 !insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
-; ─── Uninstaller pages ───────────────────────────────────────────────────────
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 
 !insertmacro MUI_LANGUAGE "English"
 
 ; =============================================================================
-;  Pre-install checks
+;  Pre-install
 ; =============================================================================
 Function .onInit
-    ; Require 64-bit Windows
     ${IfNot} ${RunningX64}
         MessageBox MB_OK|MB_ICONSTOP \
             "This application requires 64-bit Windows.$\r$\n$\r$\nInstallation cannot continue."
         Abort
     ${EndIf}
 
-    ; Warn if a previous version is installed
     ReadRegStr $R0 HKLM "${PRODUCT_UNINST_KEY}" "UninstallString"
     ${If} $R0 != ""
         MessageBox MB_YESNO|MB_ICONQUESTION \
-            "A previous version of ${PRODUCT_NAME} is already installed.$\r$\n$\r$\n\
-             Uninstall it before continuing?" \
+            "A previous version is already installed.$\r$\n$\r$\n\
+             Uninstall it first?$\r$\n$\r$\n\
+             Your journals folder will be preserved." \
             IDNO skip_uninstall
         ExecWait '$R0 /S _?=$INSTDIR'
         skip_uninstall:
@@ -105,39 +99,29 @@ Function .onInit
 FunctionEnd
 
 ; =============================================================================
-;  Main install section
+;  Application
 ; =============================================================================
 Section "Application (required)" SEC_APP
-    SectionIn RO   ; read-only, cannot be deselected
+    SectionIn RO
 
     SetOutPath "$INSTDIR"
     SetOverwrite try
 
-    ; ── Copy the entire PyInstaller bundle ───────────────────────────────
-    ; This includes RamRacingCFD.exe, all bundled Python runtime,
-    ; PyQt6 DLLs, PyFluent packages, and the _internal folder.
     DetailPrint "Installing application files..."
-    File /r "${BUILD_DIR}\*.*"
+    ; Everything except journals — those are handled separately so a
+    ; reinstall never overwrites a re-recorded journal.
+    File /r /x journals "${BUILD_DIR}\*.*"
 
-    ; ── Copy documentation if present ────────────────────────────────────
-    ${If} ${FileExists} "README.md"
-        File "README.md"
-    ${EndIf}
-
-    ; ── Verify the executable actually landed ────────────────────────────
     ${IfNot} ${FileExists} "$INSTDIR\${PRODUCT_EXE}"
         MessageBox MB_OK|MB_ICONSTOP \
             "Installation failed: ${PRODUCT_EXE} was not copied.$\r$\n$\r$\n\
-             The installer package may be corrupt or was built incorrectly.$\r$\n\
-             Ensure PyInstaller was run before building this installer."
+             The installer was built without running PyInstaller first."
         Abort
     ${EndIf}
 
-    ; ── Registry: App Paths (allows running from Win+R) ──────────────────
     WriteRegStr HKLM "${PRODUCT_DIR_REGKEY}" "" "$INSTDIR\${PRODUCT_EXE}"
     WriteRegStr HKLM "${PRODUCT_DIR_REGKEY}" "Path" "$INSTDIR"
 
-    ; ── Registry: Add/Remove Programs entry ──────────────────────────────
     WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayName"     "${PRODUCT_NAME}"
     WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayVersion"  "${PRODUCT_VERSION}"
     WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "Publisher"       "${PRODUCT_PUBLISHER}"
@@ -148,51 +132,79 @@ Section "Application (required)" SEC_APP
     WriteRegDWORD HKLM "${PRODUCT_UNINST_KEY}" "NoModify" 1
     WriteRegDWORD HKLM "${PRODUCT_UNINST_KEY}" "NoRepair" 1
 
-    ; Record installed size for Add/Remove Programs
     ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
     IntFmt $0 "0x%08X" $0
     WriteRegDWORD HKLM "${PRODUCT_UNINST_KEY}" "EstimatedSize" "$0"
 
-    ; ── Write uninstaller ────────────────────────────────────────────────
     WriteUninstaller "$INSTDIR\uninstall.exe"
 SectionEnd
 
 ; =============================================================================
-;  Start Menu shortcuts
+;  Journals — editable, preserved across upgrades
+; =============================================================================
+Section "Fluent journals" SEC_JOURNALS
+    SectionIn RO
+
+    ; Never clobber journals the team has re-recorded. Existing files are
+    ; left alone; a backup of the shipped set goes in journals\_shipped\ so a
+    ; broken edit can be compared against a known-good copy.
+    ${If} ${FileExists} "$INSTDIR\journals\*.*"
+        DetailPrint "Existing journals found — preserving them"
+        SetOutPath "$INSTDIR\journals\_shipped"
+        SetOverwrite on
+        File /r "${BUILD_DIR}\journals\*.*"
+        DetailPrint "Shipped journals copied to journals\_shipped for reference"
+    ${Else}
+        DetailPrint "Installing journals..."
+        SetOutPath "$INSTDIR\journals"
+        SetOverwrite on
+        File /r "${BUILD_DIR}\journals\*.*"
+    ${EndIf}
+
+    ; The journals folder must stay writable for re-recording, but Program
+    ; Files is admin-only by default. Grant Users modify rights on it.
+    AccessControl::GrantOnFile "$INSTDIR\journals" "(BU)" "FullAccess"
+    Pop $0
+    ${If} $0 == "error"
+        DetailPrint "Note: could not grant write access to journals folder."
+        DetailPrint "Re-recording may require running as administrator, or set"
+        DetailPrint "RAMRACING_JOURNALS to a folder you can write to."
+    ${Else}
+        DetailPrint "Journals folder is writable by all users"
+    ${EndIf}
+SectionEnd
+
+; =============================================================================
+;  Shortcuts
 ; =============================================================================
 Section "Start Menu shortcuts" SEC_STARTMENU
     CreateDirectory "$SMPROGRAMS\Ram Racing"
     CreateShortCut  "$SMPROGRAMS\Ram Racing\Ram Racing CFD.lnk" \
                     "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\${PRODUCT_EXE}" 0
+    CreateShortCut  "$SMPROGRAMS\Ram Racing\Journals Folder.lnk" \
+                    "$INSTDIR\journals"
     CreateShortCut  "$SMPROGRAMS\Ram Racing\Uninstall Ram Racing CFD.lnk" \
                     "$INSTDIR\uninstall.exe"
 SectionEnd
 
-; =============================================================================
-;  Desktop shortcut
-; =============================================================================
 Section "Desktop shortcut" SEC_DESKTOP
     CreateShortCut "$DESKTOP\Ram Racing CFD.lnk" \
                    "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\${PRODUCT_EXE}" 0
 SectionEnd
 
 ; =============================================================================
-;  Ansys detection (informational only - does not block install)
+;  Ansys detection (informational)
 ; =============================================================================
 Section "-AnsysCheck"
     DetailPrint "Checking for Ansys Fluent 2026 R1..."
+    StrCpy $R1 ""
 
-    StrCpy $R1 ""   ; found path
-
-    ; Check AWP_ROOT261 environment variable
     ReadEnvStr $R0 "AWP_ROOT261"
     ${If} $R0 != ""
-        ${If} ${FileExists} "$R0\fluent\*.*"
-            StrCpy $R1 $R0
-        ${EndIf}
+    ${AndIf} ${FileExists} "$R0\fluent\*.*"
+        StrCpy $R1 $R0
     ${EndIf}
 
-    ; Check standard install locations
     ${If} $R1 == ""
         ${If} ${FileExists} "$PROGRAMFILES64\ANSYS Inc\v261\fluent\*.*"
             StrCpy $R1 "$PROGRAMFILES64\ANSYS Inc\v261"
@@ -202,68 +214,88 @@ Section "-AnsysCheck"
     ${EndIf}
 
     ${If} $R1 != ""
-        DetailPrint "  Found Ansys 2026 R1 at: $R1"
-        ; Persist AWP_ROOT261 for all users if not already set
+        DetailPrint "  Found Ansys 2026 R1: $R1"
         ReadEnvStr $R2 "AWP_ROOT261"
         ${If} $R2 == ""
             WriteRegExpandStr HKLM \
                 "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" \
                 "AWP_ROOT261" "$R1"
-            DetailPrint "  Set AWP_ROOT261 system environment variable"
+            DetailPrint "  AWP_ROOT261 set system-wide"
             SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
         ${EndIf}
     ${Else}
         DetailPrint "  WARNING: Ansys Fluent 2026 R1 not found"
         MessageBox MB_OK|MB_ICONEXCLAMATION \
-            "Ansys Fluent 2026 R1 (v261) was not detected on this system.$\r$\n$\r$\n\
-             The application will install successfully, but you must have Ansys$\r$\n\
-             Fluent 2026 R1 installed and licensed to run simulations.$\r$\n$\r$\n\
-             If Ansys is installed in a non-standard location, set the$\r$\n\
-             AWP_ROOT261 environment variable to its install directory:$\r$\n$\r$\n\
+            "Ansys Fluent 2026 R1 (v261) was not detected.$\r$\n$\r$\n\
+             The suite will install, but Fluent must be installed and licensed$\r$\n\
+             to mesh or solve.$\r$\n$\r$\n\
+             For a non-standard install location:$\r$\n$\r$\n\
              setx AWP_ROOT261 $\"C:\path\to\ANSYS Inc\v261$\" /M"
     ${EndIf}
 SectionEnd
 
-; ─── Section descriptions (shown on hover in component page) ─────────────────
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_APP} \
-        "The main application and all bundled dependencies. Required."
+        "The application and all bundled dependencies. Required."
+    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_JOURNALS} \
+        "Recorded Fluent journals. Installed to a writable folder so they can \
+         be re-recorded after an Ansys upgrade. Existing journals are preserved."
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_STARTMENU} \
-        "Add shortcuts to the Windows Start Menu."
+        "Start Menu shortcuts, including one to the journals folder."
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_DESKTOP} \
-        "Add a shortcut to the Desktop."
+        "Desktop shortcut."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; =============================================================================
-;  Uninstaller
+;  Uninstall
 ; =============================================================================
 Section "Uninstall"
-    ; Remove shortcuts
     Delete "$DESKTOP\Ram Racing CFD.lnk"
     Delete "$SMPROGRAMS\Ram Racing\Ram Racing CFD.lnk"
+    Delete "$SMPROGRAMS\Ram Racing\Journals Folder.lnk"
     Delete "$SMPROGRAMS\Ram Racing\Uninstall Ram Racing CFD.lnk"
     RMDir  "$SMPROGRAMS\Ram Racing"
 
-    ; Remove all installed files
-    ; RMDir /r removes the whole tree including _internal
-    RMDir /r "$INSTDIR"
+    ; Offer to keep journals — they may hold hours of re-recording work
+    ${If} ${FileExists} "$INSTDIR\journals\*.*"
+        MessageBox MB_YESNO|MB_ICONQUESTION \
+            "Keep the journals folder?$\r$\n$\r$\n\
+             It contains your recorded Fluent journals, including any you have\
+             re-recorded.$\r$\n$\r$\n\
+             Yes = keep    No = delete everything" \
+            IDNO remove_all
 
-    ; Clean registry
+        ; Remove everything except journals
+        Delete "$INSTDIR\${PRODUCT_EXE}"
+        Delete "$INSTDIR\uninstall.exe"
+        RMDir /r "$INSTDIR\_internal"
+        RMDir /r "$INSTDIR\assets"
+        RMDir /r "$INSTDIR\utils"
+        DetailPrint "Journals kept at $INSTDIR\journals"
+        Goto cleanup_registry
+
+        remove_all:
+        RMDir /r "$INSTDIR"
+    ${Else}
+        RMDir /r "$INSTDIR"
+    ${EndIf}
+
+    cleanup_registry:
     DeleteRegKey HKLM "${PRODUCT_UNINST_KEY}"
     DeleteRegKey HKLM "${PRODUCT_DIR_REGKEY}"
 
     SetAutoClose false
 SectionEnd
 
-Function un.onUninstSuccess
-    HideWindow
-    MessageBox MB_ICONINFORMATION|MB_OK \
-        "${PRODUCT_NAME} was successfully removed from your computer."
-FunctionEnd
-
 Function un.onInit
     MessageBox MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2 \
         "Remove ${PRODUCT_NAME} and all of its components?" \
         IDYES +2
     Abort
+FunctionEnd
+
+Function un.onUninstSuccess
+    HideWindow
+    MessageBox MB_ICONINFORMATION|MB_OK \
+        "${PRODUCT_NAME} was successfully removed."
 FunctionEnd

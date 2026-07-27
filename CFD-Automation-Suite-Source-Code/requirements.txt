@@ -1,3 +1,18 @@
+# Ram Racing CFD Automation Suite
+# Python 3.12  |  Ansys Fluent 2026 R1 (v261)
+#
+#   pip install -r requirements.txt
+#
+# PyQt6 must come from a wheel. Building from source needs qmake and the Qt
+# build tools, which are not present on the HPC nodes:
+#   pip install PyQt6 --only-binary=:all:
+
+# GUI
 PyQt6>=6.6.0
+
+# Fluent automation. 0.39+ is required for the Enhanced Meshing Workflow
+# and the journal.start() / journal.stop() API the suite is built on.
 ansys-fluent-core>=0.39.0
+
+# Build only — not needed to run from source
 pyinstaller>=6.0.0

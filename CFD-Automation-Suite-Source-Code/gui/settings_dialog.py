@@ -109,6 +109,33 @@ class CarSettingsDialog(QDialog):
 
         root.addWidget(hpc_group)
 
+        # ── Journals ────────────────────────────────────────────────────
+        journal_group = QGroupBox("Fluent Journals")
+        journal_form = QFormLayout(journal_group)
+
+        self.lbl_journals_dir = QLabel("—")
+        self.lbl_journals_dir.setWordWrap(True)
+        self.lbl_journals_dir.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        journal_form.addRow("Location:", self.lbl_journals_dir)
+
+        self.lbl_journals_status = QLabel("—")
+        self.lbl_journals_status.setWordWrap(True)
+        journal_form.addRow("Recorded:", self.lbl_journals_status)
+
+        journal_note = QLabel(
+            "Read-only. Override the location with the RAMRACING_JOURNALS "
+            "environment variable, or per simulation on the Journals tab of "
+            "the editor."
+        )
+        journal_note.setObjectName("muted")
+        journal_note.setWordWrap(True)
+        journal_form.addRow(journal_note)
+
+        self._refresh_journal_info()
+        root.addWidget(journal_group)
+
         # ── Buttons ─────────────────────────────────────────────────────
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -124,6 +151,47 @@ class CarSettingsDialog(QDialog):
         root.addWidget(btns)
 
     # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _refresh_journal_info(self):
+        """Report where journals were found and which are recorded."""
+        import os
+        try:
+            from utils.resource_path import journals_dir
+            from core.journal_params import all_sim_type_keys
+        except Exception as exc:
+            self.lbl_journals_dir.setText(f"unavailable ({exc})")
+            return
+
+        root = journals_dir()
+        self.lbl_journals_dir.setText(root)
+
+        if not os.path.isdir(root):
+            self.lbl_journals_status.setText("directory not found")
+            self.lbl_journals_status.setStyleSheet("color: #e06c75;")
+            return
+
+        ready, partial = [], []
+        for key in all_sim_type_keys():
+            folder = os.path.join(root, key)
+            has_mesh  = os.path.isfile(os.path.join(folder, "mesh.py"))
+            has_solve = os.path.isfile(os.path.join(folder, "solve.py"))
+            if has_mesh and has_solve:
+                ready.append(key)
+            elif has_mesh or has_solve:
+                partial.append(key)
+
+        parts = []
+        if ready:
+            parts.append(f"{len(ready)} complete: {', '.join(ready)}")
+        if partial:
+            parts.append(f"{len(partial)} partial: {', '.join(partial)}")
+        if not parts:
+            parts.append("none recorded yet")
+
+        self.lbl_journals_status.setText("  |  ".join(parts))
+        self.lbl_journals_status.setStyleSheet(
+            "color: #98c379;" if ready else "color: #e5c07b;"
+        )
 
     def _dspin(self, lo, hi, decimals, suffix="", tooltip=""):
         sb = QDoubleSpinBox()
