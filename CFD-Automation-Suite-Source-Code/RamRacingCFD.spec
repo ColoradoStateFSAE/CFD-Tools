@@ -1,228 +1,124 @@
-# RamRacingCFD.spec — Rocky Linux 8.10 build
-# Python 3.12 / PyQt6 / PyFluent 0.38 / Ansys 2025 R2 (v252)
-#
-# Build:
-#   source .venv/bin/activate
-#   rm -rf build dist
-#   pyinstaller RamRacingCFD.spec
-#   chmod +x dist/RamRacingCFD/RamRacingCFD
-#
-# Run:
-#   export AWP_ROOT252=/home/xeongold/ansys_inc/v252
-#   ./dist/RamRacingCFD/RamRacingCFD
+name: Nightly Development Build
 
-import sys
-import os
-from pathlib import Path
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
 
-block_cipher = None
+permissions:
+  contents: write
 
-# ── Collect ansys packages (includes all data files like cfg.yaml) ────────────
-ansys_fc_d, ansys_fc_b, ansys_fc_h = collect_all("ansys.fluent.core")
-ansys_u_d,  ansys_u_b,  ansys_u_h  = collect_all("ansys.units")
-ansys_a_d,  ansys_a_b,  ansys_a_h  = collect_all("ansys.api.fluent")
-ansys_p_d,  ansys_p_b,  ansys_p_h  = collect_all("ansys.platform")
-ansys_t_d,  ansys_t_b,  ansys_t_h  = collect_all("ansys.tools.common")
+jobs:
+  # =========================================================================
+  # JOB 1: Compile the Windows Installer (.exe) with Metadata
+  # =========================================================================
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
 
-# Package metadata — needed by packages that call importlib.metadata.version()
-# at import time (ansys.platform.instancemanagement does this)
-from PyInstaller.utils.hooks import copy_metadata
-meta_datas = []
-for pkg in [
-    "ansys-platform-instancemanagement",
-    "ansys-fluent-core",
-    "ansys-units",
-    "ansys-api-fluent",
-    "ansys-tools-filetransfer",
-    "ansys-tools-common",
-    "PyQt6",
-    "PyQt6-Qt6",
-    "PyQt6-sip",
-    "grpcio",
-    "numpy",
-    "pandas",
-]:
-    try:
-        meta_datas += copy_metadata(pkg)
-    except Exception:
-        pass  # package not installed — skip
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
 
-grpc_h  = collect_submodules("grpc")
-proto_h = collect_submodules("google.protobuf")
-nltk_h  = collect_submodules("nltk")
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-all_datas = (
-    meta_datas
-    + ansys_fc_d + ansys_u_d + ansys_a_d + ansys_p_d + ansys_t_d + [
-        ("utils/Wheel_MRF_Setup_Guide.pdf", "utils"),
-        ("assets/logo.png",                 "assets"),
-    ]
-)
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+          if (Test-Path CFD-Automation-Suite-Source-Code/requirements.txt) { pip install -r CFD-Automation-Suite-Source-Code/requirements.txt }
 
-all_binaries = ansys_fc_b + ansys_u_b + ansys_a_b + ansys_p_b + ansys_t_b
+      - name: Install NSIS Compiler Engine
+        uses: negrutiu/nsis-install@v2
 
-# ── Rocky 8 specific: bundle xcb platform plugin ─────────────────────────────
-# Rocky 8 ships an older libxcb — the one bundled with PyQt6 may not load
-# against the system xcb. We force-include the Qt xcb plugin from the venv
-# and also bundle libatomic which Rocky 8 sometimes can't find.
-try:
-    import subprocess
-    qt_plugin_path = subprocess.check_output(
-        [sys.executable, "-c",
-         "from PyQt6.QtCore import QLibraryInfo; "
-         "print(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))"],
-        text=True
-    ).strip()
+      - name: Compile Windows Installer via NSIS
+        run: |
+          makensis CFD-Automation-Suite-Source-Code/installer.nsi
 
-    # Platform plugin
-    xcb = os.path.join(qt_plugin_path, "platforms", "libqxcb.so")
-    if os.path.exists(xcb):
-        all_binaries.append((xcb, "PyQt6/Qt6/plugins/platforms"))
-        print(f"spec: bundled {xcb}")
+      - name: Rename Installer with Date and Commit Hash
+        shell: powershell
+        run: |
+          $date = Get-Date -Format "yyyyMMdd"
+          $sha = (git rev-parse --short HEAD).Trim()
+          mkdir dist-staged
+          Get-ChildItem -Path . , dist, CFD-Automation-Suite-Source-Code -Filter *.exe -Recurse | Select-Object -First 1 | ForEach-Object {
+              Move-Item $_.FullName "dist-staged/setup-$date-$sha.exe" -Force
+          }
 
-    # Wayland plugin (fallback if xcb unavailable)
-    wayland = os.path.join(qt_plugin_path, "platforms", "libqwayland-generic.so")
-    if os.path.exists(wayland):
-        all_binaries.append((wayland, "PyQt6/Qt6/plugins/platforms"))
+      - name: Archive Windows Installer Piece
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-windows-exe
+          path: dist-staged/*.exe
+          retention-days: 1
 
-    # xcb integration plugin
-    xcb_qpa_dir = os.path.join(qt_plugin_path, "xcbglintegrations")
-    if os.path.isdir(xcb_qpa_dir):
-        for f in os.listdir(xcb_qpa_dir):
-            all_binaries.append(
-                (os.path.join(xcb_qpa_dir, f), "PyQt6/Qt6/plugins/xcbglintegrations")
-            )
+  # =========================================================================
+  # JOB 2: Delete Old Release, Then Publish Fresh One
+  # =========================================================================
+  publish-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build-windows]
 
-    # Qt image format plugins
-    img_dir = os.path.join(qt_plugin_path, "imageformats")
-    if os.path.isdir(img_dir):
-        for f in os.listdir(img_dir):
-            if f.endswith(".so") and "pdf" not in f:  # skip libqpdf (needs libatomic)
-                all_binaries.append(
-                    (os.path.join(img_dir, f), "PyQt6/Qt6/plugins/imageformats")
-                )
-except Exception as e:
-    print(f"spec WARNING: Qt plugin collection failed: {e}")
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
 
-# libatomic — required by Qt PDF plugin, not always present on Rocky 8
-for lib_path in [
-    "/usr/lib64/libatomic.so.1",
-    "/lib64/libatomic.so.1",
-    "/usr/lib/libatomic.so.1",
-]:
-    if os.path.exists(lib_path):
-        all_binaries.append((lib_path, "."))
-        print(f"spec: bundled {lib_path}")
-        break
+      - name: Generate build metadata tags
+        id: metadata
+        shell: bash
+        run: |
+          echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-all_hidden = (
-    ansys_fc_h + ansys_u_h + ansys_a_h + ansys_p_h + ansys_t_h
-    + grpc_h + proto_h + nltk_h
-    + [
-        # PyQt6
-        "PyQt6.QtCore",
-        "PyQt6.QtGui",
-        "PyQt6.QtWidgets",
-        "PyQt6.QtPrintSupport",
-        "PyQt6.sip",
-        # ansys internals that collect_all can miss
-        "ansys.fluent.core.generated",
-        "ansys.fluent.core.generated.solver",
-        "ansys.fluent.core.generated.solver.settings_builtin",
-        "ansys.fluent.core.generated.datamodel_252",
-        "ansys.fluent.core.solver.settings_builtin_bases",
-        "ansys.fluent.core.solver.flobject",
-        "ansys.fluent.core.variable_strategies",
-        "ansys.fluent.core.variable_strategies.expr",
-        "ansys.units.variable_descriptor",
-        "ansys.units.quantity",
-        "ansys.units.systems",
-        "ansys.units._constants",
-        # grpc
-        "grpc._cython.cygrpc",
-        "grpc._channel",
-        "grpc._interceptor",
-        "grpc.experimental",
-        # protobuf
-        "google.protobuf.descriptor",
-        "google.protobuf.descriptor_pool",
-        "google.protobuf.reflection",
-        "google.protobuf.symbol_database",
-        # our modules
-        "simtypes.configs",
-        "core.runner",
-        "core.queue_manager",
-        "gui.app",
-        "gui.theme",
-        "gui.sim_editor",
-        "gui.wheel_editor",
-        "gui.settings_dialog",
-        "utils.results_exporter",
-        "utils.resource_path",
-        # misc
-        "lxml",
-        "lxml.etree",
-        "PIL",
-        "PIL.Image",
-    ]
-)
+      - name: Download Windows Compilation Piece
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-windows-exe
+          path: dist-assets
 
-a = Analysis(
-    ["main.py"],
-    pathex=[str(Path(".").resolve())],
-    binaries=all_binaries,
-    datas=all_datas,
-    hiddenimports=all_hidden,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[
-        "tkinter",
-        "matplotlib",
-        "IPython",
-        "notebook",
-        "jupyter",
-        "sphinx",
-        "pytest",
-        # scipy pulls in a lot on Rocky 8 — exclude unless needed
-        # "scipy",
-    ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
-    noarchive=False,
-)
+      - name: Package application source archive
+        shell: bash
+        run: |
+          mkdir -p dist-assets
+          tar --exclude='.git' --exclude='.github' --exclude='dist-assets' \
+            -czf dist-assets/app-nightly-${{ steps.metadata.outputs.BUILD_DATE }}-${{ steps.metadata.outputs.COMMIT_SHA }}.tar.gz .
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+      # Deletes the release AND its tag so nothing old lingers.
+      # The `gh` CLI is pre-installed on all GitHub-hosted runners.
+      # The `|| true` prevents the step from failing if no prior release exists yet.
+      - name: Delete existing nightly release and tag
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete nightly-latest --yes --cleanup-tag || true
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="RamRacingCFD",
-    icon=None,
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=True,
-    upx=False,
-    upx_exclude=["*"],   # exclude ALL files from UPX — belt and suspenders
-    console=False,
-    disable_windowed_traceback=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+      # Small pause to let GitHub's backend fully propagate the deletion
+      # before we immediately recreate the same tag name.
+      - name: Wait for deletion to propagate
+        run: sleep 5
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=True,
-    upx=False,
-    upx_exclude=["*"],   # exclude ALL files from UPX
-    name="RamRacingCFD",
-)
+      - name: Publish fresh nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-latest
+          name: "Nightly Development Build"
+          body: |
+            ### 🌙 Nightly Development Build
+            This release contains the absolute latest, automatically compiled features directly from the `main` branch.
 
+            ⚠️ **Please Note:** These builds are developmental works-in-progress and may contain bugs or unstable features.
+
+            * **Build Date:** ${{ steps.metadata.outputs.BUILD_DATE }}
+            * **Latest Commit:** ${{ steps.metadata.outputs.COMMIT_SHA }}
+          prerelease: true
+          files: |
+            dist-assets/*.tar.gz
+            dist-assets/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
