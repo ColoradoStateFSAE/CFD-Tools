@@ -609,6 +609,80 @@ def _set_task_property(task, name, value) -> bool:
             return False
 
 
+def _apply_task_arguments(task, args: dict) -> bool:
+    """
+    Push an argument dict onto a workflow task.
+
+    "Create Local Refinement Regions" is a compound task -- its settings live
+    in the task's `arguments` datamodel node rather than as direct Python
+    attributes, so the CamelCase keys from the legacy API still apply.
+    """
+    # 1. arguments.set_state()
+    try:
+        task.arguments.set_state(args)
+        return True
+    except Exception as e:
+        log.debug(f"  arguments.set_state: {e}")
+    # 2. arguments.update_dict() / update()
+    for method in ("update_dict", "update"):
+        try:
+            getattr(task.arguments, method)(args)
+            return True
+        except Exception:
+            continue
+    # 3. plain assignment
+    try:
+        task.arguments = args
+        return True
+    except Exception as e:
+        log.debug(f"  arguments assignment: {e}")
+    # 4. per-key snake_case attributes (older enhanced-workflow builds)
+    n = sum(1 for k, v in args.items() if _set_task_property(task, _snake(k), v))
+    return n > 0
+
+
+def _snake(camel: str) -> str:
+    """LocalRefinementRegionName -> local_refinement_region_name, XMin -> x_min"""
+    out = []
+    for i, ch in enumerate(camel):
+        if ch.isupper() and i > 0:
+            out.append("_")
+        out.append(ch.lower())
+    return "".join(out)
+
+
+def _execute_task(task) -> bool:
+    """Execute a workflow task, trying compound-child and plain forms."""
+    for method in ("add_child_and_update", "execute", "__call__"):
+        fn = getattr(task, method, None)
+        if fn is None:
+            continue
+        try:
+            if method == "add_child_and_update":
+                try:
+                    fn(defer_update=False)
+                except TypeError:
+                    fn()
+            else:
+                fn()
+            return True
+        except Exception as e:
+            log.debug(f"  {method}(): {e}")
+    return False
+
+
+def _dump_task_arguments(task, label: str):
+    """Log the task's real argument keys so naming can be corrected."""
+    try:
+        state = task.arguments()
+        if isinstance(state, dict):
+            log.warning(f"  {label} accepts these argument keys: {sorted(state.keys())}")
+            return
+        log.warning(f"  {label} arguments state: {state}")
+    except Exception as e:
+        log.warning(f"  {label}: could not read arguments ({e})")
+
+
 def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
     """
     Create a coordinate-specified local refinement region.
@@ -624,6 +698,15 @@ def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
         log.warning(f"  Refinement box {name!r}: task not available in workflow")
         return False
 
+    args = {
+        "LocalRefinementRegionName":     name,
+        "Type":                          "box",
+        "CoordinateSpecificationMethod": "directly-specify-coordinates",
+        "MeshSize":                      box["size"],
+        "XMin": box["x_min"], "XMax": box["x_max"],
+        "YMin": box["y_min"], "YMax": box["y_max"],
+        "ZMin": box["z_min"], "ZMax": box["z_max"],
+    }
     extents = (
         f"X[{box['x_min']:.2f}, {box['x_max']:.2f}]  "
         f"Y[{box['y_min']:.2f}, {box['y_max']:.2f}]  "
@@ -632,15 +715,7 @@ def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
 
     if mode == "legacy":
         try:
-            task.Arguments.update({
-                "LocalRefinementRegionName":     name,
-                "Type":                          "box",
-                "CoordinateSpecificationMethod": "directly-specify-coordinates",
-                "MeshSize":                      box["size"],
-                "XMin": box["x_min"], "XMax": box["x_max"],
-                "YMin": box["y_min"], "YMax": box["y_max"],
-                "ZMin": box["z_min"], "ZMax": box["z_max"],
-            })
+            task.Arguments.update(args)
             task.Execute()
             log.info(f"  Added refinement box: {name}  size={box['size']} m  {extents}")
             return True
@@ -648,34 +723,17 @@ def _add_refinement_box(meshing, watertight, name: str, box: dict) -> bool:
             log.warning(f"  Refinement box {name!r} (legacy): {e}")
             return False
 
-    # Enhanced workflow -- snake_case property names
-    props = [
-        ("local_refinement_region_name",    name),
-        ("region_name",                     name),
-        ("type",                            "box"),
-        ("region_type",                     "box"),
-        ("coordinate_specification_method", "directly-specify-coordinates"),
-        ("mesh_size",                       box["size"]),
-        ("x_min", box["x_min"]), ("x_max", box["x_max"]),
-        ("y_min", box["y_min"]), ("y_max", box["y_max"]),
-        ("z_min", box["z_min"]), ("z_max", box["z_max"]),
-    ]
-    n_set = sum(1 for p, v in props if _set_task_property(task, p, v))
-    if n_set == 0:
-        available = [a for a in dir(task) if not a.startswith("_")][:20]
-        log.warning(
-            f"  Refinement box {name!r}: no properties could be set. "
-            f"Task attributes: {available}"
-        )
+    if not _apply_task_arguments(task, args):
+        log.warning(f"  Refinement box {name!r}: could not set arguments")
+        _dump_task_arguments(task, f"Refinement box {name!r}")
         return False
 
-    try:
-        task()
-        log.info(f"  Added refinement box: {name}  size={box['size']} m  {extents}")
-        return True
-    except Exception as e:
-        log.warning(f"  Refinement box {name!r} execute: {e}")
+    if not _execute_task(task):
+        log.warning(f"  Refinement box {name!r}: execute failed")
         return False
+
+    log.info(f"  Added refinement box: {name}  size={box['size']} m  {extents}")
+    return True
 
 
 def _add_wheel_refinement(meshing, watertight, wheel_name: str,
@@ -692,18 +750,19 @@ def _add_wheel_refinement(meshing, watertight, wheel_name: str,
         return False
 
     region_name = f"wheel_{wheel_name.lower()}"
+    args = {
+        "LocalRefinementRegionName":     region_name,
+        "Type":                          "box",
+        "CoordinateSpecificationMethod": "relative-to-body-size",
+        "MeshSize":                      0.032,
+        "XMin": 0.1, "XMax": 1.0,
+        "YMin": 0.0, "YMax": 0.1,
+        "ZMin": 0.1, "ZMax": 0.1,
+    }
 
     if mode == "legacy":
         try:
-            task.Arguments.update({
-                "LocalRefinementRegionName":     region_name,
-                "Type":                          "box",
-                "CoordinateSpecificationMethod": "relative-to-body-size",
-                "MeshSize":                      0.032,
-                "XMin": 0.1, "XMax": 1.0,
-                "YMin": 0.0, "YMax": 0.1,
-                "ZMin": 0.1, "ZMax": 0.1,
-            })
+            task.Arguments.update(args)
             task.Execute()
             log.info(f"  Added wheel refinement box: {wheel_name}")
             return True
@@ -711,27 +770,15 @@ def _add_wheel_refinement(meshing, watertight, wheel_name: str,
             log.warning(f"  Wheel refinement {wheel_name!r} (legacy): {e}")
             return False
 
-    props = [
-        ("local_refinement_region_name",    region_name),
-        ("region_name",                     region_name),
-        ("type",                            "box"),
-        ("region_type",                     "box"),
-        ("coordinate_specification_method", "relative-to-body-size"),
-        ("mesh_size",                       0.032),
-        ("x_min", 0.1), ("x_max", 1.0),
-        ("y_min", 0.0), ("y_max", 0.1),
-        ("z_min", 0.1), ("z_max", 0.1),
-    ]
-    if sum(1 for p, v in props if _set_task_property(task, p, v)) == 0:
+    if not _apply_task_arguments(task, args):
+        log.warning(f"  Wheel refinement {wheel_name!r}: could not set arguments")
+        return False
+    if not _execute_task(task):
+        log.warning(f"  Wheel refinement {wheel_name!r}: execute failed")
         return False
 
-    try:
-        task()
-        log.info(f"  Added wheel refinement box: {wheel_name}")
-        return True
-    except Exception as e:
-        log.warning(f"  Wheel refinement {wheel_name!r} execute: {e}")
-        return False
+    log.info(f"  Added wheel refinement box: {wheel_name}")
+    return True
 
 
 # ---------------------------------------------------------------------------
