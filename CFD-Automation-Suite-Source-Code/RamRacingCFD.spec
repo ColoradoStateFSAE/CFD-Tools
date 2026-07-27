@@ -1,228 +1,183 @@
-# RamRacingCFD.spec — Rocky Linux 8.10 build
-# Python 3.12 / PyQt6 / PyFluent 0.38 / Ansys 2025 R2 (v252)
-#
-# Build:
-#   source .venv/bin/activate
-#   rm -rf build dist
-#   pyinstaller RamRacingCFD.spec
-#   chmod +x dist/RamRacingCFD/RamRacingCFD
-#
-# Run:
-#   export AWP_ROOT252=/home/xeongold/ansys_inc/v252
-#   ./dist/RamRacingCFD/RamRacingCFD
+name: Nightly Development Build
 
-import sys
-import os
-from pathlib import Path
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
 
-block_cipher = None
+permissions:
+  contents: write
 
-# ── Collect ansys packages (includes all data files like cfg.yaml) ────────────
-ansys_fc_d, ansys_fc_b, ansys_fc_h = collect_all("ansys.fluent.core")
-ansys_u_d,  ansys_u_b,  ansys_u_h  = collect_all("ansys.units")
-ansys_a_d,  ansys_a_b,  ansys_a_h  = collect_all("ansys.api.fluent")
-ansys_p_d,  ansys_p_b,  ansys_p_h  = collect_all("ansys.platform")
-ansys_t_d,  ansys_t_b,  ansys_t_h  = collect_all("ansys.tools.common")
+jobs:
+  # =========================================================================
+  # JOB 1: Build the self-contained app with PyInstaller, then package
+  # =========================================================================
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
 
-# Package metadata — needed by packages that call importlib.metadata.version()
-# at import time (ansys.platform.instancemanagement does this)
-from PyInstaller.utils.hooks import copy_metadata
-meta_datas = []
-for pkg in [
-    "ansys-platform-instancemanagement",
-    "ansys-fluent-core",
-    "ansys-units",
-    "ansys-api-fluent",
-    "ansys-tools-filetransfer",
-    "ansys-tools-common",
-    "PyQt6",
-    "PyQt6-Qt6",
-    "PyQt6-sip",
-    "grpcio",
-    "numpy",
-    "pandas",
-]:
-    try:
-        meta_datas += copy_metadata(pkg)
-    except Exception:
-        pass  # package not installed — skip
+    defaults:
+      run:
+        working-directory: CFD-Automation-Suite-Source-Code
 
-grpc_h  = collect_submodules("grpc")
-proto_h = collect_submodules("google.protobuf")
-nltk_h  = collect_submodules("nltk")
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
 
-all_datas = (
-    meta_datas
-    + ansys_fc_d + ansys_u_d + ansys_a_d + ansys_p_d + ansys_t_d + [
-        ("utils/Wheel_MRF_Setup_Guide.pdf", "utils"),
-        ("assets/logo.png",                 "assets"),
-    ]
-)
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
 
-all_binaries = ansys_fc_b + ansys_u_b + ansys_a_b + ansys_p_b + ansys_t_b
+      # ── Install all Python dependencies ──────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 --only-binary=:all:
+          pip install ansys-fluent-core
+          pip install pyinstaller
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-# ── Rocky 8 specific: bundle xcb platform plugin ─────────────────────────────
-# Rocky 8 ships an older libxcb — the one bundled with PyQt6 may not load
-# against the system xcb. We force-include the Qt xcb plugin from the venv
-# and also bundle libatomic which Rocky 8 sometimes can't find.
-try:
-    import subprocess
-    qt_plugin_path = subprocess.check_output(
-        [sys.executable, "-c",
-         "from PyQt6.QtCore import QLibraryInfo; "
-         "print(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))"],
-        text=True
-    ).strip()
+      # ── Verify critical imports work ─────────────────────────────────
+      - name: Verify imports
+        run: |
+          python -c "import PyQt6.QtWidgets; print('PyQt6 OK')"
+          python -c "import ansys.fluent.core; print('PyFluent OK')"
+          python -c "from simtypes.configs import HalfCarConfig; print('Configs OK')"
+          python -c "from core.runner import run_meshing; print('Runner OK')"
 
-    # Platform plugin
-    xcb = os.path.join(qt_plugin_path, "platforms", "libqxcb.so")
-    if os.path.exists(xcb):
-        all_binaries.append((xcb, "PyQt6/Qt6/plugins/platforms"))
-        print(f"spec: bundled {xcb}")
+      # ── Build with PyInstaller ───────────────────────────────────────
+      # This creates dist/RamRacingCFD/ containing the self-contained
+      # executable + all bundled dependencies. No Python install needed
+      # on the target machine.
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --clean RamRacingCFD.spec 2>&1 | Tee-Object -FilePath build.log
 
-    # Wayland plugin (fallback if xcb unavailable)
-    wayland = os.path.join(qt_plugin_path, "platforms", "libqwayland-generic.so")
-    if os.path.exists(wayland):
-        all_binaries.append((wayland, "PyQt6/Qt6/plugins/platforms"))
+          # Verify the exe was actually created and has real content
+          if (!(Test-Path "dist\RamRacingCFD\RamRacingCFD.exe")) {
+            Write-Error "BUILD FAILED — RamRacingCFD.exe not found"
+            Get-Content build.log | Select-Object -Last 50
+            exit 1
+          }
 
-    # xcb integration plugin
-    xcb_qpa_dir = os.path.join(qt_plugin_path, "xcbglintegrations")
-    if os.path.isdir(xcb_qpa_dir):
-        for f in os.listdir(xcb_qpa_dir):
-            all_binaries.append(
-                (os.path.join(xcb_qpa_dir, f), "PyQt6/Qt6/plugins/xcbglintegrations")
-            )
+          $size = (Get-Item "dist\RamRacingCFD\RamRacingCFD.exe").Length / 1MB
+          if ($size -lt 1) {
+            Write-Error "BUILD FAILED — exe is only $([math]::Round($size, 2)) MB (expected >10 MB)"
+            exit 1
+          }
 
-    # Qt image format plugins
-    img_dir = os.path.join(qt_plugin_path, "imageformats")
-    if os.path.isdir(img_dir):
-        for f in os.listdir(img_dir):
-            if f.endswith(".so") and "pdf" not in f:  # skip libqpdf (needs libatomic)
-                all_binaries.append(
-                    (os.path.join(img_dir, f), "PyQt6/Qt6/plugins/imageformats")
-                )
-except Exception as e:
-    print(f"spec WARNING: Qt plugin collection failed: {e}")
+          Write-Output "Build successful:"
+          Get-ChildItem dist\RamRacingCFD\ | Measure-Object -Property Length -Sum | ForEach-Object {
+            Write-Output "  $($_.Count) files, $([math]::Round($_.Sum / 1MB, 1)) MB total"
+          }
 
-# libatomic — required by Qt PDF plugin, not always present on Rocky 8
-for lib_path in [
-    "/usr/lib64/libatomic.so.1",
-    "/lib64/libatomic.so.1",
-    "/usr/lib/libatomic.so.1",
-]:
-    if os.path.exists(lib_path):
-        all_binaries.append((lib_path, "."))
-        print(f"spec: bundled {lib_path}")
-        break
+      # ── Create portable zip (no installer needed) ───────────────────
+      - name: Create portable zip
+        shell: powershell
+        run: |
+          $date = Get-Date -Format "yyyyMMdd"
+          $sha = (git rev-parse --short HEAD).Trim()
+          $zipName = "RamRacingCFD-$date-$sha-portable.zip"
+          Compress-Archive -Path dist\RamRacingCFD\* -DestinationPath "..\$zipName"
+          Write-Output "Created $zipName ($([math]::Round((Get-Item ..\$zipName).Length / 1MB, 1)) MB)"
 
-all_hidden = (
-    ansys_fc_h + ansys_u_h + ansys_a_h + ansys_p_h + ansys_t_h
-    + grpc_h + proto_h + nltk_h
-    + [
-        # PyQt6
-        "PyQt6.QtCore",
-        "PyQt6.QtGui",
-        "PyQt6.QtWidgets",
-        "PyQt6.QtPrintSupport",
-        "PyQt6.sip",
-        # ansys internals that collect_all can miss
-        "ansys.fluent.core.generated",
-        "ansys.fluent.core.generated.solver",
-        "ansys.fluent.core.generated.solver.settings_builtin",
-        "ansys.fluent.core.generated.datamodel_252",
-        "ansys.fluent.core.solver.settings_builtin_bases",
-        "ansys.fluent.core.solver.flobject",
-        "ansys.fluent.core.variable_strategies",
-        "ansys.fluent.core.variable_strategies.expr",
-        "ansys.units.variable_descriptor",
-        "ansys.units.quantity",
-        "ansys.units.systems",
-        "ansys.units._constants",
-        # grpc
-        "grpc._cython.cygrpc",
-        "grpc._channel",
-        "grpc._interceptor",
-        "grpc.experimental",
-        # protobuf
-        "google.protobuf.descriptor",
-        "google.protobuf.descriptor_pool",
-        "google.protobuf.reflection",
-        "google.protobuf.symbol_database",
-        # our modules
-        "simtypes.configs",
-        "core.runner",
-        "core.queue_manager",
-        "gui.app",
-        "gui.theme",
-        "gui.sim_editor",
-        "gui.wheel_editor",
-        "gui.settings_dialog",
-        "utils.results_exporter",
-        "utils.resource_path",
-        # misc
-        "lxml",
-        "lxml.etree",
-        "PIL",
-        "PIL.Image",
-    ]
-)
+      # ── Create NSIS installer (optional — wraps the PyInstaller bundle) ──
+      - name: Install NSIS
+        uses: negrutiu/nsis-install@v2
 
-a = Analysis(
-    ["main.py"],
-    pathex=[str(Path(".").resolve())],
-    binaries=all_binaries,
-    datas=all_datas,
-    hiddenimports=all_hidden,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[
-        "tkinter",
-        "matplotlib",
-        "IPython",
-        "notebook",
-        "jupyter",
-        "sphinx",
-        "pytest",
-        # scipy pulls in a lot on Rocky 8 — exclude unless needed
-        # "scipy",
-    ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
-    noarchive=False,
-)
+      - name: Build NSIS installer
+        shell: powershell
+        run: |
+          # Only build NSIS installer if the .nsi file exists
+          if (Test-Path "installer.nsi") {
+            makensis installer.nsi
+            $date = Get-Date -Format "yyyyMMdd"
+            $sha = (git rev-parse --short HEAD).Trim()
+            # Find the generated exe and rename it
+            Get-ChildItem -Filter *.exe -Exclude RamRacingCFD.exe | Select-Object -First 1 | ForEach-Object {
+              Move-Item $_.FullName "..\RamRacingCFD-$date-$sha-setup.exe" -Force
+              Write-Output "Installer: RamRacingCFD-$date-$sha-setup.exe"
+            }
+          } else {
+            Write-Output "No installer.nsi found — skipping NSIS build"
+          }
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+      # ── Stage all artifacts ──────────────────────────────────────────
+      - name: Stage distribution files
+        shell: powershell
+        run: |
+          mkdir -Force ..\dist-staged
+          # Move zip
+          Get-ChildItem ..\ -Filter "RamRacingCFD-*-portable.zip" | Move-Item -Destination ..\dist-staged\
+          # Move installer exe (if it exists)
+          Get-ChildItem ..\ -Filter "RamRacingCFD-*-setup.exe" | Move-Item -Destination ..\dist-staged\
+          # List what we're uploading
+          Write-Output "Distribution files:"
+          Get-ChildItem ..\dist-staged\
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="RamRacingCFD",
-    icon=None,
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=True,
-    upx=False,
-    upx_exclude=["*"],   # exclude ALL files from UPX — belt and suspenders
-    console=False,
-    disable_windowed_traceback=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: dist-staged/*
+          retention-days: 30
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=True,
-    upx=False,
-    upx_exclude=["*"],   # exclude ALL files from UPX
-    name="RamRacingCFD",
-)
+  # =========================================================================
+  # JOB 2: Publish Release
+  # =========================================================================
+  publish-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build-windows]
 
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Generate build metadata
+        id: metadata
+        run: |
+          echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-build
+          path: dist-assets
+
+      - name: List distribution assets
+        run: ls -lh dist-assets/
+
+      # Delete old release so there's only ever one nightly
+      - name: Delete existing nightly release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete nightly-latest --yes --cleanup-tag || true
+
+      - name: Wait for deletion to propagate
+        run: sleep 5
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-latest
+          name: "Nightly Development Build"
+          body: |
+            ### Nightly Development Build
+
+            **Portable zip** — unzip anywhere and run `RamRacingCFD.exe`. No Python install required.
+            Requires Ansys Fluent 2026 R1 installed separately.
+
+            * **Build Date:** ${{ steps.metadata.outputs.BUILD_DATE }}
+            * **Commit:** ${{ steps.metadata.outputs.COMMIT_SHA }}
+
+            ---
+            These builds are from `main` and may contain bugs or incomplete features.
+          prerelease: true
+          files: |
+            dist-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
