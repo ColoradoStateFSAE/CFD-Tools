@@ -29,19 +29,38 @@ from utils.resource_path import resource_path
 #  Logging bridge
 # =============================================================================
 
-class LogBridge(QObject, logging.Handler):
-    """Forwards log records to the GUI thread as a Qt signal."""
+class _LogEmitter(QObject):
+    """Carries the Qt signal. Kept separate from the logging handler so Qt
+    never owns the handler object itself."""
     record = pyqtSignal(str, str)      # level name, formatted message
 
+
+class LogBridge(logging.Handler):
+    """
+    Forwards log records to the GUI thread.
+
+    Simulations run on a worker thread, so records must cross to the GUI
+    thread before touching a widget. A Qt signal does that; the emitter is a
+    separate object so that Qt destroying it cannot leave logging holding a
+    dead handler at interpreter shutdown.
+    """
+
     def __init__(self):
-        QObject.__init__(self)
-        logging.Handler.__init__(self)
+        super().__init__()
+        self.emitter = _LogEmitter()
         self.setFormatter(logging.Formatter(
             "%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
 
+    @property
+    def record(self):
+        return self.emitter.record
+
     def emit(self, record):
         try:
-            self.record.emit(record.levelname, self.format(record))
+            self.emitter.record.emit(record.levelname, self.format(record))
+        except RuntimeError:
+            # The window has gone; drop the record rather than raise.
+            pass
         except Exception:
             pass
 

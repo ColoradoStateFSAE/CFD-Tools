@@ -9,7 +9,7 @@ import os
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QGroupBox, QLabel, QSpinBox,
     QCheckBox, QComboBox, QDialogButtonBox, QLineEdit, QHBoxLayout,
-    QPushButton, QFileDialog,
+    QPushButton, QFileDialog, QWidget,
 )
 from PyQt6.QtCore import Qt, QSettings
 
@@ -56,16 +56,16 @@ class SettingsDialog(QDialog):
 
         self.e_output = QLineEdit()
         self.e_output.setPlaceholderText("Starting folder for new simulations")
-        browse_row = QHBoxLayout()
+        output_row = QWidget()
+        browse_row = QHBoxLayout(output_row)
         browse_row.setContentsMargins(0, 0, 0, 0)
+        browse_row.setSpacing(6)
         browse_row.addWidget(self.e_output, 1)
         browse = QPushButton("Browse…")
         browse.setFixedWidth(84)
         browse.clicked.connect(self._pick_output)
         browse_row.addWidget(browse)
-        wrapper = QLabel()
-        wrapper.setLayout(browse_row)
-        form.addRow("Output folder:", wrapper)
+        form.addRow("Output folder:", output_row)
 
         layout.addWidget(defaults)
 
