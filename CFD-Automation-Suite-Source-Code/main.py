@@ -29,6 +29,32 @@ def fail(title: str, message: str) -> None:
     sys.exit(1)
 
 
+def quiet_pyfluent_noise() -> None:
+    """
+    Suppress PyFluent's event subscription warnings.
+
+    PyFluent tries to subscribe to attribute-change events on every task it
+    touches and logs a warning when the server declines. It declines for most
+    of them, so a normal run produces dozens of these:
+
+        Failed to subscribe event: {'eventrequest': [...]}!
+
+    They are informational and never affect the mesh, but they bury the
+    progress messages. Errors from the same logger still come through.
+    """
+    import logging
+
+    class _DropSubscribeWarnings(logging.Filter):
+        def filter(self, record):
+            return "Failed to subscribe event" not in record.getMessage()
+
+    for name in ("pyfluent.datamodel", "pyfluent.networking",
+                 "pyfluent.general"):
+        logger = logging.getLogger(name)
+        logger.addFilter(_DropSubscribeWarnings())
+        logger.setLevel(logging.INFO)
+
+
 def check_dependencies() -> None:
     missing = []
     try:
@@ -68,6 +94,7 @@ def check_ansys() -> None:
 def main() -> None:
     print(f"{APP_NAME} {APP_VERSION}")
     check_dependencies()
+    quiet_pyfluent_noise()
 
     import simtypes
     print(f"Types:  {', '.join(name for _, name in simtypes.names())}")
