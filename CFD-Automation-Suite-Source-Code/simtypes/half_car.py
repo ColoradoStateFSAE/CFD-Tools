@@ -138,6 +138,7 @@ class Settings:
     # ── Fluent session ───────────────────────────────────────────────────
     processes:        int  = 40
     double_precision: bool = True
+    mpi_type: string = "intel"
 
     # ── Mesh sizing [m] ──────────────────────────────────────────────────
     surface_min: float = 0.002
@@ -226,7 +227,6 @@ def mesh(s: Settings, log, progress=None) -> str:
         precision="double" if s.double_precision else "single",
         product_version="26.1",
         cleanup_on_exit=True,
-        mpi_type="intel",
     )
 
     try:
