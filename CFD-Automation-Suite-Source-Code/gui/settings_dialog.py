@@ -48,6 +48,14 @@ class SettingsDialog(QDialog):
         hint.setObjectName("muted")
         form.addRow("", hint)
 
+        self.combo_mpi = QComboBox()
+        self.combo_mpi.addItems(["intel", "openmpi", "msmpi", "default"])
+        form.addRow("MPI type:", self.combo_mpi)
+
+        mpi_hint = QLabel("intel for Xeon Gold · openmpi for ThreadRipper")
+        mpi_hint.setObjectName("muted")
+        form.addRow("", mpi_hint)
+
         self.cb_double = QCheckBox("Double precision")
         form.addRow("", self.cb_double)
 
@@ -139,6 +147,7 @@ class SettingsDialog(QDialog):
             int(self.store.value("processes", 40)))
         self.cb_double.setChecked(
             self.store.value("double_precision", True, type=bool))
+        self.combo_mpi.setCurrentText(self.store.value("mpi_type", "intel"))
         self.cb_ensight.setChecked(
             self.store.value("export_ensight", True, type=bool))
         self.e_output.setText(self.store.value("output_dir", ""))
@@ -147,6 +156,7 @@ class SettingsDialog(QDialog):
     def _save(self) -> None:
         self.store.setValue("processes", self.sb_processes.value())
         self.store.setValue("double_precision", self.cb_double.isChecked())
+        self.store.setValue("mpi_type", self.combo_mpi.currentText())
         self.store.setValue("export_ensight", self.cb_ensight.isChecked())
         self.store.setValue("output_dir", self.e_output.text().strip())
         self.store.setValue("log_level", self.combo_log.currentText())
@@ -160,6 +170,7 @@ class SettingsDialog(QDialog):
     def _restore(self) -> None:
         self.sb_processes.setValue(40)
         self.cb_double.setChecked(True)
+        self.combo_mpi.setCurrentText("intel")
         self.cb_ensight.setChecked(True)
         self.e_output.clear()
         self.combo_log.setCurrentText("INFO")
@@ -174,6 +185,8 @@ def apply_defaults(settings) -> None:
     settings.processes = int(store.value("processes", settings.processes))
     settings.double_precision = store.value(
         "double_precision", settings.double_precision, type=bool)
+    if hasattr(settings, "mpi_type"):
+        settings.mpi_type = store.value("mpi_type", settings.mpi_type)
     settings.export_ensight = store.value(
         "export_ensight", settings.export_ensight, type=bool)
     output = store.value("output_dir", "")
