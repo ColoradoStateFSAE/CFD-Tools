@@ -159,6 +159,9 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._setup_logging()
 
+        # Set the initial button states rather than leaving them all enabled
+        self._refresh_queue()
+
         # Keep elapsed times ticking while a job runs
         timer = QTimer(self)
         timer.timeout.connect(self._tick)
@@ -273,6 +276,35 @@ class MainWindow(QMainWindow):
         order.addWidget(down)
         layout.addLayout(order)
 
+        # Queue control. Adding a simulation does not start it; nothing runs
+        # until Start Queue is pressed.
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(divider)
+
+        control = QHBoxLayout()
+        self.btn_start = QPushButton("▶  Start Queue")
+        self.btn_start.setObjectName("accent")
+        self.btn_start.setToolTip(
+            "Begin running queued simulations, oldest first")
+        self.btn_start.clicked.connect(self._start_queue)
+        control.addWidget(self.btn_start)
+
+        self.btn_pause = QPushButton("⏸  Pause")
+        self.btn_pause.setToolTip(
+            "Stop picking up new simulations.\n"
+            "The one running now continues; use Kill to stop that too.")
+        self.btn_pause.clicked.connect(self._pause_queue)
+        control.addWidget(self.btn_pause)
+
+        self.btn_kill = QPushButton("■  Kill")
+        self.btn_kill.setObjectName("danger")
+        self.btn_kill.setToolTip(
+            "Force the running simulation to stop and shut Fluent down")
+        self.btn_kill.clicked.connect(self._kill_running)
+        control.addWidget(self.btn_kill)
+        layout.addLayout(control)
+
         return pane
 
     def _detail_pane(self) -> QWidget:
@@ -374,7 +406,9 @@ class MainWindow(QMainWindow):
         if editor.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            self.queue.add(sim_type, settings)
+            self.queue.add(sim_type, settings)      # queued, not started
+            self.statusBar().showMessage(
+                "Queued. Press Start Queue to run it.", 6000)
         except ValueError as exc:
             QMessageBox.warning(self, "Cannot queue", str(exc))
 
@@ -394,6 +428,48 @@ class MainWindow(QMainWindow):
         editor = SimEditor(job.sim_type, job.settings, self)
         if editor.exec() == QDialog.DialogCode.Accepted:
             self._refresh_queue()
+
+    def _start_queue(self) -> None:
+        if self.queue.pending_count == 0 and self.queue.current is None:
+            QMessageBox.information(
+                self, "Nothing queued",
+                "Add a simulation before starting the queue.")
+            return
+        self.queue.start()
+        self.statusBar().showMessage("Queue started", 4000)
+        self._refresh_queue()
+
+    def _pause_queue(self) -> None:
+        self.queue.pause()
+        running = self.queue.current
+        message = ("Queue paused. "
+                   + (f"{running.name} will finish first."
+                      if running else "No simulation is running."))
+        self.statusBar().showMessage(message, 6000)
+        self._refresh_queue()
+
+    def _kill_running(self) -> None:
+        job = self.queue.current
+        if job is None:
+            QMessageBox.information(self, "Nothing running",
+                                    "No simulation is running.")
+            return
+
+        answer = QMessageBox.question(
+            self, "Stop simulation",
+            f"Stop “{job.name}” now?\n\n"
+            "Fluent will be shut down and the work so far is lost. "
+            "Any case files already written are kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        if self.queue.kill(job.job_id):
+            self.statusBar().showMessage(
+                f"Stopping {job.name}; Fluent may take a few seconds "
+                f"to close", 8000)
+        self._refresh_queue()
 
     def _cancel_selected(self) -> None:
         job = self._selected_job()
@@ -473,6 +549,13 @@ class MainWindow(QMainWindow):
         self.lbl_queue_count.setText(
             f"{len(jobs)} total · {pending} pending"
             + (f" · {running} running" if running else ""))
+
+        worker_live = self.queue.running
+        self.btn_start.setEnabled(not worker_live and pending > 0)
+        self.btn_pause.setEnabled(worker_live)
+        self.btn_kill.setEnabled(running > 0)
+        self.btn_start.setText(
+            "▶  Start Queue" if not worker_live else "▶  Running…")
 
         self._show_detail()
 
@@ -567,19 +650,24 @@ class MainWindow(QMainWindow):
     # ── Close ────────────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
-        running = [j for j in self.queue.jobs()
-                   if j.state is JobState.RUNNING]
-        if running:
+        job = self.queue.current
+        if job is not None:
             answer = QMessageBox.question(
                 self, "Simulation running",
-                f"{running[0].name} is still running.\n\n"
-                "Closing will not stop Fluent. Quit anyway?",
+                f"“{job.name}” is still running.\n\n"
+                "Yes  — stop it and quit\n"
+                "No   — leave it running and quit anyway\n"
+                "Cancel — stay open",
                 QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+
+            if answer == QMessageBox.StandardButton.Cancel:
                 event.ignore()
                 return
+            if answer == QMessageBox.StandardButton.Yes:
+                self.queue.kill(job.job_id)
         self.queue.stop()
 
         # Detach the log handler before Qt destroys it. Without this,
