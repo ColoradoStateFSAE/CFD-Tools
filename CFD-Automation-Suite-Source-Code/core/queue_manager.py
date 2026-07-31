@@ -25,6 +25,79 @@ class JobState(Enum):
     CANCELLED = "Cancelled"
 
 
+class SimulationKilled(Exception):
+    """Raised inside a simulation when the user kills it."""
+
+
+class RunControl:
+    """
+    Lets a running simulation be stopped.
+
+    A simulation spends most of its time blocked inside a Fluent call, so a
+    flag alone cannot interrupt it. Killing therefore does two things:
+
+      1. sets the flag, which the simulation checks at every progress step
+      2. forces the Fluent sessions down, so whatever call is in flight
+         fails immediately rather than running to completion
+
+    Simulation types register each session as they launch it and call
+    check() at every step; both are one line each.
+    """
+
+    def __init__(self):
+        self._killed = threading.Event()
+        self._sessions = []
+        self._lock = threading.Lock()
+
+    # ── Used by the simulation ───────────────────────────────────────────
+
+    def register(self, session) -> None:
+        """Register a Fluent session so it can be forced down."""
+        with self._lock:
+            self._sessions.append(session)
+
+    def release(self, session) -> None:
+        """Forget a session that has exited normally."""
+        with self._lock:
+            if session in self._sessions:
+                self._sessions.remove(session)
+
+    def check(self) -> None:
+        """Raise if a kill has been requested. Call between steps."""
+        if self._killed.is_set():
+            raise SimulationKilled("Stopped by user")
+
+    @property
+    def killed(self) -> bool:
+        return self._killed.is_set()
+
+    # ── Used by the queue ────────────────────────────────────────────────
+
+    def kill(self) -> int:
+        """
+        Request a stop and force every registered session down.
+        Returns how many sessions were signalled.
+        """
+        self._killed.set()
+        with self._lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+
+        for session in sessions:
+            # force_exit is the hard stop; exit() is the graceful one and is
+            # tried second in case this build lacks force_exit.
+            for method in ("force_exit", "exit"):
+                closer = getattr(session, method, None)
+                if closer is None:
+                    continue
+                try:
+                    closer()
+                    break
+                except Exception as exc:
+                    log.debug(f"  {method}(): {exc}")
+        return len(sessions)
+
+
 @dataclass
 class Job:
     """One queued simulation."""
@@ -38,6 +111,7 @@ class Job:
     results:    dict = field(default_factory=dict)
     started_at:  Optional[float] = None
     finished_at: Optional[float] = None
+    control:     RunControl = field(default_factory=RunControl)
 
     @property
     def name(self) -> str:
@@ -79,8 +153,13 @@ class SimQueue:
 
     # ── Queue contents ───────────────────────────────────────────────────
 
-    def add(self, sim_type, settings) -> Job:
-        """Validate and queue a simulation. Raises ValueError if unusable."""
+    def add(self, sim_type, settings, start_now: bool = False) -> Job:
+        """
+        Validate and queue a simulation.
+
+        Queuing does not start it. Call start() when you are ready, or pass
+        start_now=True. Raises ValueError if the settings are unusable.
+        """
         problems = settings.validate()
         if problems:
             raise ValueError("\n".join(problems))
@@ -93,8 +172,27 @@ class SimQueue:
         self._queue.put(job)
         log.info(f"Queued [{job.job_id}] {job.name} ({job.type_name})")
         self._changed()
-        self.start()
+
+        if start_now:
+            self.start()
         return job
+
+    def kill(self, job_id: int) -> bool:
+        """
+        Stop a running simulation.
+
+        Forces its Fluent sessions down, so the call it is blocked in fails
+        and the simulation unwinds. Fluent may take a few seconds to close.
+        """
+        job = self.get(job_id)
+        if job is None or job.state is not JobState.RUNNING:
+            return False
+
+        log.warning(f"Killing [{job.job_id}] {job.name}")
+        count = job.control.kill()
+        log.warning(f"  Signalled {count} Fluent session(s); "
+                    f"the job will stop shortly")
+        return True
 
     def jobs(self) -> list:
         with self._lock:
@@ -167,8 +265,28 @@ class SimQueue:
         log.info("Queue worker started")
 
     def stop(self) -> None:
-        """Ask the worker to finish after the current job."""
+        """Ask the worker to finish the current job, then stop."""
         self._stop.set()
+
+    def pause(self) -> None:
+        """
+        Stop picking up new jobs. The current job runs to completion; use
+        kill() to stop that as well.
+        """
+        self._stop.set()
+        log.info("Queue paused; it will stop after the current job")
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return sum(1 for j in self._jobs if j.state is JobState.PENDING)
+
+    @property
+    def current(self) -> Optional[Job]:
+        """The job being run, if any."""
+        with self._lock:
+            return next((j for j in self._jobs
+                         if j.state is JobState.RUNNING), None)
 
     @property
     def running(self) -> bool:
@@ -203,14 +321,32 @@ class SimQueue:
                 self.on_progress(job)
 
         try:
-            job.results = job.sim_type.run(job.settings, log, progress)
+            job.results = job.sim_type.run(job.settings, log, progress,
+                                           job.control)
             job.state = JobState.COMPLETED
             job.progress = 100
             job.message = "Complete"
             log.info(f"Completed [{job.job_id}] {job.name} "
                      f"in {job.elapsed / 60:.1f} min")
 
+        except SimulationKilled:
+            job.state = JobState.CANCELLED
+            job.message = "Stopped by user"
+            log.warning(f"Stopped [{job.job_id}] {job.name} "
+                        f"after {job.elapsed / 60:.1f} min")
+
         except Exception as exc:
+            # A forced session shutdown surfaces as a connection error rather
+            # than SimulationKilled, so treat anything after a kill request
+            # as a stop rather than a failure.
+            if job.control.killed:
+                job.state = JobState.CANCELLED
+                job.message = "Stopped by user"
+                log.warning(f"Stopped [{job.job_id}] {job.name} "
+                            f"after {job.elapsed / 60:.1f} min")
+                job.finished_at = time.time()
+                self._changed()
+                return
             job.state = JobState.FAILED
             job.error = str(exc)
             job.message = f"Failed: {exc}"
