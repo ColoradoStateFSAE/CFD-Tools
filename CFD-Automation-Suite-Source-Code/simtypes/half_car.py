@@ -20,6 +20,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
+from utils.fluent_log import FluentLogCapture
 from utils.refinement import refinement_boxes, WHEEL_BOX_SIZE, WHEEL_BOX_RATIOS
 
 NAME = "Half Car"
@@ -27,6 +28,9 @@ KEY = "half_car"
 
 MPH_TO_MS = 0.44704
 AIR_DENSITY = 1.225          # kg/m^3
+
+# Passed to Fluent as -mpi=<type>. "default" omits the flag entirely.
+MPI_TYPES = ["intel", "openmpi", "msmpi", "default"]
 
 
 # =============================================================================
@@ -139,6 +143,10 @@ class Settings:
     processes:        int  = 40
     double_precision: bool = True
 
+    # MPI implementation. intel suits the Xeon Gold nodes; openmpi is the
+    # ThreadRipper default; use "default" to let Fluent choose.
+    mpi_type: str = "intel"
+
     # ── Mesh sizing [m] ──────────────────────────────────────────────────
     surface_min: float = 0.002
     surface_max: float = 0.256
@@ -195,6 +203,9 @@ class Settings:
             problems.append("Speed must be greater than zero")
         if self.processes < 1:
             problems.append("Process count must be at least 1")
+        if self.mpi_type not in MPI_TYPES:
+            problems.append(
+                f"MPI type must be one of {', '.join(MPI_TYPES)}")
         if self.surface_min >= self.surface_max:
             problems.append("Surface min size must be below max size")
         return problems
@@ -224,16 +235,25 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
     os.makedirs(s.output_dir, exist_ok=True)
     mesh_file = os.path.join(s.output_dir, "mesh.msh.h5")
 
-    step(0, "Launching Fluent Meshing")
-    session = pyfluent.launch_fluent(
+    step(0, f"Launching Fluent Meshing "
+            f"({s.processes} processes, {s.mpi_type} MPI)")
+    launch_args = dict(
         mode="meshing",
         processor_count=s.processes,
         precision="double" if s.double_precision else "single",
         product_version="26.1",
         cleanup_on_exit=True,
     )
+    if s.mpi_type and s.mpi_type != "default":
+        launch_args["additional_arguments"] = f"-mpi={s.mpi_type}"
+
+    session = pyfluent.launch_fluent(**launch_args)
     if control:
         control.register(session)
+
+    # Everything Fluent prints now appears in the application log.
+    transcript = FluentLogCapture(session, log,
+                                  output_dir=s.output_dir, tag="mesh").start()
 
     try:
         workflow = session.workflow
@@ -437,6 +457,7 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
         return mesh_file
 
     finally:
+        transcript.stop()
         if control:
             control.release(session)
         try:
@@ -467,16 +488,25 @@ def solve(s: Settings, mesh_file: str, log, progress=None,
         if progress:
             progress(msg, pct)
 
-    step(0, "Launching Fluent solver")
-    session = pyfluent.launch_fluent(
+    step(0, f"Launching Fluent solver "
+            f"({s.processes} processes, {s.mpi_type} MPI)")
+    launch_args = dict(
         mode="solver",
         processor_count=s.processes,
         precision="double" if s.double_precision else "single",
         product_version="26.1",
         cleanup_on_exit=True,
     )
+    if s.mpi_type and s.mpi_type != "default":
+        launch_args["additional_arguments"] = f"-mpi={s.mpi_type}"
+
+    session = pyfluent.launch_fluent(**launch_args)
     if control:
         control.register(session)
+
+    # Residuals and force monitors stream into the application log.
+    transcript = FluentLogCapture(session, log,
+                                  output_dir=s.output_dir, tag="solve").start()
 
     try:
         setup    = session.settings.setup
@@ -572,6 +602,7 @@ def solve(s: Settings, mesh_file: str, log, progress=None,
         return results
 
     finally:
+        transcript.stop()
         if control:
             control.release(session)
         try:
