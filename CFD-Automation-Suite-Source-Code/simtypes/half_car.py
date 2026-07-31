@@ -138,7 +138,7 @@ class Settings:
     # ── Fluent session ───────────────────────────────────────────────────
     processes:        int  = 40
     double_precision: bool = True
-    mpi_type: string = "intel"
+    mpi_type: str = "intel"
 
     # ── Mesh sizing [m] ──────────────────────────────────────────────────
     surface_min: float = 0.002
