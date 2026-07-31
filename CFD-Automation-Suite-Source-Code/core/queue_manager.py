@@ -1,290 +1,231 @@
 """
-Simulation queue manager.
-Runs simulations sequentially in a background thread,
-emitting callbacks for the GUI to consume.
+Simulation queue.
+
+Runs queued simulations one at a time on a background thread so the GUI stays
+responsive. Each job holds a simulation type module and its settings; the
+queue calls module.run(settings, log, progress) and records the result.
 """
-import threading
-import queue
 import logging
+import threading
+import time
 import traceback
-import json
-import os
-from datetime import datetime
-from typing import Callable, Optional, List
+from dataclasses import dataclass, field
 from enum import Enum
+from queue import Queue, Empty
+from typing import Callable, Optional
 
-log = logging.getLogger("sim_queue")
+log = logging.getLogger("queue")
 
 
-class JobStatus(Enum):
-    QUEUED = "Queued"
-    RUNNING = "Running"
-    DONE = "Done"
-    FAILED = "Failed"
+class JobState(Enum):
+    PENDING   = "Pending"
+    RUNNING   = "Running"
+    COMPLETED = "Completed"
+    FAILED    = "Failed"
     CANCELLED = "Cancelled"
 
 
-class SimJob:
-    _id_counter = 0
-
-    def __init__(self, config):
-        SimJob._id_counter += 1
-        self.job_id = SimJob._id_counter
-        self.config = config
-        self.status = JobStatus.QUEUED
-        self.progress_pct = 0
-        self.progress_msg = ""
-        self.results = {}
-        self.error = ""
-        self.queued_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.started_at = ""
-        self.finished_at = ""
+@dataclass
+class Job:
+    """One queued simulation."""
+    job_id:     int
+    sim_type:   object          # a module from simtypes
+    settings:   object          # that module's Settings instance
+    state:      JobState = JobState.PENDING
+    progress:   int = 0
+    message:    str = ""
+    error:      str = ""
+    results:    dict = field(default_factory=dict)
+    started_at:  Optional[float] = None
+    finished_at: Optional[float] = None
 
     @property
-    def display_name(self) -> str:
-        return f"[{self.job_id}] {self.config.name} ({self.config.sim_type.value})"
+    def name(self) -> str:
+        return self.settings.name
 
-    def to_dict(self) -> dict:
-        return {
-            "job_id": self.job_id,
-            "name": self.config.name,
-            "sim_type": self.config.sim_type.value,
-            "status": self.status.value,
-            "progress_pct": self.progress_pct,
-            "progress_msg": self.progress_msg,
-            "queued_at": self.queued_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "results": self.results,
-            "error": self.error,
-        }
+    @property
+    def type_name(self) -> str:
+        return self.sim_type.NAME
+
+    @property
+    def elapsed(self) -> float:
+        """Seconds spent running, live while in progress."""
+        if self.started_at is None:
+            return 0.0
+        end = self.finished_at if self.finished_at else time.time()
+        return end - self.started_at
 
 
-class SimulationQueue:
+class SimQueue:
     """
-    Thread-safe simulation queue.
-    One job runs at a time; others wait.
+    Thread-safe FIFO queue with a single worker.
 
-    Uses a threading.Event (_job_available) to signal the worker thread
-    when new jobs are added, eliminating the race condition where the
-    worker could exit between checking for a next job and a new job
-    being enqueued.
+    Callbacks fire on the worker thread. Qt callers should marshal to the GUI
+    thread with a signal.
     """
 
     def __init__(self,
-                 on_job_update: Optional[Callable] = None,
-                 on_queue_update: Optional[Callable] = None):
-        self._queue: List[SimJob] = []
+                 on_change: Optional[Callable] = None,
+                 on_progress: Optional[Callable] = None):
+        self._jobs: list = []
+        self._queue: Queue = Queue()
         self._lock = threading.Lock()
-        self._worker_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        # Signalled whenever a QUEUED job becomes available, or on shutdown.
-        self._job_available = threading.Event()
-        self._current_job: Optional[SimJob] = None
+        self._worker: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._next_id = 1
 
-        # Callbacks fired on the worker thread; GUI should use .after() etc.
-        self.on_job_update = on_job_update    # called(job) on any status change
-        self.on_queue_update = on_queue_update  # called() when queue list changes
+        self.on_change = on_change       # called when the job list changes
+        self.on_progress = on_progress   # called as a job reports progress
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # ── Queue contents ───────────────────────────────────────────────────
 
-    def add_job(self, config) -> SimJob:
-        job = SimJob(config)
+    def add(self, sim_type, settings) -> Job:
+        """Validate and queue a simulation. Raises ValueError if unusable."""
+        problems = settings.validate()
+        if problems:
+            raise ValueError("\n".join(problems))
+
         with self._lock:
-            self._queue.append(job)
-        self._fire_queue_update()
-        self._ensure_worker_running()
-        # Signal the worker thread that a job is available.
-        self._job_available.set()
-        log.info(f"Queued: {job.display_name}")
+            job = Job(self._next_id, sim_type, settings)
+            self._next_id += 1
+            self._jobs.append(job)
+
+        self._queue.put(job)
+        log.info(f"Queued [{job.job_id}] {job.name} ({job.type_name})")
+        self._changed()
+        self.start()
         return job
 
-    def cancel_job(self, job_id: int):
+    def jobs(self) -> list:
         with self._lock:
-            for job in self._queue:
-                if job.job_id == job_id and job.status == JobStatus.QUEUED:
-                    job.status = JobStatus.CANCELLED
-                    log.info(f"Cancelled: {job.display_name}")
-                    self._fire_queue_update()
-                    return
-        log.warning(f"Cannot cancel job {job_id} - not in QUEUED state.")
+            return list(self._jobs)
 
-    def move_up(self, job_id: int):
+    def get(self, job_id: int) -> Optional[Job]:
         with self._lock:
-            queued = [j for j in self._queue if j.status == JobStatus.QUEUED]
-            idx = next((i for i, j in enumerate(queued) if j.job_id == job_id), None)
-            if idx is not None and idx > 0:
-                pos_a = self._queue.index(queued[idx])
-                pos_b = self._queue.index(queued[idx - 1])
-                self._queue[pos_a], self._queue[pos_b] = (
-                    self._queue[pos_b], self._queue[pos_a]
-                )
-        self._fire_queue_update()
+            return next((j for j in self._jobs if j.job_id == job_id), None)
 
-    def move_down(self, job_id: int):
+    def cancel(self, job_id: int) -> bool:
+        """Cancel a pending job. A running job cannot be cancelled."""
+        job = self.get(job_id)
+        if job is None or job.state is not JobState.PENDING:
+            return False
+        job.state = JobState.CANCELLED
+        log.info(f"Cancelled [{job.job_id}] {job.name}")
+        self._changed()
+        return True
+
+    def remove(self, job_id: int) -> bool:
+        """Remove a job that is not running."""
         with self._lock:
-            queued = [j for j in self._queue if j.status == JobStatus.QUEUED]
-            idx = next((i for i, j in enumerate(queued) if j.job_id == job_id), None)
-            if idx is not None and idx < len(queued) - 1:
-                pos_a = self._queue.index(queued[idx])
-                pos_b = self._queue.index(queued[idx + 1])
-                self._queue[pos_a], self._queue[pos_b] = (
-                    self._queue[pos_b], self._queue[pos_a]
-                )
-        self._fire_queue_update()
+            job = next((j for j in self._jobs if j.job_id == job_id), None)
+            if job is None or job.state is JobState.RUNNING:
+                return False
+            self._jobs.remove(job)
+        self._changed()
+        return True
 
-    def get_jobs(self) -> List[SimJob]:
+    def move(self, job_id: int, offset: int) -> bool:
+        """Reorder a pending job. Only affects display order of pending work."""
         with self._lock:
-            return list(self._queue)
+            index = next((i for i, j in enumerate(self._jobs)
+                          if j.job_id == job_id), None)
+            if index is None:
+                return False
+            target = index + offset
+            if not 0 <= target < len(self._jobs):
+                return False
+            if self._jobs[index].state is not JobState.PENDING:
+                return False
+            if self._jobs[target].state is not JobState.PENDING:
+                return False
+            self._jobs[index], self._jobs[target] = \
+                self._jobs[target], self._jobs[index]
+        self._changed()
+        return True
 
-    def get_current_job(self) -> Optional[SimJob]:
-        return self._current_job
-
-    def shutdown(self):
-        self._stop_event.set()
-        # Wake the worker so it can see the stop event and exit cleanly.
-        self._job_available.set()
-
-    def save_log(self, path: str):
-        """Save queue history to JSON."""
+    def clear_finished(self) -> int:
+        """Drop completed, failed and cancelled jobs. Returns how many."""
         with self._lock:
-            data = [j.to_dict() for j in self._queue]
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-        log.info(f"Queue log saved to {path}")
+            before = len(self._jobs)
+            self._jobs = [j for j in self._jobs
+                          if j.state in (JobState.PENDING, JobState.RUNNING)]
+            removed = before - len(self._jobs)
+        if removed:
+            self._changed()
+        return removed
 
-    # ── Internal ────────────────────────────────────────────────────────────
+    # ── Worker ───────────────────────────────────────────────────────────
 
-    def _ensure_worker_running(self):
-        if self._worker_thread is None or not self._worker_thread.is_alive():
-            self._stop_event.clear()
-            self._worker_thread = threading.Thread(
-                target=self._worker_loop, daemon=True
-            )
-            self._worker_thread.start()
+    def start(self) -> None:
+        """Start the worker if it is not already running."""
+        if self._worker and self._worker.is_alive():
+            return
+        self._stop.clear()
+        self._worker = threading.Thread(target=self._work, daemon=True,
+                                        name="sim-queue")
+        self._worker.start()
+        log.info("Queue worker started")
 
-    def _worker_loop(self):
-        log.info("Queue worker started.")
-        while not self._stop_event.is_set():
-            job = self._next_queued_job()
-            if job is not None:
-                self._run_job(job)
+    def stop(self) -> None:
+        """Ask the worker to finish after the current job."""
+        self._stop.set()
+
+    @property
+    def running(self) -> bool:
+        return bool(self._worker and self._worker.is_alive())
+
+    def _work(self) -> None:
+        while not self._stop.is_set():
+            try:
+                job = self._queue.get(timeout=1.0)
+            except Empty:
                 continue
-            # No job available right now — wait for a signal before re-checking.
-            # This eliminates the race between "no job found" and "job just added".
-            self._job_available.clear()
-            # Re-check under the clear to avoid a missed wakeup:
-            # if add_job() set the event between our _next_queued_job() call
-            # and the clear() above, we'd block forever without this re-check.
-            job = self._next_queued_job()
-            if job is not None:
-                self._run_job(job)
+
+            if job.state is JobState.CANCELLED:
                 continue
-            self._job_available.wait()
-        log.info("Queue worker exited.")
 
-    def _next_queued_job(self) -> Optional[SimJob]:
-        with self._lock:
-            for job in self._queue:
-                if job.status == JobStatus.QUEUED:
-                    return job
-        return None
+            self._run(job)
 
-    def _preflight_journals(self, config, skip_mesh: bool = False) -> None:
-        """
-        Verify the journals this job needs exist and render cleanly.
+        log.info("Queue worker stopped")
 
-        Runs before Fluent is launched so a missing journal or an unknown
-        {{TOKEN}} fails in seconds rather than after a 90 minute mesh.
-        Raises with a message naming the file and the fix.
-        """
-        from core import journal_params, journal_runner
-        from utils.resource_path import journal_path
+    def _run(self, job: Job) -> None:
+        job.state = JobState.RUNNING
+        job.started_at = time.time()
+        job.progress = 0
+        self._changed()
 
-        key    = journal_params.sim_type_key(config.sim_type)
-        tokens = journal_params.build(config)
+        log.info(f"Starting [{job.job_id}] {job.name} ({job.type_name})")
 
-        stages = ["solve"] if skip_mesh else ["mesh", "solve"]
-        for stage in stages:
-            path = journal_path(key, stage,
-                                getattr(config, "journal_dir", ""))
-            if not os.path.isfile(path):
-                raise FileNotFoundError(
-                    f"No {stage} journal for {config.sim_type.value}.\n"
-                    f"Expected: {path}\n"
-                    f"Record it with:  python tools/record_journal.py "
-                    f"--sim-type {key} --stage {stage}"
-                )
-            # Render only — this catches unknown placeholders
-            journal_runner.render(
-                journal_runner.load(path), tokens, f"{key}/{stage}.py"
-            )
-
-        log.info(f"Journals OK: {', '.join(stages)} for {key}")
-
-    def _run_job(self, job: SimJob):
-        self._current_job = job
-        job.status = JobStatus.RUNNING
-        job.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._fire_job_update(job)
-        log.info(f"Starting: {job.display_name}")
-
-        def progress_cb(msg: str, pct: int):
-            job.progress_msg = msg
-            job.progress_pct = pct
-            self._fire_job_update(job)
+        def progress(message: str, percent: int) -> None:
+            job.progress = percent
+            job.message = message
+            if self.on_progress:
+                self.on_progress(job)
 
         try:
-            from core.runner import run_meshing, run_solver
-            os.makedirs(job.config.output_dir, exist_ok=True)
+            job.results = job.sim_type.run(job.settings, log, progress)
+            job.state = JobState.COMPLETED
+            job.progress = 100
+            job.message = "Complete"
+            log.info(f"Completed [{job.job_id}] {job.name} "
+                     f"in {job.elapsed / 60:.1f} min")
 
-            existing = getattr(job.config, "existing_mesh_path", "").strip()
+        except Exception as exc:
+            job.state = JobState.FAILED
+            job.error = str(exc)
+            job.message = f"Failed: {exc}"
+            log.error(f"Failed [{job.job_id}] {job.name}: {exc}")
+            log.debug(traceback.format_exc())
 
-            # Preflight: confirm the journals exist and render before Fluent
-            # is launched. Catching a typo'd placeholder here costs seconds;
-            # catching it mid-run costs the whole meshing pass.
-            self._preflight_journals(job.config, skip_mesh=bool(existing))
-
-            if existing:
-                if not os.path.exists(existing):
-                    raise FileNotFoundError(
-                        f"Existing mesh not found: {existing}"
-                    )
-                log.info(f"Skipping meshing — using existing mesh: {existing}")
-                mesh_file    = existing
-                mesh_quality = {}
-            else:
-                mesh_file, mesh_quality = run_meshing(
-                    job.config, progress_cb=progress_cb
-                )
-
-            results = run_solver(job.config, mesh_file,
-                                 progress_cb=progress_cb,
-                                 mesh_quality=mesh_quality)
-            job.results = results
-            job.status = JobStatus.DONE
-            log.info(f"Completed: {job.display_name}")
-        except Exception as e:
-            job.error = traceback.format_exc()
-            job.status = JobStatus.FAILED
-            log.error(f"Failed: {job.display_name}\n{job.error}")
         finally:
-            job.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            job.progress_pct = 100
-            self._current_job = None
-            self._fire_job_update(job)
-            self._fire_queue_update()
+            job.finished_at = time.time()
+            self._changed()
 
-    def _fire_job_update(self, job: SimJob):
-        if self.on_job_update:
-            try:
-                self.on_job_update(job)
-            except Exception:
-                pass
+    # ── Internal ─────────────────────────────────────────────────────────
 
-    def _fire_queue_update(self):
-        if self.on_queue_update:
+    def _changed(self) -> None:
+        if self.on_change:
             try:
-                self.on_queue_update()
-            except Exception:
-                pass
+                self.on_change()
+            except Exception as exc:
+                log.debug(f"on_change callback: {exc}")

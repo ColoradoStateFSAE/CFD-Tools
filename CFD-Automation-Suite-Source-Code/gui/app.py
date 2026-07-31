@@ -1,687 +1,574 @@
 """
-Ram Racing CFD Automation Tool — Main Window (PyQt6).
+Main window.
+
+Left: the simulation queue. Right: details of the selected job.
+Bottom: the log. Everything the simulations write with the logging module
+appears there live.
 """
-import os
-import sys
 import logging
+import os
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
-    QLabel, QPushButton, QFrame, QTreeWidget, QTreeWidgetItem,
-    QTabWidget, QPlainTextEdit, QProgressBar, QStatusBar,
-    QFileDialog, QMessageBox, QHeaderView, QAbstractItemView,
-    QGroupBox, QFormLayout, QSizePolicy, QScrollArea
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel,
+    QPushButton, QListWidget, QListWidgetItem, QPlainTextEdit, QFrame,
+    QProgressBar, QFormLayout, QMessageBox, QFileDialog, QComboBox,
+    QDialog, QDialogButtonBox, QGroupBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSize
-from PyQt6.QtGui import QFont, QColor, QAction, QIcon
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt6.QtGui import QAction, QColor, QFont
 
-from core.queue_manager import SimulationQueue, JobStatus
-from simtypes.configs import SimType, SIM_TYPE_REGISTRY
-from gui.theme import STATUS_COLORS, ACCENT, GREEN, RED, YELLOW, TEXT, ACCENT2
+import simtypes
+from core.queue_manager import SimQueue, JobState
+from gui.sim_editor import SimEditor
+from gui.theme import STATE_COLOURS, TEXT_MUTED, ACCENT, OK, ERROR
+from utils.resource_path import resource_path
 
 
-# ── Logging → QPlainTextEdit ──────────────────────────────────────────────────
+# =============================================================================
+#  Logging bridge
+# =============================================================================
 
-class _QtLogHandler(logging.Handler, QObject):
-    new_record = pyqtSignal(str)
+class LogBridge(QObject, logging.Handler):
+    """Forwards log records to the GUI thread as a Qt signal."""
+    record = pyqtSignal(str, str)      # level name, formatted message
 
     def __init__(self):
-        logging.Handler.__init__(self)
         QObject.__init__(self)
+        logging.Handler.__init__(self)
         self.setFormatter(logging.Formatter(
-            "%(asctime)s  [%(levelname)s]  %(name)s — %(message)s",
-            datefmt="%H:%M:%S"
-        ))
+            "%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
 
     def emit(self, record):
-        self.new_record.emit(self.format(record))
+        try:
+            self.record.emit(record.levelname, self.format(record))
+        except Exception:
+            pass
 
 
-# ── Sim-type chooser dialog ───────────────────────────────────────────────────
+LEVEL_COLOURS = {
+    "DEBUG":    TEXT_MUTED,
+    "INFO":     "#abb2bf",
+    "WARNING":  "#e5c07b",
+    "ERROR":    ERROR,
+    "CRITICAL": ERROR,
+}
 
-class SimTypeChooserDialog(QWidget):
-    """Popup that lets the user pick a sim type, then opens the editor."""
 
-    def __init__(self, parent):
-        from PyQt6.QtWidgets import (
-            QDialog, QVBoxLayout, QHBoxLayout, QRadioButton,
-            QButtonGroup, QDialogButtonBox, QLabel, QFrame
-        )
-        self._dialog = QDialog(parent)
-        self._dialog.setWindowTitle("Choose Simulation Type")
-        self._dialog.setMinimumWidth(460)
-        self._dialog.setModal(True)
+# =============================================================================
+#  New simulation dialog
+# =============================================================================
 
-        root = QVBoxLayout(self._dialog)
-        root.setSpacing(12)
-        root.setContentsMargins(24, 20, 24, 20)
+class NewSimDialog(QDialog):
+    """Pick a simulation type before opening the editor."""
 
-        title = QLabel("Select simulation type")
-        title.setObjectName("subheading")
-        root.addWidget(title)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Simulation")
+        self.setMinimumWidth(420)
 
-        descriptions = {
-            SimType.HALF_CAR:
-                "Symmetry plane at Z=0 — 2 wheels. Forces doubled automatically.",
-            SimType.FULL_CAR:
-                "Full 4-wheel simulation — no symmetry.",
-            SimType.FRONT_WING_ONLY:
-                "Isolated front wing element study.",
-            SimType.REAR_WING_ONLY:
-                "Isolated rear wing element study.",
-            SimType.QUARTER_MODEL:
-                "Quarter model — two symmetry planes.",
-            SimType.TURNING:
-                "Full car at yaw — asymmetric wheel RPMs, yaw moment & lateral force output.",
-        }
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(10)
 
-        self._group = QButtonGroup(self._dialog)
-        self._type_map = {}
+        heading = QLabel("New Simulation")
+        heading.setObjectName("heading")
+        layout.addWidget(heading)
 
-        for sim_type, desc in descriptions.items():
-            card = QFrame()
-            card.setStyleSheet(
-                "QFrame { background: #282c34; border: 1px solid #3e4451;"
-                " border-radius: 6px; padding: 4px; }"
-                "QFrame:hover { border-color: #00b4a0; }"
-                "QRadioButton { background: transparent; border: none; }"
-                "QLabel { background: transparent; border: none; }"
-            )
-            card_l = QVBoxLayout(card)
-            card_l.setContentsMargins(10, 8, 10, 8)
-            card_l.setSpacing(2)
+        note = QLabel("Each type is a self-contained setup with its own "
+                      "meshing sequence, solver settings and reports.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
 
-            rb = QRadioButton(sim_type.value)
-            rb.setStyleSheet("font-weight: bold; font-size: 10pt;")
-            if sim_type == SimType.HALF_CAR:
-                rb.setChecked(True)
-            self._group.addButton(rb)
-            self._type_map[rb] = sim_type
-            card_l.addWidget(rb)
+        form = QFormLayout()
+        self.combo = QComboBox()
+        for key, name in simtypes.names():
+            self.combo.addItem(name, key)
+        self.combo.currentIndexChanged.connect(self._describe)
+        form.addRow("Type:", self.combo)
+        layout.addLayout(form)
 
-            desc_lbl = QLabel(desc)
-            desc_lbl.setObjectName("muted")
-            desc_lbl.setContentsMargins(22, 0, 0, 0)
-            card_l.addWidget(desc_lbl)
+        self.description = QLabel("")
+        self.description.setObjectName("muted")
+        self.description.setWordWrap(True)
+        self.description.setMinimumHeight(60)
+        self.description.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(self.description)
 
-            root.addWidget(card)
-
-        btns = QDialogButtonBox(
+        buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Continue →")
-        btns.button(QDialogButtonBox.StandardButton.Ok).setObjectName("accent")
-        btns.accepted.connect(self._dialog.accept)
-        btns.rejected.connect(self._dialog.reject)
-        root.addWidget(btns)
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
-        self.chosen_type = None
+        self._describe()
 
-    def exec(self):
-        from PyQt6.QtWidgets import QDialog
-        if self._dialog.exec() == QDialog.DialogCode.Accepted:
-            for btn, sim_type in self._type_map.items():
-                if btn.isChecked():
-                    self.chosen_type = sim_type
-                    return True
-        return False
+    def _describe(self) -> None:
+        module = simtypes.get(self.combo.currentData())
+        doc = (module.__doc__ or "").strip().splitlines()
+        summary = " ".join(line.strip() for line in doc[2:6] if line.strip())
+        self.description.setText(summary)
+
+    def selected(self):
+        return simtypes.get(self.combo.currentData())
 
 
-# ── Main window ───────────────────────────────────────────────────────────────
+# =============================================================================
+#  Main window
+# =============================================================================
 
-class RamRacingCFDWindow(QMainWindow):
-    # Signals fired from background thread → UI thread
-    _job_update_signal  = pyqtSignal(object)
-    _queue_update_signal = pyqtSignal()
+class MainWindow(QMainWindow):
+
+    job_changed = pyqtSignal()
+    job_progress = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Ram Racing | CFD Automation Tool")
-        self.resize(1380, 860)
-        self.setMinimumSize(960, 620)
+        self.setWindowTitle("Ram Racing CFD Automation Suite")
+        self.resize(1240, 800)
 
-        self._job_map: dict = {}   # job_id → QTreeWidgetItem
-
-        # Queue
-        self.sim_queue = SimulationQueue(
-            on_job_update=self._job_update_signal.emit,
-            on_queue_update=self._queue_update_signal.emit,
+        self.queue = SimQueue(
+            on_change=self.job_changed.emit,
+            on_progress=lambda job: self.job_progress.emit(job.job_id),
         )
-        self._job_update_signal.connect(self._on_job_update)
-        self._queue_update_signal.connect(self._on_queue_update)
+        self.job_changed.connect(self._refresh_queue)
+        self.job_progress.connect(lambda _: self._refresh_queue())
 
         self._build_menu()
         self._build_ui()
         self._setup_logging()
 
-        # Status bar clock
-        self._clock = QTimer(self)
-        self._clock.timeout.connect(self._tick_clock)
-        self._clock.start(1000)
+        # Keep elapsed times ticking while a job runs
+        timer = QTimer(self)
+        timer.timeout.connect(self._tick)
+        timer.start(1000)
 
-        logging.info("Ram Racing CFD Automation Tool started.")
+        logging.getLogger().info("Ram Racing CFD Automation Suite ready")
 
-    # ── Menu ─────────────────────────────────────────────────────────────────
+    # ── Construction ─────────────────────────────────────────────────────
 
-    def _build_menu(self):
-        mb = self.menuBar()
+    def _build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
 
-        file_menu = mb.addMenu("&File")
-        settings_act = QAction("Car Settings…", self)
-        settings_act.setShortcut("Ctrl+,")
-        settings_act.setToolTip("Set wheelbase, CoP geometry constants, reference area")
-        settings_act.triggered.connect(self._open_car_settings)
-        file_menu.addAction(settings_act)
-        file_menu.addSeparator()
-        save_log = QAction("Save Queue Log…", self)
+        new_action = QAction("&New Simulation…", self)
+        new_action.setShortcut("Ctrl+N")
+        new_action.triggered.connect(self._new_simulation)
+        file_menu.addAction(new_action)
+
+        save_log = QAction("Save &Log…", self)
         save_log.setShortcut("Ctrl+S")
         save_log.triggered.connect(self._save_log)
         file_menu.addAction(save_log)
+
         file_menu.addSeparator()
-        quit_act = QAction("Exit", self)
-        quit_act.setShortcut("Ctrl+Q")
-        quit_act.triggered.connect(self.close)
-        file_menu.addAction(quit_act)
+        quit_action = QAction("&Quit", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
 
-        help_menu = mb.addMenu("&Help")
-        about_act = QAction("About", self)
-        about_act.triggered.connect(self._show_about)
-        help_menu.addAction(about_act)
+        settings_action = QAction("&Settings…", self)
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(self._open_settings)
+        file_menu.addAction(settings_action)
+        file_menu.addSeparator()
 
-    # ── Central UI ────────────────────────────────────────────────────────────
+        queue_menu = self.menuBar().addMenu("&Queue")
+        clear = QAction("Clear &Finished", self)
+        clear.triggered.connect(self._clear_finished)
+        queue_menu.addAction(clear)
 
-    def _build_ui(self):
+        help_menu = self.menuBar().addMenu("&Help")
+        about = QAction("&About", self)
+        about.triggered.connect(self._about)
+        help_menu.addAction(about)
+
+    def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Header bar ──
-        header = QFrame()
-        header.setFixedHeight(56)
-        header.setStyleSheet(
-            "QFrame { background-color: #282c34;"
-            " border-bottom: 2px solid #00b4a0; }"
-        )
-        h_layout = QHBoxLayout(header)
-        h_layout.setContentsMargins(20, 0, 20, 0)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        root.addWidget(splitter, 1)
 
-        from utils.resource_path import resource_path
-        icon_path = resource_path(os.path.join("assets", "logo.png"))
+        # ── Top: queue and detail ────────────────────────────────────────
+        top = QSplitter(Qt.Orientation.Horizontal)
+        top.addWidget(self._queue_pane())
+        top.addWidget(self._detail_pane())
+        top.setStretchFactor(0, 3)
+        top.setStretchFactor(1, 4)
+        splitter.addWidget(top)
 
-        logo = QLabel("Ram Racing  |  CFD Automation")
-        logo.setStyleSheet(
-            "font-size: 15pt; font-weight: bold; color: #00b4a0;"
-            " background: transparent;"
-        )
-        h_layout.addWidget(logo)
-        h_layout.addStretch()
-
-        sub = QLabel("Fluent 2025R2  •  PyFluent 0.38  •  PyQt6")
-        sub.setStyleSheet("color: #abb2bf; background: transparent; font-size: 9pt;")
-        h_layout.addWidget(sub)
-        root.addWidget(header)
-
-        # ── Main splitter ──
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(1)
-        root.addWidget(splitter)
-
-        # Left pane — queue
-        left = QWidget()
-        left.setMinimumWidth(580)
-        left_v = QVBoxLayout(left)
-        left_v.setContentsMargins(10, 10, 6, 10)
-        left_v.setSpacing(8)
-        self._build_queue_pane(left_v)
-        splitter.addWidget(left)
-
-        # Right pane — detail + log
-        right = QWidget()
-        right.setMinimumWidth(340)
-        right_v = QVBoxLayout(right)
-        right_v.setContentsMargins(6, 10, 10, 10)
-        right_v.setSpacing(0)
-        self._build_detail_pane(right_v)
-        splitter.addWidget(right)
-
+        # ── Bottom: log ──────────────────────────────────────────────────
+        splitter.addWidget(self._log_pane())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
 
-        # ── Status bar ──
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self._clock_label = QLabel("--:--:--")
-        self._clock_label.setStyleSheet("color: #abb2bf; padding-right: 8px;")
-        self.status_bar.addPermanentWidget(self._clock_label)
-        self.status_bar.showMessage("Ready")
+        self.statusBar().showMessage("Ready")
 
-    # ── Queue pane ────────────────────────────────────────────────────────────
+    def _queue_pane(self) -> QWidget:
+        pane = QWidget()
+        layout = QVBoxLayout(pane)
+        layout.setContentsMargins(14, 12, 8, 12)
+        layout.setSpacing(9)
 
-    def _build_queue_pane(self, layout):
-        # Toolbar
-        toolbar = QHBoxLayout()
-        title = QLabel("Simulation Queue")
-        title.setObjectName("subheading")
-        toolbar.addWidget(title)
-        toolbar.addStretch()
+        header = QHBoxLayout()
+        title = QLabel("Queue")
+        title.setObjectName("heading")
+        header.addWidget(title)
+        header.addStretch()
+        self.lbl_queue_count = QLabel("")
+        self.lbl_queue_count.setObjectName("muted")
+        header.addWidget(self.lbl_queue_count)
+        layout.addLayout(header)
 
-        self.btn_add = QPushButton("＋  Add Simulation")
-        self.btn_add.setObjectName("accent")
-        self.btn_add.setFixedHeight(32)
-        self.btn_add.clicked.connect(self._add_simulation)
-        toolbar.addWidget(self.btn_add)
+        self.list = QListWidget()
+        self.list.currentItemChanged.connect(lambda *_: self._show_detail())
+        layout.addWidget(self.list, 1)
 
-        for label, slot, danger in [
-            ("▲", self._move_up, False),
-            ("▼", self._move_down, False),
-            ("✎  Edit", self._edit_job, False),
-            ("✕  Cancel", self._cancel_job, True),
-        ]:
-            btn = QPushButton(label)
-            btn.setFixedHeight(32)
-            if danger:
-                btn.setObjectName("danger")
-            btn.clicked.connect(slot)
-            toolbar.addWidget(btn)
+        buttons = QHBoxLayout()
+        add = QPushButton("＋  Add Simulation")
+        add.setObjectName("accent")
+        add.clicked.connect(self._new_simulation)
+        buttons.addWidget(add)
 
-        layout.addLayout(toolbar)
+        self.btn_edit = QPushButton("Edit")
+        self.btn_edit.clicked.connect(self._edit_selected)
+        buttons.addWidget(self.btn_edit)
 
-        # Queue tree
-        cols = ["#", "Name", "Type", "Status", "Progress", "Queued At"]
-        self.queue_tree = QTreeWidget()
-        self.queue_tree.setHeaderLabels(cols)
-        self.queue_tree.setRootIsDecorated(False)
-        self.queue_tree.setAlternatingRowColors(True)
-        self.queue_tree.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.queue_tree.setUniformRowHeights(True)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setObjectName("danger")
+        self.btn_cancel.clicked.connect(self._cancel_selected)
+        buttons.addWidget(self.btn_cancel)
+        layout.addLayout(buttons)
 
-        hdr = self.queue_tree.header()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        order = QHBoxLayout()
+        up = QPushButton("▲  Move Up")
+        up.clicked.connect(lambda: self._move(-1))
+        order.addWidget(up)
+        down = QPushButton("▼  Move Down")
+        down.clicked.connect(lambda: self._move(1))
+        order.addWidget(down)
+        layout.addLayout(order)
 
-        self.queue_tree.itemSelectionChanged.connect(self._on_tree_select)
-        self.queue_tree.itemDoubleClicked.connect(lambda: self._edit_job())
-        layout.addWidget(self.queue_tree)
+        return pane
 
-    # ── Detail pane ───────────────────────────────────────────────────────────
+    def _detail_pane(self) -> QWidget:
+        pane = QWidget()
+        layout = QVBoxLayout(pane)
+        layout.setContentsMargins(8, 12, 14, 12)
+        layout.setSpacing(9)
 
-    def _build_detail_pane(self, layout):
-        self.detail_tabs = QTabWidget()
-        layout.addWidget(self.detail_tabs)
+        title = QLabel("Details")
+        title.setObjectName("heading")
+        layout.addWidget(title)
 
-        # Tab 1 — Job Detail
-        detail_page = QScrollArea()
-        detail_page.setWidgetResizable(True)
-        detail_page.setFrameShape(QFrame.Shape.NoFrame)
-        inner = QWidget()
-        detail_page.setWidget(inner)
-        detail_v = QVBoxLayout(inner)
-        detail_v.setContentsMargins(14, 14, 14, 14)
-        detail_v.setSpacing(12)
-        self.detail_tabs.addTab(detail_page, "  Job Detail  ")
-        self._build_detail_fields(detail_v)
+        self.detail_box = QGroupBox("")
+        form = QFormLayout(self.detail_box)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setSpacing(7)
 
-        # Tab 2 — Log
-        log_page = QWidget()
-        log_v = QVBoxLayout(log_page)
-        log_v.setContentsMargins(0, 0, 0, 0)
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(4000)
-        log_v.addWidget(self.log_view)
-        self.detail_tabs.addTab(log_page, "  Log  ")
+        self.d_type    = QLabel("—")
+        self.d_state   = QLabel("—")
+        self.d_speed   = QLabel("—")
+        self.d_iters   = QLabel("—")
+        self.d_elapsed = QLabel("—")
+        self.d_output  = QLabel("—")
+        self.d_output.setWordWrap(True)
+        for widget in (self.d_type, self.d_state, self.d_speed,
+                       self.d_iters, self.d_elapsed):
+            widget.setObjectName("value")
 
-    def _build_detail_fields(self, layout):
-        # Info group
-        info_group = QGroupBox("Selected Job")
-        info_form = QFormLayout(info_group)
-        info_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        info_form.setSpacing(6)
+        form.addRow("Type:",       self.d_type)
+        form.addRow("State:",      self.d_state)
+        form.addRow("Speed:",      self.d_speed)
+        form.addRow("Iterations:", self.d_iters)
+        form.addRow("Elapsed:",    self.d_elapsed)
+        form.addRow("Output:",     self.d_output)
+        layout.addWidget(self.detail_box)
 
-        self._detail_labels = {}
-        fields = [
-            ("job_id",      "Job ID"),
-            ("name",        "Name"),
-            ("sim_type",    "Type"),
-            ("status",      "Status"),
-            ("speed",       "Speed [mph]"),
-            ("procs",       "Processes"),
-            ("queued_at",   "Queued At"),
-            ("started_at",  "Started At"),
-            ("finished_at", "Finished At"),
-            ("geometry",    "Geometry File"),
-            ("output",      "Sim Output"),
-            ("results_dir", "Results Dir"),
-        ]
-        for key, label in fields:
-            val = QLabel("—")
-            val.setWordWrap(True)
-            if key == "status":
-                val.setObjectName("status_queued")
-            self._detail_labels[key] = val
-            info_form.addRow(label + ":", val)
-        layout.addWidget(info_group)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        layout.addWidget(self.progress)
 
-        # Progress group
-        prog_group = QGroupBox("Progress")
-        prog_v = QVBoxLayout(prog_group)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(10)
-        prog_v.addWidget(self.progress_bar)
-        self.progress_msg = QLabel("")
-        self.progress_msg.setObjectName("muted")
-        prog_v.addWidget(self.progress_msg)
-        layout.addWidget(prog_group)
+        self.d_message = QLabel("")
+        self.d_message.setObjectName("muted")
+        self.d_message.setWordWrap(True)
+        layout.addWidget(self.d_message)
 
-        # Results group
-        res_group = QGroupBox("Results")
-        res_v = QVBoxLayout(res_group)
-        self.results_display = QPlainTextEdit()
-        self.results_display.setReadOnly(True)
-        self.results_display.setFixedHeight(180)
-        font = QFont("Consolas", 9)
-        self.results_display.setFont(font)
-        res_v.addWidget(self.results_display)
-        layout.addWidget(res_group)
+        self.results_box = QGroupBox("Results")
+        self.results_form = QFormLayout(self.results_box)
+        self.results_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.results_box.setVisible(False)
+        layout.addWidget(self.results_box)
 
         layout.addStretch()
+        return pane
 
-    # ── Actions ───────────────────────────────────────────────────────────────
+    def _log_pane(self) -> QWidget:
+        pane = QWidget()
+        layout = QVBoxLayout(pane)
+        layout.setContentsMargins(14, 8, 14, 12)
+        layout.setSpacing(7)
 
-    def _add_simulation(self):
-        chooser = SimTypeChooserDialog(self)
-        if not chooser.exec():
+        header = QHBoxLayout()
+        title = QLabel("Log")
+        title.setObjectName("heading")
+        header.addWidget(title)
+        header.addStretch()
+        clear = QPushButton("Clear")
+        clear.setFixedWidth(72)
+        clear.clicked.connect(lambda: self.log.clear())
+        header.addWidget(clear)
+        layout.addLayout(header)
+
+        self.log = QPlainTextEdit()
+        self.log.setObjectName("log")
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(6000)
+        layout.addWidget(self.log, 1)
+        return pane
+
+    def _setup_logging(self) -> None:
+        self._log_bridge = LogBridge()
+        self._log_bridge.record.connect(self._append_log)
+        root = logging.getLogger()
+        root.setLevel(logging.INFO)
+        root.addHandler(self._log_bridge)
+
+    # ── Actions ──────────────────────────────────────────────────────────
+
+    def _new_simulation(self) -> None:
+        picker = NewSimDialog(self)
+        if picker.exec() != QDialog.DialogCode.Accepted:
             return
-        config_cls = SIM_TYPE_REGISTRY[chooser.chosen_type]
-        config = config_cls()
-        # Apply any user-saved global defaults (File → Car Settings)
-        try:
-            from gui.settings_dialog import apply_defaults_to_config
-            apply_defaults_to_config(config)
-        except Exception:
-            pass
-        self._open_editor(config, new=True)
+        sim_type = picker.selected()
+        settings = sim_type.Settings()
 
-    def _edit_job(self):
+        from gui.settings_dialog import apply_defaults
+        apply_defaults(settings)
+
+        editor = SimEditor(sim_type, settings, self, is_new=True)
+        if editor.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.queue.add(sim_type, settings)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot queue", str(exc))
+
+    def _open_settings(self) -> None:
+        from gui.settings_dialog import SettingsDialog
+        SettingsDialog(self).exec()
+
+    def _edit_selected(self) -> None:
         job = self._selected_job()
         if job is None:
             return
-        if job.status != JobStatus.QUEUED:
-            QMessageBox.information(
-                self, "Cannot Edit",
-                "Only queued jobs can be edited.\n"
-                f"This job is currently: {job.status.value}"
-            )
+        if job.state is JobState.RUNNING:
+            QMessageBox.information(self, "Running",
+                                    "This simulation is running and cannot "
+                                    "be edited.")
             return
-        self._open_editor(job.config, new=False, job=job)
+        editor = SimEditor(job.sim_type, job.settings, self)
+        if editor.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_queue()
 
-    def _open_editor(self, config, new=False, job=None):
-        from gui.sim_editor import SimEditorDialog
-        dlg = SimEditorDialog(self, config)
-        if dlg.exec() == SimEditorDialog.DialogCode.Accepted and dlg.accepted_ok:
-            if new:
-                self.sim_queue.add_job(dlg.config)
-            else:
-                job.config = dlg.config
-                self._refresh_queue_tree()
-
-    def _cancel_job(self):
+    def _cancel_selected(self) -> None:
         job = self._selected_job()
-        if job:
-            self.sim_queue.cancel_job(job.job_id)
+        if job is None:
+            return
+        if not self.queue.cancel(job.job_id):
+            QMessageBox.information(
+                self, "Cannot cancel",
+                "Only pending simulations can be cancelled.")
 
-    def _move_up(self):
+    def _move(self, offset: int) -> None:
         job = self._selected_job()
-        if job:
-            self.sim_queue.move_up(job.job_id)
+        if job is not None:
+            self.queue.move(job.job_id, offset)
 
-    def _move_down(self):
-        job = self._selected_job()
-        if job:
-            self.sim_queue.move_down(job.job_id)
+    def _clear_finished(self) -> None:
+        removed = self.queue.clear_finished()
+        self.statusBar().showMessage(f"Removed {removed} finished job(s)", 4000)
+
+    def _save_log(self) -> None:
+        default = f"cfd_log_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Log", default, "Text Files (*.txt);;All Files (*)")
+        if path:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self.log.toPlainText())
+            self.statusBar().showMessage(f"Log saved to {path}", 5000)
+
+    def _about(self) -> None:
+        types = "\n".join(f"    {name}" for _, name in simtypes.names())
+        QMessageBox.about(
+            self, "About",
+            "<b>Ram Racing CFD Automation Suite</b><br>"
+            "Colorado State University FSAE<br><br>"
+            "Automates Ansys Fluent meshing and solving.<br>"
+            "Each simulation type is one self-contained file "
+            "under simtypes/.<br><br>"
+            f"<pre>Available types:\n{types}</pre>")
+
+    # ── Refresh ──────────────────────────────────────────────────────────
 
     def _selected_job(self):
-        items = self.queue_tree.selectedItems()
-        if not items:
-            return None
-        job_id = int(items[0].text(0))
-        for job in self.sim_queue.get_jobs():
-            if job.job_id == job_id:
-                return job
-        return None
-
-    def _open_car_settings(self):
-        from gui.settings_dialog import CarSettingsDialog
-        CarSettingsDialog(self).exec()
-
-    def _save_log(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Queue Log", "",
-            "JSON (*.json);;All Files (*)"
-        )
-        if path:
-            self.sim_queue.save_log(path)
-            self.status_bar.showMessage(f"Log saved → {path}", 4000)
-
-    def _show_about(self):
-        QMessageBox.about(
-            self,
-            "About",
-            "<b>Ram Racing CFD Automation Tool</b><br>"
-            "Aerodynamic Subteam<br><br>"
-            "Built on PyFluent (Ansys Fluent 2025R2 / v252)<br>"
-            "GUI: PyQt6<br><br>"
-            "Based on Ram Racing Fluent Procedure documentation."
-        )
-
-    # ── Queue / job update callbacks (fire from worker → GUI thread) ──────────
-
-    def _on_job_update(self, job):
-        self._upsert_tree_item(job)
-        sel = self._selected_job()
-        if sel and sel.job_id == job.job_id:
-            self._populate_detail(job)
-        self.status_bar.showMessage(
-            f"[{job.job_id}] {job.config.name}  →  {job.status.value}"
-            + (f"  {job.progress_pct}%" if job.status == JobStatus.RUNNING else ""),
-            0 if job.status == JobStatus.RUNNING else 5000
-        )
-
-    def _on_queue_update(self):
-        self._refresh_queue_tree()
-
-    def _refresh_queue_tree(self):
-        sel_id = None
-        sel = self._selected_job()
-        if sel:
-            sel_id = sel.job_id
-
-        self.queue_tree.clear()
-        self._job_map.clear()
-
-        for job in self.sim_queue.get_jobs():
-            self._upsert_tree_item(job)
-
-        if sel_id:
-            for i in range(self.queue_tree.topLevelItemCount()):
-                item = self.queue_tree.topLevelItem(i)
-                if item and int(item.text(0)) == sel_id:
-                    self.queue_tree.setCurrentItem(item)
-                    break
-
-    def _upsert_tree_item(self, job):
-        pct = f"{job.progress_pct}%" if job.status == JobStatus.RUNNING else ""
-        values = [
-            str(job.job_id),
-            job.config.name,
-            job.config.sim_type.value,
-            job.status.value,
-            pct,
-            job.queued_at,
-        ]
-        color_hex = STATUS_COLORS.get(job.status.value, TEXT)
-        color = QColor(color_hex)
-
-        item = self._job_map.get(job.job_id)
+        item = self.list.currentItem()
         if item is None:
-            item = QTreeWidgetItem(self.queue_tree, values)
-            self._job_map[job.job_id] = item
-        else:
-            for c, v in enumerate(values):
-                item.setText(c, v)
+            return None
+        return self.queue.get(item.data(Qt.ItemDataRole.UserRole))
 
-        for col in range(len(values)):
-            item.setForeground(col, color)
+    def _refresh_queue(self) -> None:
+        jobs = self.queue.jobs()
+        selected = self.list.currentItem()
+        selected_id = (selected.data(Qt.ItemDataRole.UserRole)
+                       if selected else None)
 
-        # Align center for all but name
-        for col in [0, 2, 3, 4, 5]:
-            item.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
+        self.list.blockSignals(True)
+        self.list.clear()
+        for job in jobs:
+            label = f"[{job.job_id}]  {job.name}"
+            if job.state is JobState.RUNNING:
+                label += f"     {job.progress}%"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, job.job_id)
+            item.setForeground(QColor(STATE_COLOURS.get(job.state.value,
+                                                        TEXT_MUTED)))
+            if job.state is JobState.RUNNING:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            item.setToolTip(f"{job.type_name}\n{job.state.value}\n"
+                            f"{job.message}")
+            self.list.addItem(item)
+            if job.job_id == selected_id:
+                self.list.setCurrentItem(item)
+        self.list.blockSignals(False)
 
-    def _on_tree_select(self):
+        running = sum(1 for j in jobs if j.state is JobState.RUNNING)
+        pending = sum(1 for j in jobs if j.state is JobState.PENDING)
+        self.lbl_queue_count.setText(
+            f"{len(jobs)} total · {pending} pending"
+            + (f" · {running} running" if running else ""))
+
+        self._show_detail()
+
+    def _show_detail(self) -> None:
         job = self._selected_job()
-        if job:
-            self._populate_detail(job)
+        if job is None:
+            self.detail_box.setTitle("")
+            for widget in (self.d_type, self.d_state, self.d_speed,
+                           self.d_iters, self.d_elapsed):
+                widget.setText("—")
+            self.d_output.setText("—")
+            self.d_message.setText("")
+            self.progress.setValue(0)
+            self.results_box.setVisible(False)
+            self.btn_edit.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+            return
 
-    def _populate_detail(self, job):
-        d = self._detail_labels
-        d["job_id"].setText(str(job.job_id))
-        d["name"].setText(job.config.name)
-        d["sim_type"].setText(job.config.sim_type.value)
-        d["status"].setText(job.status.value)
-        d["speed"].setText(f"{job.config.vehicle_speed_mph} mph")
-        d["procs"].setText(str(job.config.num_processes))
-        d["queued_at"].setText(job.queued_at)
-        d["started_at"].setText(job.started_at or "—")
-        d["finished_at"].setText(job.finished_at or "—")
-        d["geometry"].setText(os.path.basename(job.config.geometry_path) or "—")
-        d["output"].setText(job.config.output_dir or "—")
-        d["results_dir"].setText(job.config.results_dir or "—")
+        s = job.settings
+        self.detail_box.setTitle(job.name)
+        self.d_type.setText(job.type_name)
+        self.d_state.setText(job.state.value)
+        self.d_state.setStyleSheet(
+            f"color: {STATE_COLOURS.get(job.state.value, TEXT_MUTED)};")
+        self.d_speed.setText(f"{s.speed_mph:.0f} mph   "
+                             f"({s.speed_ms:.2f} m/s)")
+        total = s.ramp1_iters + s.ramp2_iters + s.ramp3_iters
+        self.d_iters.setText(
+            f"{total:,}   ({s.ramp1_iters} / {s.ramp2_iters} / "
+            f"{s.ramp3_iters})")
 
-        # Status label colour
-        status_obj = {
-            "Queued":    "status_queued",
-            "Running":   "status_running",
-            "Done":      "status_done",
-            "Failed":    "status_failed",
-            "Cancelled": "status_cancelled",
-        }.get(job.status.value, "")
-        d["status"].setObjectName(status_obj)
-        d["status"].style().unpolish(d["status"])
-        d["status"].style().polish(d["status"])
+        elapsed = job.elapsed
+        self.d_elapsed.setText(
+            f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s"
+            if elapsed else "—")
+        self.d_output.setText(s.output_dir or "—")
 
-        # Progress
-        self.progress_bar.setValue(job.progress_pct)
-        self.progress_msg.setText(job.progress_msg)
+        self.progress.setValue(job.progress)
+        self.d_message.setText(job.error or job.message)
+        self.d_message.setStyleSheet(
+            f"color: {ERROR};" if job.error else "")
 
-        # Results
-        self.results_display.clear()
-        mult = 2.0 if job.config.is_half_symmetry else 1.0
-        if job.status == JobStatus.DONE and job.results:
-            r = job.results
-            # Per-element values are raw (pre-multiplier); apply mult for display.
-            # Total fields (downforce_lbf, drag_lbf) are already doubled in runner.
-            fw  = r.get('downforce_fw_lbf', 0) * mult
-            rw  = r.get('downforce_rw_lbf', 0) * mult
-            ut  = r.get('downforce_ut_lbf', 0) * mult
-            # Use the pre-computed total so it always equals sum of parts.
-            total_df   = r.get('downforce_lbf',  fw + rw + ut)
-            total_drag = r.get('drag_lbf',        0)
-            aero_drag  = r.get('drag_aero_lbf',   0) * mult
-            lines = [
-                f"Front Wing Df  : {fw:>8.2f} lbf",
-                f"Rear Wing Df   : {rw:>8.2f} lbf",
-                f"Undertray Df   : {ut:>8.2f} lbf",
-                f"Total Df       : {total_df:>8.2f} lbf",
-                f"Total Drag     : {total_drag:>8.2f} lbf",
-                f"Aero Drag      : {aero_drag:>8.2f} lbf",
-                f"L/D Ratio      : {r.get('ld_ratio', 0):>8.3f}",
-            ]
+        self.btn_edit.setEnabled(job.state is not JobState.RUNNING)
+        self.btn_cancel.setEnabled(job.state is JobState.PENDING)
 
-            # Mesh quality summary
-            mq = r.get("mesh_quality", {})
-            if mq:
-                oq_min  = mq.get("oq_min",  0.0)
-                oq_mean = mq.get("oq_mean", 0.0)
-                oq_note = mq.get("oq_note", "N/A")
-                passed  = mq.get("oq_pass", False)
-                verdict = "✔ PASS" if passed else "✘ CHECK"
-                lines += [
-                    "",
-                    "── Mesh Quality ──────────────────",
-                    f"Verdict        : {verdict}",
-                    f"Min OQ         : {oq_min:>8.4f}",
-                    f"Mean OQ        : {oq_mean:>8.4f}",
-                    f"Note           : {oq_note}",
-                ]
+        self._show_results(job)
 
-            # Cornering results (Turning sim only)
-            from simtypes.configs import SimType
-            if job.config.sim_type == SimType.TURNING:
-                yaw_mom = r.get("yaw_moment_lbf_ft", 0.0)
-                lat_f   = r.get("lateral_force_lbf",  0.0)
-                yaw_deg = r.get("yaw_angle_deg_used",  0.0)
-                turn_r  = r.get("turn_radius_m",       0.0)
-                tendency = "oversteer" if yaw_mom > 0 else "understeer"
-                lines += [
-                    "",
-                    "── Cornering ─────────────────────",
-                    f"Turn Radius    : {turn_r:>7.2f} m",
-                    f"Yaw Angle      : {yaw_deg:>7.2f}°",
-                    f"Yaw Moment     : {yaw_mom:>7.1f} lbf·ft",
-                    f"Lateral Force  : {lat_f:>7.1f} lbf",
-                    f"Tendency       : {tendency}",
-                ]
+    def _show_results(self, job) -> None:
+        while self.results_form.rowCount():
+            self.results_form.removeRow(0)
 
-            if "note" in r:
-                lines += ["", r["note"]]
-            if "result_file" in r:
-                lines += ["", f"Results → {r['result_file']}"]
-            self.results_display.setPlainText("\n".join(lines))
-        elif job.status == JobStatus.FAILED:
-            self.results_display.setPlainText(
-                f"FAILED:\n{job.error[:800]}"
-            )
+        if job.state is not JobState.COMPLETED or not job.results:
+            self.results_box.setVisible(False)
+            return
 
-    # ── Logging ───────────────────────────────────────────────────────────────
+        r = job.results
+        rows = [
+            ("Downforce Fz", f"{r.get('fz', 0):.1f} N"),
+            ("Drag Fx",      f"{r.get('fx', 0):.1f} N"),
+            ("L/D",          f"{r.get('ld_ratio', 0):.2f}"),
+            ("SCz",          f"{r.get('SCz', 0):.4f} m²"),
+            ("SCx",          f"{r.get('SCx', 0):.4f} m²"),
+            ("CoP x",        f"{r.get('copx', 0):.4f} m"),
+            ("Balance",      f"{r.get('cop_pct', 0):.1f} % forward"),
+        ]
+        for label, value in rows:
+            widget = QLabel(value)
+            widget.setObjectName("value")
+            self.results_form.addRow(f"{label}:", widget)
 
-    def _setup_logging(self):
-        self._log_handler = _QtLogHandler()
-        self._log_handler.new_record.connect(self._append_log)
-        logging.getLogger().addHandler(self._log_handler)
-        logging.getLogger().setLevel(logging.DEBUG)
+        if r.get("result_file"):
+            link = QLabel(os.path.basename(r["result_file"]))
+            link.setObjectName("muted")
+            link.setToolTip(r["result_file"])
+            self.results_form.addRow("File:", link)
 
-    def _append_log(self, msg: str):
-        self.log_view.appendPlainText(msg)
-        self.log_view.verticalScrollBar().setValue(
-            self.log_view.verticalScrollBar().maximum()
-        )
+        self.results_box.setVisible(True)
 
-    # ── Misc ──────────────────────────────────────────────────────────────────
+    def _tick(self) -> None:
+        """Keep the elapsed time live for a running job."""
+        job = self._selected_job()
+        if job and job.state is JobState.RUNNING:
+            elapsed = job.elapsed
+            self.d_elapsed.setText(
+                f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s")
 
-    def _tick_clock(self):
-        self._clock_label.setText(datetime.now().strftime("%H:%M:%S"))
+    def _append_log(self, level: str, message: str) -> None:
+        colour = LEVEL_COLOURS.get(level, "#abb2bf")
+        self.log.appendHtml(
+            f'<span style="color:{colour};">{message}</span>')
 
-    def closeEvent(self, event):
-        reply = QMessageBox.question(
-            self, "Quit",
-            "Exit the CFD Automation Tool?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self.sim_queue.shutdown()
-            event.accept()
-        else:
-            event.ignore()
+    # ── Close ────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event) -> None:
+        running = [j for j in self.queue.jobs()
+                   if j.state is JobState.RUNNING]
+        if running:
+            answer = QMessageBox.question(
+                self, "Simulation running",
+                f"{running[0].name} is still running.\n\n"
+                "Closing will not stop Fluent. Quit anyway?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        self.queue.stop()
+
+        # Detach the log handler before Qt destroys it. Without this,
+        # logging's atexit shutdown reaches a deleted C++ object and
+        # prints a traceback after the window has closed.
+        handler = getattr(self, "_log_bridge", None)
+        if handler is not None:
+            logging.getLogger().removeHandler(handler)
+            self._log_bridge = None
+
+        event.accept()
