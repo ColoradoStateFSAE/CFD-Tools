@@ -138,7 +138,6 @@ class Settings:
     # ── Fluent session ───────────────────────────────────────────────────
     processes:        int  = 40
     double_precision: bool = True
-    mpi_type: str = "intel"
 
     # ── Mesh sizing [m] ──────────────────────────────────────────────────
     surface_min: float = 0.002
@@ -159,9 +158,9 @@ class Settings:
     wheel_axis: list = field(default_factory=lambda: [0.0, 0.0, 1.0])
 
     # ── Solver ramps ─────────────────────────────────────────────────────
-    ramp1_iters: int = 800      # first order
-    ramp2_iters: int = 1000      # second order, PRESTO pressure
-    ramp3_iters: int = 1500      # full send, curvature correction on
+    ramp1_iters: int = 200      # first order
+    ramp2_iters: int = 300      # second order, PRESTO pressure
+    ramp3_iters: int = 500      # full send, curvature correction on
 
     # ── Exports ──────────────────────────────────────────────────────────
     export_ensight: bool = True
@@ -205,14 +204,19 @@ class Settings:
 #  MESHING
 # =============================================================================
 
-def mesh(s: Settings, log, progress=None) -> str:
+def mesh(s: Settings, log, progress=None, control=None) -> str:
     """
     Run the Watertight Geometry workflow and write the mesh.
     Returns the mesh file path.
+
+    `control` lets the queue stop the run: step() checks it, and the session
+    is registered so it can be forced down mid-call.
     """
     import ansys.fluent.core as pyfluent
 
     def step(pct, msg):
+        if control:
+            control.check()
         log.info(f"[MESH {pct:3d}%] {msg}")
         if progress:
             progress(msg, pct)
@@ -228,6 +232,8 @@ def mesh(s: Settings, log, progress=None) -> str:
         product_version="26.1",
         cleanup_on_exit=True,
     )
+    if control:
+        control.register(session)
 
     try:
         workflow = session.workflow
@@ -431,6 +437,8 @@ def mesh(s: Settings, log, progress=None) -> str:
         return mesh_file
 
     finally:
+        if control:
+            control.release(session)
         try:
             session.exit()
         except Exception:
@@ -441,14 +449,20 @@ def mesh(s: Settings, log, progress=None) -> str:
 #  SOLVING
 # =============================================================================
 
-def solve(s: Settings, mesh_file: str, log, progress=None) -> dict:
+def solve(s: Settings, mesh_file: str, log, progress=None,
+          control=None) -> dict:
     """
     Set up physics, boundary conditions and reports, run the three ramps,
     export, and return the results.
+
+    `control` lets the queue stop the run: step() checks it, and the session
+    is registered so it can be forced down mid-iteration.
     """
     import ansys.fluent.core as pyfluent
 
     def step(pct, msg):
+        if control:
+            control.check()
         log.info(f"[SOLVE {pct:3d}%] {msg}")
         if progress:
             progress(msg, pct)
@@ -461,6 +475,8 @@ def solve(s: Settings, mesh_file: str, log, progress=None) -> dict:
         product_version="26.1",
         cleanup_on_exit=True,
     )
+    if control:
+        control.register(session)
 
     try:
         setup    = session.settings.setup
@@ -556,6 +572,8 @@ def solve(s: Settings, mesh_file: str, log, progress=None) -> dict:
         return results
 
     finally:
+        if control:
+            control.release(session)
         try:
             session.exit()
         except Exception:
@@ -839,11 +857,12 @@ def _export_ensight(session, s: Settings, log) -> None:
 #  ENTRY POINT
 # =============================================================================
 
-def run(s: Settings, log, progress=None) -> dict:
+def run(s: Settings, log, progress=None, control=None) -> dict:
     """
     Mesh if needed, then solve. Returns the results dictionary.
 
     Set `s.existing_mesh` to skip meshing and go straight to the solver.
+    `control` is supplied by the queue and allows the run to be stopped.
     """
     started = time.time()
 
@@ -853,9 +872,9 @@ def run(s: Settings, log, progress=None) -> dict:
         log.info(f"Using existing mesh: {s.existing_mesh}")
         mesh_file = s.existing_mesh
     else:
-        mesh_file = mesh(s, log, progress)
+        mesh_file = mesh(s, log, progress, control)
 
-    results = solve(s, mesh_file, log, progress)
+    results = solve(s, mesh_file, log, progress, control)
     results["runtime_s"] = time.time() - started
     log.info(f"Total runtime {results['runtime_s'] / 60:.1f} min")
     return results
