@@ -139,15 +139,23 @@ def compute_refinement_boxes(L: float, W: float, H: float,
 
 def wheel_mrf_spec(config, speed_ms: float) -> List[dict]:
     """
-    One dict per wheel MRF zone, ready to loop over inside a journal:
+    One dict per wheel, ready to loop over inside a journal:
 
-        {'name': 'FRW', 'zone': 'mrf_frw', 'origin': [x, y, z],
-         'axis': [0, 0, -1], 'radius': 0.203, 'omega': 88.09, 'rpm': 841.2}
+        {'name': 'FRW', 'zone': 'mrf_frw', 'labels': ['fw', 'fwb'],
+         'origin': [x, y, z], 'axis': [0, 0, -1], 'radius': 0.203,
+         'omega': 88.09, 'rpm': 841.2}
+
+    `labels` are the wall boundaries for that corner, so a journal can set
+    rotating-wall motion directly. `zone` is the MRF cell zone, for journals
+    that use a rotating reference frame instead.
 
     omega is rad/s, computed as v / r unless an rpm override is set on the
-    wheel. Turning simulations set different rpm per wheel, and that override
-    is respected here.
+    wheel. Turning simulations set different rpm per wheel; that override is
+    respected here.
     """
+    half_sym = bool(getattr(config, "is_half_symmetry", False))
+    corners  = wheel_labels(half_sym)
+
     spec = []
     for w in getattr(config, "wheel_mrf_zones", []) or []:
         radius = float(getattr(w, "wheel_radius", 0.203)) or 0.203
@@ -157,9 +165,24 @@ def wheel_mrf_spec(config, speed_ms: float) -> List[dict]:
         else:
             omega = speed_ms / radius
             rpm   = omega * 60.0 / (2.0 * 3.141592653589793)
+
+        # Front or rear from the wheel name: FLW/FRW -> front, RLW/RRW -> rear
+        axle = "front" if w.name.strip().lower().startswith("f") else "rear"
+
+        if half_sym:
+            labels = corners[axle]
+        else:
+            # Full car: match this specific corner, e.g. FLW -> flw + flwb
+            base = w.name.strip().lower()
+            labels = [l for l in corners[axle] if l.startswith(base)]
+            if not labels:
+                labels = corners[axle]
+
         spec.append({
             "name":   w.name,
             "zone":   w.zone_name,
+            "labels": labels,
+            "axle":   axle,
             "origin": [float(w.center_x), float(w.center_y), float(w.center_z)],
             "axis":   [float(w.axis_x),   float(w.axis_y),   float(w.axis_z)],
             "radius": radius,
@@ -221,7 +244,10 @@ def build(config, mesh_file: str = "") -> Dict[str, Any]:
         "CAR_LABELS":         car_surface_labels(half_sym),
         "VEHICLE_ZONES":      car_surface_labels(half_sym),
         "STUFF_LABELS":       BODY_LABELS + FRONT_SUS_LABELS + REAR_SUS_LABELS,
-        "BL_ZONES":           AERO_LABELS + all_wheel_labels(half_sym) + ["ground"],
+        # Doc Step 10 and both recordings: aero devices and the ground
+        # only. Wheels are deliberately excluded -- prisms on a rotating
+        # wall hurt more than they help here.
+        "BL_ZONES":           AERO_LABELS + ["ground"],
 
         # ── Mesh sizing ──────────────────────────────────────────────────
         "SURFACE_MIN":         float(config.surface_mesh_min),

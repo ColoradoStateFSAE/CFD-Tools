@@ -182,9 +182,13 @@ def run_mesh_journal(config, meshing, watertight, tokens,
     from core.journal_params import sim_type_key
     from utils.resource_path import journal_path
 
-    journal_file = journal_path(sim_type_key(config.sim_type), "mesh")
+    journal_file = journal_path(sim_type_key(config.sim_type), "mesh",
+                                getattr(config, "journal_dir", ""))
+    # `workflow` is what recorded journals use -- PyFluent writes meshing
+    # workflow calls in the classic TaskObject form, not the enhanced one.
     namespace = {
         "meshing":    meshing,
+        "workflow":   meshing.workflow,
         "watertight": watertight,
         "config":     config,
         "log":        log,
@@ -205,7 +209,8 @@ def run_solve_journal(config, solver, tokens,
     from core.journal_params import sim_type_key
     from utils.resource_path import journal_path
 
-    journal_file = journal_path(sim_type_key(config.sim_type), "solve")
+    journal_file = journal_path(sim_type_key(config.sim_type), "solve",
+                                getattr(config, "journal_dir", ""))
     namespace = {
         "solver": solver,
         "config": config,
