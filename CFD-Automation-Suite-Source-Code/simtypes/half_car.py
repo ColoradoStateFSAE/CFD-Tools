@@ -158,9 +158,9 @@ class Settings:
     wheel_axis: list = field(default_factory=lambda: [0.0, 0.0, 1.0])
 
     # ── Solver ramps ─────────────────────────────────────────────────────
-    ramp1_iters: int = 200      # first order
-    ramp2_iters: int = 300      # second order, PRESTO pressure
-    ramp3_iters: int = 500      # full send, curvature correction on
+    ramp1_iters: int = 800      # first order
+    ramp2_iters: int = 1000      # second order, PRESTO pressure
+    ramp3_iters: int = 1500      # full send, curvature correction on
 
     # ── Exports ──────────────────────────────────────────────────────────
     export_ensight: bool = True
@@ -226,6 +226,7 @@ def mesh(s: Settings, log, progress=None) -> str:
         precision="double" if s.double_precision else "single",
         product_version="26.1",
         cleanup_on_exit=True,
+        mpi_type="intel",
     )
 
     try:
