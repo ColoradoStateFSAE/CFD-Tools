@@ -12,7 +12,7 @@ import os
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QWidget,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton,
-    QFrame, QScrollArea, QFileDialog, QMessageBox, QGroupBox,
+    QFrame, QScrollArea, QFileDialog, QMessageBox, QGroupBox, QComboBox,
 )
 from PyQt6.QtCore import Qt
 
@@ -230,6 +230,17 @@ class SimEditor(QDialog):
         self._note(form,
                    "ThreadRipper 40–50 · Xeon Gold 60–70 · Big Boi 128–170")
 
+        self.combo_mpi = QComboBox()
+        try:
+            from simtypes.half_car import MPI_TYPES
+            self.combo_mpi.addItems(MPI_TYPES)
+        except Exception:
+            self.combo_mpi.addItems(["intel", "openmpi", "msmpi", "default"])
+        form.addRow("MPI type:", self.combo_mpi)
+        self._note(form,
+                   "intel for the Xeon Gold nodes · openmpi for ThreadRipper · "
+                   "default lets Fluent choose. Passed as -mpi=<type>.")
+
         self.cb_double = QCheckBox("Double precision")
         form.addRow("", self.cb_double)
 
@@ -377,6 +388,9 @@ class SimEditor(QDialog):
         self.sb_speed.setValue(s.speed_mph)
         self.sb_processes.setValue(s.processes)
         self.cb_double.setChecked(s.double_precision)
+        if hasattr(s, "mpi_type"):
+            index = self.combo_mpi.findText(s.mpi_type)
+            self.combo_mpi.setCurrentIndex(index if index >= 0 else 0)
 
         self.sb_length.setValue(s.car_length)
         self.sb_width.setValue(s.car_width)
@@ -413,6 +427,8 @@ class SimEditor(QDialog):
         s.speed_mph = self.sb_speed.value()
         s.processes = self.sb_processes.value()
         s.double_precision = self.cb_double.isChecked()
+        if hasattr(s, "mpi_type"):
+            s.mpi_type = self.combo_mpi.currentText()
 
         s.car_length = self.sb_length.value()
         s.car_width = self.sb_width.value()
