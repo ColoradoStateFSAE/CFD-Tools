@@ -90,7 +90,7 @@ ISOSURFACE_COLOR_FIELD = 'Velocity_Magnitude'
 
 IMG_SIZE = [3840, 2160]  # true 4K. PNG is lossless regardless of size, this just gives more pixels to work with
 FRONT_IMG_SIZE = IMG_SIZE  # back to horizontal, same resolution as the other views
-N_SWEEP_FRAMES = 30
+N_SWEEP_FRAMES = 120  # 5 seconds at 24fps
 SLICE_STEP = 0.05  # 50mm
 
 # ============================================================
@@ -100,7 +100,7 @@ SLICE_STEP = 0.05  # 50mm
 # ============================================================
 STITCH_MOVIES = True
 FFMPEG_PATH = "ffmpeg"  # set to a full path like r"C:\ffmpeg\bin\ffmpeg.exe" if not on PATH
-MOVIE_FRAMERATE = 10
+MOVIE_FRAMERATE = 24
 
 
 def stitch_frames_to_mp4(frame_dir, case_out_dir, out_name):
@@ -183,14 +183,27 @@ CAM_TOP = {
     "view_up": [0, 0, 1],
 }
 
-VIEW_SETUP = {
-    "front": lambda view, bounds: apply_perspective_camera(view, CAM_FRONT),
-    "side": lambda view, bounds: apply_perspective_camera(view, CAM_SIDE),
-    "top": lambda view, bounds: apply_perspective_camera(view, CAM_TOP),
-}
+CAMS_BY_VIEW = {"front": CAM_FRONT, "side": CAM_SIDE, "top": CAM_TOP}
 AXIS_FOR_VIEW = {"front": "x", "side": "z", "top": "y"}  # sweep/slice normal per view
 NORMAL_VEC = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+
+
+def camera_following_slice(view_name, slice_pos, sweep_start):
+    """Translate the base camera by the same delta the slice has moved from the
+    start of the sweep, so the slice plane stays centered in frame throughout -
+    the domain slides past a moving camera instead of the camera sitting fixed
+    while the slice sweeps in and out of frame."""
+    base = CAMS_BY_VIEW[view_name]
+    axis = AXIS_FOR_VIEW[view_name]
+    delta = slice_pos - sweep_start
+    shift = [0.0, 0.0, 0.0]
+    shift[AXIS_INDEX[axis]] = delta
+    return {
+        "position": [base["position"][i] + shift[i] for i in range(3)],
+        "focal_point": [base["focal_point"][i] + shift[i] for i in range(3)],
+        "view_up": base["view_up"],
+    }
 
 
 # ============================================================
@@ -380,14 +393,13 @@ def make_sweep_movie(source, view_name, view, field, bounds, out_dir, name, fiel
     ctf = apply_color_preset(view, field)
     disp.SetScalarBarVisibility(view, True)
 
-    VIEW_SETUP[view_name](view, bounds)
-
     for i in range(N_SWEEP_FRAMES):
         t = i / (N_SWEEP_FRAMES - 1)
         pos = lo + t * (hi - lo)
         origin = [0.0, 0.0, 0.0]
         origin[AXIS_INDEX[axis]] = pos
         slice1.SliceType.Origin = origin
+        apply_perspective_camera(view, camera_following_slice(view_name, pos, lo))
         Render()
         SaveScreenshot(os.path.join(sub_dir, f"frame_{i:03d}.png"),
                         view, ImageResolution=img_size)
@@ -398,6 +410,107 @@ def make_sweep_movie(source, view_name, view, field, bounds, out_dir, name, fiel
 
     if STITCH_MOVIES:
         stitch_frames_to_mp4(sub_dir, out_dir, f"{name}_{view_name}_{field_key}")
+
+
+# ============================================================
+# EXPERIMENTAL: native-animation version of the sweep movie.
+# Uses PythonAnimationCue (untested against this ParaView build) to drive
+# slice + camera together, then the CONFIRMED SaveAnimation() call (from
+# your trace) to export directly to .mp4, no ffmpeg needed.
+#
+# NOT wired into process_case. Test this standalone on one field/view first:
+#   view = GetActiveViewOrCreate('RenderView')
+#   sources = build_pipeline(CASES[0]["file"])
+#   make_sweep_movie_native(sources["fluid"], "side", view, FIELDS["static_pressure"],
+#                            WASH_BOUNDS, CASES[0]["out"], CASES[0]["name"], "static_pressure")
+# If it errors, paste the traceback back - same trace-and-fix process as everything else.
+# ============================================================
+# ============================================================
+# EXPERIMENTAL: native-animation version of the sweep movie.
+# Uses GetAnimationTrack + CompositeKeyFrame for the slice Origin (confirmed
+# real from your trace: CompositeKeyFrame with KeyTime/KeyValues/Interpolation
+# is exactly what the GUI's "Slice1 - Slice Type - Origin (2)" track produced)
+# and GetCameraTrack + CameraKeyFrame for the camera (matches the "Camera -
+# RenderView1" / "Interpolate cameras" track seen in your Time Manager
+# screenshot). Exports directly via the confirmed SaveAnimation() call.
+#
+# One piece is still inference rather than trace-confirmed: whether the
+# Origin track's proxy argument should be slice1 or slice1.SliceType, and
+# whether GetCameraTrack/CameraKeyFrame are the exact right names for the
+# camera side (very likely, they're the standard documented API, but not
+# seen verbatim in a trace). If either errors, paste the traceback.
+#
+# NOT wired into process_case. Test standalone on one field/view first:
+#   view = GetActiveViewOrCreate('RenderView')
+#   sources = build_pipeline(CASES[0]["file"])
+#   make_sweep_movie_native(sources["fluid"], "side", view, FIELDS["static_pressure"],
+#                            WASH_BOUNDS, CASES[0]["out"], CASES[0]["name"], "static_pressure")
+# ============================================================
+def make_sweep_movie_native(source, view_name, view, field, bounds, out_dir, name, field_key):
+    sub_dir = os.path.join(out_dir, "movies_mp4")
+    os.makedirs(sub_dir, exist_ok=True)
+    axis = AXIS_FOR_VIEW[view_name]
+    axis_index = AXIS_INDEX[axis]
+    lo, hi = bounds[axis]
+    img_size = FRONT_IMG_SIZE if view_name == "front" else IMG_SIZE
+    view.ViewSize = img_size
+
+    slice1 = Slice(registrationName='NativeSweepSlice', Input=source)
+    slice1.SliceType.Normal = NORMAL_VEC[axis]
+    origin0 = [0.0, 0.0, 0.0]
+    origin0[axis_index] = lo
+    slice1.SliceType.Origin = origin0
+
+    disp = Show(slice1, view)
+    ColorBy(disp, ('POINTS', field))
+    ctf = apply_color_preset(view, field)
+    disp.SetScalarBarVisibility(view, True)
+
+    base_cam = CAMS_BY_VIEW[view_name]
+    apply_perspective_camera(view, base_cam)
+
+    scene = GetAnimationScene()
+    scene.PlayMode = 'Sequence'
+    scene.NumberOfFrames = N_SWEEP_FRAMES
+
+    # --- Origin track (bound to just the swept axis component) ---
+    origin_track = GetAnimationTrack('Origin', index=axis_index, proxy=slice1.SliceType)
+    origin_kf0 = CompositeKeyFrame()
+    origin_kf0.KeyTime = 0.0
+    origin_kf0.KeyValues = [lo]
+    origin_kf1 = CompositeKeyFrame()
+    origin_kf1.KeyTime = 1.0
+    origin_kf1.KeyValues = [hi]
+    origin_track.KeyFrames = [origin_kf0, origin_kf1]
+
+    # --- Camera track (moves by the same delta the slice sweeps) ---
+    delta = hi - lo
+    shift = [0.0, 0.0, 0.0]
+    shift[axis_index] = delta
+    end_position = [base_cam["position"][i] + shift[i] for i in range(3)]
+    end_focal = [base_cam["focal_point"][i] + shift[i] for i in range(3)]
+
+    camera_track = GetCameraTrack(view)
+    cam_kf0 = CameraKeyFrame()
+    cam_kf0.KeyTime = 0.0
+    cam_kf0.Position = base_cam["position"]
+    cam_kf0.FocalPoint = base_cam["focal_point"]
+    cam_kf0.ViewUp = base_cam["view_up"]
+    cam_kf1 = CameraKeyFrame()
+    cam_kf1.KeyTime = 1.0
+    cam_kf1.Position = end_position
+    cam_kf1.FocalPoint = end_focal
+    cam_kf1.ViewUp = base_cam["view_up"]
+    camera_track.KeyFrames = [cam_kf0, cam_kf1]
+
+    out_path = os.path.join(sub_dir, f"{name}_{view_name}_{field_key}_native.mp4")
+    SaveAnimation(out_path, view, ImageResolution=img_size,
+                  FrameRate=MOVIE_FRAMERATE, FrameWindow=[0, N_SWEEP_FRAMES - 1])
+
+    GetScalarBar(ctf, view).Visibility = 0
+    Delete(slice1)
+    view.ViewSize = IMG_SIZE
+    print(f"  [native] wrote {out_path}")
 
 
 # ============================================================
@@ -420,13 +533,12 @@ def make_slice_deck(source, view_name, view, field, bounds, out_dir, name, field
     ctf = apply_color_preset(view, field)
     disp.SetScalarBarVisibility(view, True)
 
-    VIEW_SETUP[view_name](view, bounds)
-
     for i in range(n_steps + 1):
         pos = lo + i * SLICE_STEP
         origin = [0.0, 0.0, 0.0]
         origin[AXIS_INDEX[axis]] = pos
         slice1.SliceType.Origin = origin
+        apply_perspective_camera(view, camera_following_slice(view_name, pos, lo))
         Render()
         tag = f"{axis}{pos * 1000:+04.0f}mm".replace("+", "p").replace("-", "m")
         SaveScreenshot(os.path.join(sub_dir, f"{tag}.png"),
