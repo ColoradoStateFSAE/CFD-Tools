@@ -54,10 +54,13 @@ CAR_BOUNDS = {
 }
 
 # explicit sweep/slice range for movies and slice decks (fluid domain, outside-to-center on Z)
+# NOTE: y and z start at 0.001 rather than 0.0 - a slice sitting exactly on the
+# ground plane (y=0) or symmetry plane (z=0) returns an empty/degenerate result,
+# which surfaces as "Could not determine array range".
 WASH_BOUNDS = {
     "x": (-1.0, 2.5),
-    "y": (0.0, 1.8),
-    "z": (0.0, 1.8),
+    "y": (0.001, 1.8),
+    "z": (0.001, 1.8),
 }
 
 # ============================================================
@@ -413,38 +416,14 @@ def make_sweep_movie(source, view_name, view, field, bounds, out_dir, name, fiel
 
 
 # ============================================================
-# EXPERIMENTAL: native-animation version of the sweep movie.
-# Uses PythonAnimationCue (untested against this ParaView build) to drive
-# slice + camera together, then the CONFIRMED SaveAnimation() call (from
-# your trace) to export directly to .mp4, no ffmpeg needed.
+# 10 (NATIVE): SWEEPING SLICE MOVIES via ParaView's own animation engine.
+# GetAnimationTrack + CompositeKeyFrame drives the slice Origin;
+# GetCameraTrack + CameraKeyFrame drives the camera; SaveAnimation writes
+# the .mp4 directly (no ffmpeg, no PNG frame sequence).
 #
-# NOT wired into process_case. Test this standalone on one field/view first:
-#   view = GetActiveViewOrCreate('RenderView')
-#   sources = build_pipeline(CASES[0]["file"])
-#   make_sweep_movie_native(sources["fluid"], "side", view, FIELDS["static_pressure"],
-#                            WASH_BOUNDS, CASES[0]["out"], CASES[0]["name"], "static_pressure")
-# If it errors, paste the traceback back - same trace-and-fix process as everything else.
-# ============================================================
-# ============================================================
-# EXPERIMENTAL: native-animation version of the sweep movie.
-# Uses GetAnimationTrack + CompositeKeyFrame for the slice Origin (confirmed
-# real from your trace: CompositeKeyFrame with KeyTime/KeyValues/Interpolation
-# is exactly what the GUI's "Slice1 - Slice Type - Origin (2)" track produced)
-# and GetCameraTrack + CameraKeyFrame for the camera (matches the "Camera -
-# RenderView1" / "Interpolate cameras" track seen in your Time Manager
-# screenshot). Exports directly via the confirmed SaveAnimation() call.
-#
-# One piece is still inference rather than trace-confirmed: whether the
-# Origin track's proxy argument should be slice1 or slice1.SliceType, and
-# whether GetCameraTrack/CameraKeyFrame are the exact right names for the
-# camera side (very likely, they're the standard documented API, but not
-# seen verbatim in a trace). If either errors, paste the traceback.
-#
-# NOT wired into process_case. Test standalone on one field/view first:
-#   view = GetActiveViewOrCreate('RenderView')
-#   sources = build_pipeline(CASES[0]["file"])
-#   make_sweep_movie_native(sources["fluid"], "side", view, FIELDS["static_pressure"],
-#                            WASH_BOUNDS, CASES[0]["out"], CASES[0]["name"], "static_pressure")
+# NOTE: the SaveAnimation call below is deliberately MINIMAL. Passing the full
+# GUI-trace argument set (location, FileName, BitRate, FontScaling, ...) caused
+# "Could not initialize writer" - the short form is what actually works here.
 # ============================================================
 def make_sweep_movie_native(source, view_name, view, field, bounds, out_dir, name, field_key):
     sub_dir = os.path.join(out_dir, "movies_mp4")
@@ -504,13 +483,24 @@ def make_sweep_movie_native(source, view_name, view, field, bounds, out_dir, nam
     camera_track.KeyFrames = [cam_kf0, cam_kf1]
 
     out_path = os.path.join(sub_dir, f"{name}_{view_name}_{field_key}_native.mp4")
+    # A stale/locked partial .mp4 left by a crashed run can block the encoder
+    if os.path.exists(out_path):
+        try:
+            os.remove(out_path)
+        except OSError as e:
+            print(f"  [native] WARNING could not remove existing {out_path}: {e}")
+
     SaveAnimation(out_path, view, ImageResolution=img_size,
                   FrameRate=MOVIE_FRAMERATE, FrameWindow=[0, N_SWEEP_FRAMES - 1])
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        print(f"  [native] wrote {out_path} ({os.path.getsize(out_path)} bytes)")
+    else:
+        print(f"  [native] FAILED - no output produced at {out_path}")
 
     GetScalarBar(ctf, view).Visibility = 0
     Delete(slice1)
     view.ViewSize = IMG_SIZE
-    print(f"  [native] wrote {out_path}")
 
 
 # ============================================================
@@ -675,7 +665,8 @@ def process_case(case):
     # --- 10: sweeping movies (fluid domain, velocity/static/total pressure x bottom/side/front) ---
     for field_key in ["velocity", "static_pressure", "total_pressure"]:
         for view_name in ["top", "side", "front"]:
-            make_sweep_movie(fluid_source, view_name, view, FIELDS[field_key], WASH_BOUNDS, case["out"], name, field_key)
+            make_sweep_movie_native(fluid_source, view_name, view, FIELDS[field_key],
+                                     WASH_BOUNDS, case["out"], name, field_key)
 
     # --- 11: 50mm slice decks (fluid domain) ---
     for field_key in ["velocity", "static_pressure", "total_pressure"]:
