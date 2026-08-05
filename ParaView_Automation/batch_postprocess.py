@@ -1,70 +1,72 @@
+# ============================================================================
 # batch_postprocess.py
-# Run with: pvpython batch_postprocess.py   (test on ONE case first)
-# Headless on HPC later with: pvbatch --mesa batch_postprocess.py
+# VERSION: 2026-08-05_0207
+# ============================================================================
+# Written fresh against a confirmed ParaView 6.2.0-RC1 GUI trace.
 #
-# Covers:
-#   1-9.  Original standard set (iso/underside-iso contours, streamlines, centerline graph)
-#   10.   Sweeping slice movies (velocity/static/total pressure x top/side/front)
-#   11.   50mm slice decks (same fields x views)
-#   12.   Spanwise static pressure line graphs (tip-to-tail, every 50mm across car width)
-#   13.   Surface LIC streamlines (flow-vis paint comparison)
+# WHY THE PREVIOUS VERSION BROKE:
+#   ParaView changed from 6.1.1 to 6.2.0-RC1. Block selector names changed:
+#       6.1.1  ->  /Root/enclosureenclosure11
+#       6.2.0  ->  /Root/enclosure-enclosure11     (hyphen added)
+#   ExtractBlock does NOT error on a bad selector, it just returns 0 cells,
+#   so everything downstream silently rendered blank. This script now probes
+#   candidate selector strings at runtime and uses whichever actually returns
+#   cells, so a future rename cannot silently break it again.
+#
+# Run with:   pvpython batch_postprocess_2026-08-05_0202.py
+# Headless:   pvbatch --mesa batch_postprocess_2026-08-05_0202.py
+# ============================================================================
 
 from paraview.simple import *
 import os
-import subprocess
+import sys
+import argparse
+import datetime
 
 paraview.simple._DisableFirstRenderCameraReset()
 
+SCRIPT_VERSION = "2026-08-05_0207"
+
 # ============================================================
-# CASES - populate one entry per Fluent run
+# CASES
 # ============================================================
 CASES = [
-    {"name": "case_001", "file": r"C:\Users\HayesDodson\Downloads\Fluent (1)\FLTG-Setup-Output.encas", "out": r"C:\Users\HayesDodson\Downloads\test"},
-    # add more cases here
+    {"name": "case_001",
+     "file": r"C:\Users\HayesDodson\Downloads\data\FLTG-Setup-Output.encas",
+     "out":  r"C:\Users\HayesDodson\Downloads\test"},
 ]
 
 # ============================================================
-# GEOMETRY - block names to keep (car surfaces only, confirmed from your ExtractBlock)
+# BLOCK SELECTORS
+# Candidates are tried in order; the first that yields cells wins.
+# Add new spellings here if a future ParaView version renames things again.
 # ============================================================
-CAR_BLOCKS = [
-    '/Root/undertray',
-    '/Root/rearwing',
-    '/Root/frontwing',
-    '/Root/chassis',
-    '/Root/front_sus',
-    '/Root/rear_sus',
-    '/Root/rw',
-    '/Root/fw',
-    '/Root/rwb',
-    '/Root/fwb',
+CAR_BLOCK_NAMES = ['undertray', 'rearwing', 'frontwing', 'chassis',
+                   'front_sus', 'rear_sus', 'rw', 'fw', 'rwb', 'fwb']
+
+FLUID_BLOCK_CANDIDATES = [
+    '/Root/enclosure-enclosure11',   # ParaView 6.2.0-RC1 (confirmed from trace)
+    '/Root/enclosureenclosure11',    # ParaView 6.1.1
 ]
-# fluid/enclosure volume block - needed for slices, sweeps, and streamlines
-# (velocity/pressure fields live in the fluid domain, not on the car surface)
-FLUID_BLOCK = ['/Root/enclosureenclosure11']
-# NOTE: if ExtractBlock().Selectors = CAR_BLOCKS errors out, run Start Trace over just
-# building ExtractBlock1 in the GUI and send the exact call back, syntax varies by version.
 
 # ============================================================
 # BOUNDS
 # ============================================================
 CAR_BOUNDS = {
-    "x": (-1.8415, 1.23425),   # inlet(-) to outlet(+), streamwise
+    "x": (-1.8415, 1.23425),    # inlet(-) to outlet(+), streamwise
     "y": (0.0, 1.32862),        # ground to roof
-    "z": (-0.70231, 0.70231),   # full width, symmetric after reflect
+    "z": (-0.70231, 0.70231),   # full width once the car block is reflected
 }
 
-# explicit sweep/slice range for movies and slice decks (fluid domain, outside-to-center on Z)
-# NOTE: y and z start at 0.001 rather than 0.0 - a slice sitting exactly on the
-# ground plane (y=0) or symmetry plane (z=0) returns an empty/degenerate result,
-# which surfaces as "Could not determine array range".
+# sweep/slice range for movies and slice decks
 WASH_BOUNDS = {
     "x": (-1.0, 2.5),
-    "y": (0.001, 1.8),
-    "z": (0.001, 1.8),
+    "y": (0.0, 1.8),
+    "z": (0.0, 1.8),
 }
 
 # ============================================================
-# FIELDS
+# FIELDS AND COLOR
 # ============================================================
 FIELDS = {
     "velocity": "Velocity_Magnitude",
@@ -72,112 +74,50 @@ FIELDS = {
     "total_pressure": "Total_Pressure",
 }
 FIELD_RANGES = {
-    # tune these to your actual data ranges so color scales are fixed across cases
     "Velocity_Magnitude": [0, 30],
     "Static_Pressure": [-750, 250],
     "Total_Pressure": [-750, 300],
 }
 COLOR_PRESET = 'Rainbow Uniform'
-ALL_COLOR_FIELDS = ["Velocity_Magnitude", "Static_Pressure", "Total_Pressure", "Skin_Friction_Coefficient"]
+ALL_COLOR_FIELDS = ["Velocity_Magnitude", "Static_Pressure", "Total_Pressure",
+                    "Skin_Friction_Coefficient"]
 
-# ============================================================
-# ISOSURFACES - Q-criterion vortex structures, a standard way to spot
-# induced-drag sources (wingtip/diffuser vortices, separation) at a glance.
-# ISOSURFACE_VALUE is data-dependent - 1.0 is a common starting point for the
-# normalized field, but check the first result and adjust if it looks empty
-# or overwhelming.
-# ============================================================
 ISOSURFACE_FIELD = 'Q_Criterion_Normalized'
 ISOSURFACE_VALUE = 1.0
 ISOSURFACE_COLOR_FIELD = 'Velocity_Magnitude'
 
-IMG_SIZE = [3840, 2160]  # true 4K. PNG is lossless regardless of size, this just gives more pixels to work with
-FRONT_IMG_SIZE = IMG_SIZE  # back to horizontal, same resolution as the other views
-N_SWEEP_FRAMES = 120  # 5 seconds at 24fps
-SLICE_STEP = 0.05  # 50mm
-
 # ============================================================
-# MOVIE STITCHING - automatically combine each sweep's PNG frames into an .mp4
-# Requires ffmpeg on PATH (https://ffmpeg.org/download.html). If it's not found,
-# frames still get saved, just no .mp4 - stitch manually with the printed command.
+# OUTPUT SETTINGS
+# 4K MP4 export is confirmed working in 6.2 (the trace exported
+# ImageResolution=[3840, 2160] successfully).
 # ============================================================
-STITCH_MOVIES = True
-FFMPEG_PATH = "ffmpeg"  # set to a full path like r"C:\ffmpeg\bin\ffmpeg.exe" if not on PATH
+IMG_SIZE = [3840, 2160]
+N_SWEEP_FRAMES = 120        # 5 seconds at 24fps
 MOVIE_FRAMERATE = 24
-
-
-def stitch_frames_to_mp4(frame_dir, case_out_dir, out_name):
-    mp4_dir = os.path.join(case_out_dir, "movies_mp4")
-    os.makedirs(mp4_dir, exist_ok=True)
-    out_path = os.path.join(mp4_dir, f"{out_name}.mp4")
-    frame_pattern = os.path.join(frame_dir, "frame_%03d.png")
-    cmd = [FFMPEG_PATH, "-y", "-framerate", str(MOVIE_FRAMERATE), "-i", frame_pattern,
-           "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-        print(f"  [movie] wrote {out_path}")
-    except FileNotFoundError:
-        print(f"  [movie] ffmpeg not found on PATH - skipped stitching {out_name}. "
-              f"Install ffmpeg and add it to PATH, or set FFMPEG_PATH at the top of this script. "
-              f"Manual command: ffmpeg -framerate {MOVIE_FRAMERATE} -i \"{frame_pattern}\" "
-              f"-c:v libx264 -pix_fmt yuv420p \"{out_path}\"")
-    except subprocess.CalledProcessError as e:
-        stderr_tail = e.stderr.decode(errors="ignore")[-500:] if e.stderr else "(no output)"
-        print(f"  [movie] ffmpeg failed for {out_name}: {stderr_tail}")
+MOVIE_BITRATE = 10000000
+SLICE_STEP = 0.05           # 50mm
 
 # ============================================================
-# STREAMLINE SEEDING - two regions: general upstream cloud (denser now) plus a
-# dedicated low, tight seed right ahead of the nose to guarantee underfloor coverage
-# ============================================================
-STREAMLINE_SEED_MAIN = {
-    "center": [CAR_BOUNDS["x"][0] - 0.5, 0.55, 0.0],
-    "radius": 0.65,
-    "n_points": 600,
-}
-STREAMLINE_SEED_UNDERFLOOR = {
-    "center": [CAR_BOUNDS["x"][0] - 0.25, 0.06, 0.0],  # low, close to ground, just upstream of nose
-    "radius": 0.55,  # spans roughly the car's half-width at very low height
-    "n_points": 500,
-}
-
-# ============================================================
-# FIXED CAMERAS - traced directly from your GUI session
+# CAMERAS (from .pvcc state files, perspective projection)
 # ============================================================
 CAM_ISO = {
     "position": [-5.168290238998194, 3.1907989459561232, 3.859907198505371],
     "focal_point": [-0.33957097312688794, 0.6451492970271008, 0.12655292696877032],
     "view_up": [0.29551835849896174, 0.922845130744072, -0.24703393380674607],
-    "parallel_scale": 1.7116295794848735,
 }
 CAM_UNDERSIDE_ISO = {
     "position": [-2.78343145444443, -5.521651747384183, 2.809984883765469],
     "focal_point": [-0.3477141510178081, 0.11215029862658193, 0.3478005436634496],
     "view_up": [-0.6618338173671472, 0.521496331899044, 0.5385327975203293],
-    "parallel_scale": 1.7116295794848735,
 }
-
-
-def apply_perspective_camera(view, cam):
-    view.CameraParallelProjection = 0
-    view.CameraPosition = cam["position"]
-    view.CameraFocalPoint = cam["focal_point"]
-    view.CameraViewUp = cam["view_up"]
-
-
-# ============================================================
-# FIXED CAMERAS - front, side, top
-# Sourced directly from the .pvcc camera state files (authoritative, exact).
-# All three use perspective projection (CameraParallelProjection=0 in every
-# .pvcc file) - not orthographic - so parallel_scale isn't used here.
-# ============================================================
 CAM_FRONT = {
     "position": [-2.7083522739750983, 0.9135278128072652, 1.1695509914959028],
     "focal_point": [-0.6499999761581421, 0.9135278128072652, 1.1695509914959028],
     "view_up": [0, 1, 0],
 }
 CAM_SIDE = {
-    "position": [0.8294243044063128, 1.582674436005691, 6.277717263679178],
-    "focal_point": [0.8294243044063128, 1.582674436005691, 3.451149174643433],
+    "position": [0.832442, 1.67923, 6.27772],
+    "focal_point": [0.832442, 1.67923, 3.45115],
     "view_up": [0, 1, 0],
 }
 CAM_TOP = {
@@ -187,21 +127,27 @@ CAM_TOP = {
 }
 
 CAMS_BY_VIEW = {"front": CAM_FRONT, "side": CAM_SIDE, "top": CAM_TOP}
-AXIS_FOR_VIEW = {"front": "x", "side": "z", "top": "y"}  # sweep/slice normal per view
+AXIS_FOR_VIEW = {"front": "x", "side": "z", "top": "y"}
 NORMAL_VEC = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
+CAMERA_PARALLEL_SCALE = 18.6899   # from the trace, used by camera keyframes
+CAMERA_VIEW_ANGLE = 30.0
 
-def camera_following_slice(view_name, slice_pos, sweep_start):
-    """Translate the base camera by the same delta the slice has moved from the
-    start of the sweep, so the slice plane stays centered in frame throughout -
-    the domain slides past a moving camera instead of the camera sitting fixed
-    while the slice sweeps in and out of frame."""
+
+def apply_camera(view, cam):
+    view.CameraParallelProjection = 0
+    view.CameraPosition = cam["position"]
+    view.CameraFocalPoint = cam["focal_point"]
+    view.CameraViewUp = cam["view_up"]
+
+
+def shifted_camera(view_name, distance):
+    """Base camera translated along the sweep axis by `distance`."""
     base = CAMS_BY_VIEW[view_name]
-    axis = AXIS_FOR_VIEW[view_name]
-    delta = slice_pos - sweep_start
+    idx = AXIS_INDEX[AXIS_FOR_VIEW[view_name]]
     shift = [0.0, 0.0, 0.0]
-    shift[AXIS_INDEX[axis]] = delta
+    shift[idx] = distance
     return {
         "position": [base["position"][i] + shift[i] for i in range(3)],
         "focal_point": [base["focal_point"][i] + shift[i] for i in range(3)],
@@ -210,486 +156,584 @@ def camera_following_slice(view_name, slice_pos, sweep_start):
 
 
 # ============================================================
-# PIPELINE BUILD (per case)
-# Returns both branches: car (surface geometry, for contours/LIC) and
-# fluid (volume domain, for slices/sweeps/streamlines/graphs)
+# BLOCK SELECTOR PROBING
 # ============================================================
-REFLECT_FLUID_BLOCK = False  # fluid domain stays half-width (symmetric flow, only reflect the car block for visuals)
+def _make_extract(reader, selectors):
+    ex = ExtractBlock(Input=reader)
+    try:
+        ex.Assembly = 'Hierarchy'    # exists in 6.2, may not in older builds
+    except Exception:
+        pass
+    ex.Selectors = selectors
+    ex.UpdatePipeline()
+    return ex
 
 
-def _make_reflect(input_proxy):
-    reflect = AxisAlignedReflect(Input=input_proxy)
-    reflect.ReflectionPlane.Set(
-        Origin=[0.0, 0.0, 0.0],
-        Normal=[0.0, 0.0, 1.0],
+def _cells(proxy):
+    return proxy.GetDataInformation().GetNumberOfCells()
+
+
+def resolve_fluid_block(reader):
+    for candidate in FLUID_BLOCK_CANDIDATES:
+        try:
+            ex = _make_extract(reader, [candidate])
+            n = _cells(ex)
+            print(f"  [probe] fluid selector {candidate!r} -> {n} cells")
+            if n > 0:
+                return ex, candidate
+            Delete(ex)
+        except Exception as e:
+            print(f"  [probe] fluid selector {candidate!r} raised: {e}")
+    raise RuntimeError(
+        "No fluid block selector matched. Open the file in the GUI, add an "
+        "ExtractBlock, and check the exact selector string in the trace. "
+        "Then add it to FLUID_BLOCK_CANDIDATES at the top of this script."
     )
-    reflect.ReflectAllInputArrays = 1
-    reflect.UpdatePipeline()
-    return reflect
+
+
+def resolve_car_blocks(reader):
+    """Car block names have no special characters, but the hyphen change on the
+    enclosure block shows names can shift between versions, so probe per block
+    and keep whichever spelling returns cells."""
+    working = []
+    for base in CAR_BLOCK_NAMES:
+        for candidate in (f'/Root/{base}', f'/Root/{base.replace("_", "-")}'):
+            try:
+                ex = _make_extract(reader, [candidate])
+                n = _cells(ex)
+                Delete(ex)
+                if n > 0:
+                    working.append(candidate)
+                    break
+            except Exception:
+                continue
+        else:
+            print(f"  [warn] no working selector found for car block {base!r}")
+
+    if not working:
+        raise RuntimeError("No car block selectors matched. Check block names in the GUI.")
+
+    ex = _make_extract(reader, working)
+    print(f"  [probe] car blocks -> {len(working)}/{len(CAR_BLOCK_NAMES)} matched, "
+          f"{_cells(ex)} cells")
+    return ex
+
+
+def make_reflect(input_proxy):
+    r = AxisAlignedReflect(Input=input_proxy)
+    r.ReflectionPlane.Set(Origin=[0.0, 0.0, 0.0], Normal=[0.0, 0.0, 1.0])
+    r.ReflectAllInputArrays = 1
+    r.UpdatePipeline()
+    return r
 
 
 def build_pipeline(case_file):
+    if not os.path.exists(case_file):
+        raise RuntimeError(f"Case file not found: {case_file}")
+
     reader = OpenDataFile(case_file)
     reader.UpdatePipeline()
+    print(f"  [check] reader cells: {_cells(reader)}")
 
-    # --- Car surface branch (contours, surface LIC) ---
-    car_extract = ExtractBlock(Input=reader)
-    car_extract.Selectors = CAR_BLOCKS
-    car_extract.UpdatePipeline()
+    car_extract = resolve_car_blocks(reader)
+    car = make_reflect(car_extract)            # mirror the car for full-width visuals
+    print(f"  [check] car after reflect: {_cells(car)} cells")
 
-    n_cells = car_extract.GetDataInformation().GetNumberOfCells()
-    print(f"  [check] Car ExtractBlock cell count: {n_cells}")
-    if n_cells == 0:
-        raise RuntimeError(
-            "Car ExtractBlock produced 0 cells. CAR_BLOCKS selector strings don't match "
-            "this file's hierarchy. Run the diagnostic hierarchy dump before continuing."
-        )
+    fluid, sel = resolve_fluid_block(reader)   # fluid stays half-width (symmetric flow)
+    print(f"  [check] using fluid selector: {sel}")
 
-    car_reflect = _make_reflect(car_extract)
-    print(f"  [check] Car reflect cell count: {car_reflect.GetDataInformation().GetNumberOfCells()}")
-
-    # --- Fluid volume branch (slices, sweeps, streamlines, line graphs) ---
-    fluid_extract = ExtractBlock(Input=reader)
-    fluid_extract.Selectors = FLUID_BLOCK
-    fluid_extract.UpdatePipeline()
-
-    n_fluid_cells = fluid_extract.GetDataInformation().GetNumberOfCells()
-    print(f"  [check] Fluid ExtractBlock cell count: {n_fluid_cells}")
-    if n_fluid_cells == 0:
-        raise RuntimeError(
-            "Fluid ExtractBlock produced 0 cells. FLUID_BLOCK selector doesn't match "
-            "this file's hierarchy. Check the exact enclosure block name."
-        )
-
-    if REFLECT_FLUID_BLOCK:
-        fluid_source = _make_reflect(fluid_extract)
-        print(f"  [check] Fluid reflect cell count: {fluid_source.GetDataInformation().GetNumberOfCells()}")
-    else:
-        fluid_source = fluid_extract
-
-    return {"car": car_reflect, "fluid": fluid_source}
+    return {"car": car, "fluid": fluid}
 
 
 # ============================================================
-# COLOR PRESET HELPER - applied everywhere a field is color-mapped
+# COLOR / LEGEND
 # ============================================================
-def hide_all_known_scalar_bars(view):
-    """Force-clear every legend we might have created, regardless of which
-    field owns it. Called before showing any new legend so stale ones from
-    a previous field can never remain stacked on screen."""
+def hide_all_scalar_bars(view):
     for f in ALL_COLOR_FIELDS:
         try:
-            ctf = GetColorTransferFunction(f)
-            GetScalarBar(ctf, view).Visibility = 0
+            GetScalarBar(GetColorTransferFunction(f), view).Visibility = 0
         except Exception:
             pass
 
 
-def apply_color_preset(view, field):
-    hide_all_known_scalar_bars(view)
+def apply_color(view, field):
+    hide_all_scalar_bars(view)
     ctf = GetColorTransferFunction(field)
-    ctf.RescaleTransferFunction(*FIELD_RANGES[field])
+    if field in FIELD_RANGES:
+        ctf.RescaleTransferFunction(*FIELD_RANGES[field])
     ctf.ApplyPreset(COLOR_PRESET, True)
     sb = GetScalarBar(ctf, view)
     sb.WindowLocation = 'Any Location'
-    sb.Position = [0.90, 0.35]   # right side, vertically centered
-    sb.ScalarBarLength = 0.30    # length of the bar (normalized viewport units)
+    sb.Position = [0.90, 0.35]
+    sb.ScalarBarLength = 0.33
+    sb.ScalarBarThickness = 16
     return ctf
 
 
+def shot(view, path, size=None):
+    SaveScreenshot(path, view, ImageResolution=size or IMG_SIZE)
+
+
 # ============================================================
-# 1-4: CONTOURS (iso + underside-iso, PRESSURE ONLY)
-# velocity contour on the car surface was removed: due to the no-slip
-# condition, surface velocity is always ~0, so it isn't a meaningful contour.
+# STREAMLINE SEEDS
 # ============================================================
-def save_contour(source, view, field, filename, out_dir):
-    sub_dir = os.path.join(out_dir, "contours")
-    os.makedirs(sub_dir, exist_ok=True)
-    disp = Show(source, view)
+SEED_MAIN = {"center": [CAR_BOUNDS["x"][0] - 0.5, 0.55, 0.0], "radius": 0.65, "n": 600}
+SEED_UNDER = {"center": [CAR_BOUNDS["x"][0] - 0.25, 0.06, 0.0], "radius": 0.55, "n": 500}
+
+
+def _tracer(source, seed):
+    t = StreamTracer(Input=source, SeedType='Point Cloud')
+    t.SeedType.Center = seed["center"]
+    t.SeedType.Radius = seed["radius"]
+    t.SeedType.NumberOfPoints = seed["n"]
+    t.Vectors = ['POINTS', 'Velocity']
+    t.MaximumStreamlineLength = 8
+    return t
+
+
+# ============================================================
+# OUTPUT 1: CONTOURS ON CAR SURFACE (pressure only, no-slip makes velocity ~0)
+# ============================================================
+def save_contour(car, view, field, filename, out_dir):
+    d = os.path.join(out_dir, "contours")
+    os.makedirs(d, exist_ok=True)
+    disp = Show(car, view)
     ColorBy(disp, ('POINTS', field))
-    ctf = apply_color_preset(view, field)
+    ctf = apply_color(view, field)
     disp.SetScalarBarVisibility(view, True)
     Render()
-    SaveScreenshot(os.path.join(sub_dir, filename), view, ImageResolution=IMG_SIZE)
+    shot(view, os.path.join(d, filename))
     GetScalarBar(ctf, view).Visibility = 0
-    Hide(source, view)
+    Hide(car, view)
 
 
 # ============================================================
-# 6-9: STREAMLINES (iso + underside-iso, pressure + velocity)
-# Two seed sources combined: general upstream cloud + dedicated low seed
-# to guarantee dense coverage under the undertray.
+# OUTPUT 2: STREAMLINES (seeded in the fluid domain, car shown for context)
 # ============================================================
-def save_streamlines(source, car_source, view, field, filename, out_dir):
-    sub_dir = os.path.join(out_dir, "streamlines")
-    os.makedirs(sub_dir, exist_ok=True)
+def save_streamlines(fluid, car, view, field, filename, out_dir):
+    d = os.path.join(out_dir, "streamlines")
+    os.makedirs(d, exist_ok=True)
 
-    tracer_main = StreamTracer(Input=source, SeedType='Point Cloud')
-    tracer_main.SeedType.Center = STREAMLINE_SEED_MAIN["center"]
-    tracer_main.SeedType.Radius = STREAMLINE_SEED_MAIN["radius"]
-    tracer_main.SeedType.NumberOfPoints = STREAMLINE_SEED_MAIN["n_points"]
-    tracer_main.Vectors = ['POINTS', 'Velocity']
-    tracer_main.MaximumStreamlineLength = 8
+    t1 = _tracer(fluid, SEED_MAIN)
+    t2 = _tracer(fluid, SEED_UNDER)
+    both = AppendDatasets(Input=[t1, t2])
+    both.UpdatePipeline()
 
-    tracer_under = StreamTracer(Input=source, SeedType='Point Cloud')
-    tracer_under.SeedType.Center = STREAMLINE_SEED_UNDERFLOOR["center"]
-    tracer_under.SeedType.Radius = STREAMLINE_SEED_UNDERFLOOR["radius"]
-    tracer_under.SeedType.NumberOfPoints = STREAMLINE_SEED_UNDERFLOOR["n_points"]
-    tracer_under.Vectors = ['POINTS', 'Velocity']
-    tracer_under.MaximumStreamlineLength = 8
-
-    combined = AppendDatasets(Input=[tracer_main, tracer_under])
-    combined.UpdatePipeline()
-
-    # show the car body as plain solid geometry for context (not colored by any field)
-    car_disp = Show(car_source, view)
+    car_disp = Show(car, view)
     car_disp.Representation = 'Surface'
     ColorBy(car_disp, None)
     car_disp.AmbientColor = [0.6, 0.6, 0.6]
     car_disp.DiffuseColor = [0.6, 0.6, 0.6]
 
-    disp = Show(combined, view)
+    disp = Show(both, view)
     ColorBy(disp, ('POINTS', field))
-    ctf = apply_color_preset(view, field)
+    ctf = apply_color(view, field)
     disp.SetScalarBarVisibility(view, True)
     Render()
-    SaveScreenshot(os.path.join(sub_dir, filename), view, ImageResolution=IMG_SIZE)
+    shot(view, os.path.join(d, filename))
+
     GetScalarBar(ctf, view).Visibility = 0
-    Delete(combined)
-    Delete(tracer_under)
-    Delete(tracer_main)
-    Hide(car_source, view)
+    Delete(both); Delete(t2); Delete(t1)
+    Hide(car, view)
 
 
 # ============================================================
-# 5: CENTERLINE PRESSURE GRAPH (front to rear, using Total_Pressure directly, no CpT calc)
+# OUTPUT 3: LINE GRAPHS
 # ============================================================
-def save_centerline_graph(source, out_dir, name):
-    sub_dir = os.path.join(out_dir, "graphs", "centerline")
-    os.makedirs(sub_dir, exist_ok=True)
+def save_centerline_graph(fluid, out_dir, name):
+    d = os.path.join(out_dir, "graphs", "centerline")
+    os.makedirs(d, exist_ok=True)
     x0, x1 = CAR_BOUNDS["x"]
-    pol = PlotOverLine(Input=source)
+    pol = PlotOverLine(Input=fluid)
     pol.Point1 = [x0, 0.05, 0.0]
     pol.Point2 = [x1, 0.05, 0.0]
     pol.UpdatePipeline()
-    SaveData(os.path.join(sub_dir, f"{name}_centerline_pressure.csv"),
-             proxy=pol, WriteTimeSteps=False)
+    SaveData(os.path.join(d, f"{name}_centerline.csv"), proxy=pol, WriteTimeSteps=False)
     Delete(pol)
 
 
-# ============================================================
-# 10: SWEEPING SLICE MOVIES (frame sequence, combine with ffmpeg after)
-# ============================================================
-def make_sweep_movie(source, view_name, view, field, bounds, out_dir, name, field_key):
-    sub_dir = os.path.join(out_dir, "movies", view_name, field_key)
-    os.makedirs(sub_dir, exist_ok=True)
-    axis = AXIS_FOR_VIEW[view_name]
-    lo, hi = bounds[axis]
-    img_size = FRONT_IMG_SIZE if view_name == "front" else IMG_SIZE
-    view.ViewSize = img_size
-
-    slice1 = Slice(Input=source)
-    slice1.SliceType.Normal = NORMAL_VEC[axis]
-
-    disp = Show(slice1, view)
-    ColorBy(disp, ('POINTS', field))
-    ctf = apply_color_preset(view, field)
-    disp.SetScalarBarVisibility(view, True)
-
-    for i in range(N_SWEEP_FRAMES):
-        t = i / (N_SWEEP_FRAMES - 1)
-        pos = lo + t * (hi - lo)
-        origin = [0.0, 0.0, 0.0]
-        origin[AXIS_INDEX[axis]] = pos
-        slice1.SliceType.Origin = origin
-        apply_perspective_camera(view, camera_following_slice(view_name, pos, lo))
-        Render()
-        SaveScreenshot(os.path.join(sub_dir, f"frame_{i:03d}.png"),
-                        view, ImageResolution=img_size)
-
-    GetScalarBar(ctf, view).Visibility = 0
-    Delete(slice1)
-    view.ViewSize = IMG_SIZE  # restore default for whatever runs next
-
-    if STITCH_MOVIES:
-        stitch_frames_to_mp4(sub_dir, out_dir, f"{name}_{view_name}_{field_key}")
-
-
-# ============================================================
-# 10 (NATIVE): SWEEPING SLICE MOVIES via ParaView's own animation engine.
-# GetAnimationTrack + CompositeKeyFrame drives the slice Origin;
-# GetCameraTrack + CameraKeyFrame drives the camera; SaveAnimation writes
-# the .mp4 directly (no ffmpeg, no PNG frame sequence).
-#
-# NOTE: the SaveAnimation call below is deliberately MINIMAL. Passing the full
-# GUI-trace argument set (location, FileName, BitRate, FontScaling, ...) caused
-# "Could not initialize writer" - the short form is what actually works here.
-# ============================================================
-def make_sweep_movie_native(source, view_name, view, field, bounds, out_dir, name, field_key):
-    sub_dir = os.path.join(out_dir, "movies_mp4")
-    os.makedirs(sub_dir, exist_ok=True)
-    axis = AXIS_FOR_VIEW[view_name]
-    axis_index = AXIS_INDEX[axis]
-    lo, hi = bounds[axis]
-    img_size = FRONT_IMG_SIZE if view_name == "front" else IMG_SIZE
-    view.ViewSize = img_size
-
-    slice1 = Slice(registrationName='NativeSweepSlice', Input=source)
-    slice1.SliceType.Normal = NORMAL_VEC[axis]
-    origin0 = [0.0, 0.0, 0.0]
-    origin0[axis_index] = lo
-    slice1.SliceType.Origin = origin0
-
-    disp = Show(slice1, view)
-    ColorBy(disp, ('POINTS', field))
-    ctf = apply_color_preset(view, field)
-    disp.SetScalarBarVisibility(view, True)
-
-    base_cam = CAMS_BY_VIEW[view_name]
-    apply_perspective_camera(view, base_cam)
-
-    scene = GetAnimationScene()
-    scene.PlayMode = 'Sequence'
-    scene.NumberOfFrames = N_SWEEP_FRAMES
-
-    # --- Origin track (bound to just the swept axis component) ---
-    origin_track = GetAnimationTrack('Origin', index=axis_index, proxy=slice1.SliceType)
-    origin_kf0 = CompositeKeyFrame()
-    origin_kf0.KeyTime = 0.0
-    origin_kf0.KeyValues = [lo]
-    origin_kf1 = CompositeKeyFrame()
-    origin_kf1.KeyTime = 1.0
-    origin_kf1.KeyValues = [hi]
-    origin_track.KeyFrames = [origin_kf0, origin_kf1]
-
-    # --- Camera track (moves by the same delta the slice sweeps) ---
-    delta = hi - lo
-    shift = [0.0, 0.0, 0.0]
-    shift[axis_index] = delta
-    end_position = [base_cam["position"][i] + shift[i] for i in range(3)]
-    end_focal = [base_cam["focal_point"][i] + shift[i] for i in range(3)]
-
-    camera_track = GetCameraTrack(view)
-    cam_kf0 = CameraKeyFrame()
-    cam_kf0.KeyTime = 0.0
-    cam_kf0.Position = base_cam["position"]
-    cam_kf0.FocalPoint = base_cam["focal_point"]
-    cam_kf0.ViewUp = base_cam["view_up"]
-    cam_kf1 = CameraKeyFrame()
-    cam_kf1.KeyTime = 1.0
-    cam_kf1.Position = end_position
-    cam_kf1.FocalPoint = end_focal
-    cam_kf1.ViewUp = base_cam["view_up"]
-    camera_track.KeyFrames = [cam_kf0, cam_kf1]
-
-    out_path = os.path.join(sub_dir, f"{name}_{view_name}_{field_key}_native.mp4")
-    # A stale/locked partial .mp4 left by a crashed run can block the encoder
-    if os.path.exists(out_path):
-        try:
-            os.remove(out_path)
-        except OSError as e:
-            print(f"  [native] WARNING could not remove existing {out_path}: {e}")
-
-    SaveAnimation(out_path, view, ImageResolution=img_size,
-                  FrameRate=MOVIE_FRAMERATE, FrameWindow=[0, N_SWEEP_FRAMES - 1])
-
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        print(f"  [native] wrote {out_path} ({os.path.getsize(out_path)} bytes)")
-    else:
-        print(f"  [native] FAILED - no output produced at {out_path}")
-
-    GetScalarBar(ctf, view).Visibility = 0
-    Delete(slice1)
-    view.ViewSize = IMG_SIZE
-
-
-# ============================================================
-# 11: 50MM SLICE DECKS (static images, same orientations as movies)
-# ============================================================
-def make_slice_deck(source, view_name, view, field, bounds, out_dir, name, field_key):
-    sub_dir = os.path.join(out_dir, "slices", view_name, field_key)
-    os.makedirs(sub_dir, exist_ok=True)
-    axis = AXIS_FOR_VIEW[view_name]
-    lo, hi = bounds[axis]
-    n_steps = int(round((hi - lo) / SLICE_STEP))
-    img_size = FRONT_IMG_SIZE if view_name == "front" else IMG_SIZE
-    view.ViewSize = img_size
-
-    slice1 = Slice(Input=source)
-    slice1.SliceType.Normal = NORMAL_VEC[axis]
-
-    disp = Show(slice1, view)
-    ColorBy(disp, ('POINTS', field))
-    ctf = apply_color_preset(view, field)
-    disp.SetScalarBarVisibility(view, True)
-
-    for i in range(n_steps + 1):
-        pos = lo + i * SLICE_STEP
-        origin = [0.0, 0.0, 0.0]
-        origin[AXIS_INDEX[axis]] = pos
-        slice1.SliceType.Origin = origin
-        apply_perspective_camera(view, camera_following_slice(view_name, pos, lo))
-        Render()
-        tag = f"{axis}{pos * 1000:+04.0f}mm".replace("+", "p").replace("-", "m")
-        SaveScreenshot(os.path.join(sub_dir, f"{tag}.png"),
-                        view, ImageResolution=img_size)
-
-    GetScalarBar(ctf, view).Visibility = 0
-    Delete(slice1)
-    view.ViewSize = IMG_SIZE  # restore default for whatever runs next
-
-
-# ============================================================
-# 12: SPANWISE STATIC PRESSURE GRAPHS (tip-to-tail line, every 50mm across car width)
-# ============================================================
-def make_spanwise_pressure_graphs(source, out_dir, name):
-    sub_dir = os.path.join(out_dir, "graphs", "spanwise_pressure")
-    os.makedirs(sub_dir, exist_ok=True)
-    z_lo, z_hi = WASH_BOUNDS["z"]  # outside (z_hi) to center (z_lo=0), symmetric flow
+def save_spanwise_graphs(fluid, out_dir, name):
+    d = os.path.join(out_dir, "graphs", "spanwise")
+    os.makedirs(d, exist_ok=True)
+    z0, z1 = WASH_BOUNDS["z"]
     x0, x1 = CAR_BOUNDS["x"]
-    n_steps = int(round((z_hi - z_lo) / SLICE_STEP))
-
-    for i in range(n_steps + 1):
-        z = z_lo + i * SLICE_STEP
-        pol = PlotOverLine(Input=source)
+    for i in range(int(round((z1 - z0) / SLICE_STEP)) + 1):
+        z = z0 + i * SLICE_STEP
+        pol = PlotOverLine(Input=fluid)
         pol.Point1 = [x0, 0.05, z]
         pol.Point2 = [x1, 0.05, z]
         pol.UpdatePipeline()
-        tag = f"z{z * 1000:+04.0f}mm".replace("+", "p").replace("-", "m")
-        SaveData(os.path.join(sub_dir, f"{tag}.csv"),
-                  proxy=pol, WriteTimeSteps=False)
+        tag = f"z{z * 1000:+05.0f}mm".replace("+", "p").replace("-", "m")
+        SaveData(os.path.join(d, f"{tag}.csv"), proxy=pol, WriteTimeSteps=False)
         Delete(pol)
 
 
 # ============================================================
-# 14: Q-CRITERION ISOSURFACES (iso + underside-iso) - vortex structures,
-# a standard way to visually locate induced-drag sources
+# OUTPUT 4: SWEEP MOVIE via ParaView's native animation engine.
+# All calls below are copied from the confirmed 6.2.0-RC1 trace:
+#   GetAnimationTrack('Origin', index=N, proxy=slice.SliceType)
+#   CompositeKeyFrame() with KeyTime / KeyValues / Interpolation='Ramp'
+#   track.Set(TimeMode='Normalized', StartTime=0, EndTime=1, Enabled=1, KeyFrames=[...])
+#   GetCameraTrack(view=...) with CameraKeyFrame() and Mode='Interpolate Camera'
+#   SaveAnimation(filename=..., viewOrLayout=..., FrameWindow=[0, N-1], ...)
+#
+# Mode='Interpolate Camera' matters: the default is 'Follow-data', which
+# ignores the keyframe positions entirely.
 # ============================================================
-def save_isosurface(fluid_source, car_source, view, cam_dict, filename, out_dir, apply_cam_func=None):
-    sub_dir = os.path.join(out_dir, "isosurfaces")
-    os.makedirs(sub_dir, exist_ok=True)
+def make_sweep_movie(fluid, view_name, view, field, bounds, out_dir, name, field_key):
+    d = os.path.join(out_dir, "movies")
+    os.makedirs(d, exist_ok=True)
+    axis = AXIS_FOR_VIEW[view_name]
+    idx = AXIS_INDEX[axis]
+    lo, hi = bounds[axis]
 
-    contour = Contour(Input=fluid_source)
-    contour.ContourBy = ['POINTS', ISOSURFACE_FIELD]
-    contour.Isosurfaces = [ISOSURFACE_VALUE]
-    contour.UpdatePipeline()
+    sl = Slice(registrationName=f'SweepSlice_{view_name}_{field_key}', Input=fluid)
+    sl.SliceType.Normal = NORMAL_VEC[axis]
+    origin = [0.0, 0.0, 0.0]
+    origin[idx] = lo
+    sl.SliceType.Origin = origin
+    sl.UpdatePipeline()
 
-    # show the car body as plain solid geometry for context
-    car_disp = Show(car_source, view)
+    disp = Show(sl, view)
+    ColorBy(disp, ('POINTS', field))
+    ctf = apply_color(view, field)
+    disp.SetScalarBarVisibility(view, True)
+
+    base = CAMS_BY_VIEW[view_name]
+    apply_camera(view, base)
+
+    scene = GetAnimationScene()
+    scene.NumberOfFrames = N_SWEEP_FRAMES
+
+    # --- slice Origin track ---
+    track = GetAnimationTrack('Origin', index=idx, proxy=sl.SliceType)
+    kf0 = CompositeKeyFrame()
+    kf0.Set(KeyTime=0.0, KeyValues=[lo], Interpolation='Ramp',
+            Base=2.0, StartPower=0.0, EndPower=1.0, Phase=0.0, Frequency=1.0, Offset=0.0)
+    kf1 = CompositeKeyFrame()
+    kf1.Set(KeyTime=1.0, KeyValues=[hi], Interpolation='Ramp',
+            Base=2.0, StartPower=0.0, EndPower=1.0, Phase=0.0, Frequency=1.0, Offset=0.0)
+    track.Set(TimeMode='Normalized', StartTime=0.0, EndTime=1.0, Enabled=1,
+              KeyFrames=[kf0, kf1])
+
+    # --- camera track, translated by the same distance the slice travels ---
+    end_cam = shifted_camera(view_name, hi - lo)
+    ckf0 = CameraKeyFrame()
+    ckf0.Set(KeyTime=0.0, KeyValues=[0.0],
+             Position=base["position"], FocalPoint=base["focal_point"],
+             ViewUp=base["view_up"], ViewAngle=CAMERA_VIEW_ANGLE,
+             ParallelScale=CAMERA_PARALLEL_SCALE)
+    ckf1 = CameraKeyFrame()
+    ckf1.Set(KeyTime=1.0, KeyValues=[0.0],
+             Position=end_cam["position"], FocalPoint=end_cam["focal_point"],
+             ViewUp=end_cam["view_up"], ViewAngle=CAMERA_VIEW_ANGLE,
+             ParallelScale=CAMERA_PARALLEL_SCALE)
+    cam_track = GetCameraTrack(view=view)
+    cam_track.Set(TimeMode='Normalized', StartTime=0.0, EndTime=1.0, Enabled=1,
+                  Mode='Interpolate Camera', Interpolation='Spline',
+                  KeyFrames=[ckf0, ckf1], DataSource=None)
+
+    out_path = os.path.join(d, f"{name}_{view_name}_{field_key}.mp4").replace("\\", "/")
+    SaveAnimation(filename=out_path, viewOrLayout=view,
+                  ImageResolution=IMG_SIZE,
+                  FrameRate=MOVIE_FRAMERATE,
+                  FrameStride=1,
+                  FrameWindow=[0, N_SWEEP_FRAMES - 1],
+                  BitRate=MOVIE_BITRATE)
+
+    ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    print(f"  [movie] {'wrote' if ok else 'FAILED'} {out_path}")
+
+    # tear the tracks back down so the next movie starts clean
+    cam_track.Enabled = 0
+    track.Enabled = 0
+    GetScalarBar(ctf, view).Visibility = 0
+    Delete(sl)
+
+
+# ============================================================
+# OUTPUT 5: STATIC SLICE DECK (camera follows each slice)
+# ============================================================
+def make_slice_deck(fluid, view_name, view, field, bounds, out_dir, name, field_key):
+    d = os.path.join(out_dir, "slices", view_name, field_key)
+    os.makedirs(d, exist_ok=True)
+    axis = AXIS_FOR_VIEW[view_name]
+    idx = AXIS_INDEX[axis]
+    lo, hi = bounds[axis]
+
+    sl = Slice(Input=fluid)
+    sl.SliceType.Normal = NORMAL_VEC[axis]
+
+    disp = Show(sl, view)
+    ColorBy(disp, ('POINTS', field))
+    ctf = apply_color(view, field)
+    disp.SetScalarBarVisibility(view, True)
+
+    for i in range(int(round((hi - lo) / SLICE_STEP)) + 1):
+        pos = lo + i * SLICE_STEP
+        origin = [0.0, 0.0, 0.0]
+        origin[idx] = pos
+        sl.SliceType.Origin = origin
+        apply_camera(view, shifted_camera(view_name, pos - lo))
+        Render()
+        tag = f"{axis}{pos * 1000:+05.0f}mm".replace("+", "p").replace("-", "m")
+        shot(view, os.path.join(d, f"{tag}.png"))
+
+    GetScalarBar(ctf, view).Visibility = 0
+    Delete(sl)
+
+
+# ============================================================
+# OUTPUT 6: SURFACE LIC AND Q-CRITERION ISOSURFACES
+# ============================================================
+def save_surface_lic(car, view, cam, filename, out_dir):
+    d = os.path.join(out_dir, "surface_lic")
+    os.makedirs(d, exist_ok=True)
+    disp = Show(car, view)
+    disp.SetRepresentationType('Surface LIC')
+    ColorBy(disp, ('POINTS', FIELDS["total_pressure"]))
+    ctf = apply_color(view, FIELDS["total_pressure"])
+    disp.SetScalarBarVisibility(view, True)
+    apply_camera(view, cam)
+    Render()
+    shot(view, os.path.join(d, filename))
+    GetScalarBar(ctf, view).Visibility = 0
+    Hide(car, view)
+
+
+def save_isosurface(fluid, car, view, cam, filename, out_dir):
+    d = os.path.join(out_dir, "isosurfaces")
+    os.makedirs(d, exist_ok=True)
+
+    c = Contour(Input=fluid)
+    c.ContourBy = ['POINTS', ISOSURFACE_FIELD]
+    c.Isosurfaces = [ISOSURFACE_VALUE]
+    c.UpdatePipeline()
+
+    if _cells(c) == 0:
+        print(f"  [warn] isosurface empty at {ISOSURFACE_FIELD}={ISOSURFACE_VALUE}, "
+              f"try a lower ISOSURFACE_VALUE")
+
+    car_disp = Show(car, view)
     car_disp.Representation = 'Surface'
     ColorBy(car_disp, None)
     car_disp.AmbientColor = [0.6, 0.6, 0.6]
     car_disp.DiffuseColor = [0.6, 0.6, 0.6]
 
-    disp = Show(contour, view)
+    disp = Show(c, view)
     ColorBy(disp, ('POINTS', ISOSURFACE_COLOR_FIELD))
-    ctf = apply_color_preset(view, ISOSURFACE_COLOR_FIELD)
+    ctf = apply_color(view, ISOSURFACE_COLOR_FIELD)
     disp.SetScalarBarVisibility(view, True)
-
-    if apply_cam_func:
-        apply_cam_func(view, cam_dict)
-    else:
-        apply_perspective_camera(view, cam_dict)
-
+    apply_camera(view, cam)
     Render()
-    SaveScreenshot(os.path.join(sub_dir, filename), view, ImageResolution=IMG_SIZE)
+    shot(view, os.path.join(d, filename))
+
     GetScalarBar(ctf, view).Visibility = 0
-    Delete(contour)
-    Hide(car_source, view)
+    Delete(c)
+    Hide(car, view)
 
 
 # ============================================================
-# 13: SURFACE LIC STREAMLINES (flow-vis paint comparison)
+# STAGES
+# Each stage is independently runnable via --stage. Order here is the order
+# they run in when several are selected.
 # ============================================================
-def save_surface_lic(source, view, cam_dict, filename, out_dir, apply_cam_func=None):
-    sub_dir = os.path.join(out_dir, "surface_lic")
-    os.makedirs(sub_dir, exist_ok=True)
-    # Surface LIC is built-in and renders fine without an explicit plugin load in this
-    # ParaView version - the load call previously just produced a harmless but noisy warning.
+ALL_STAGES = ["contours", "streamlines", "graphs", "movies", "slices", "lic", "iso"]
+ALL_VIEWS = ["top", "side", "front"]
+ALL_FIELDS = ["velocity", "static_pressure", "total_pressure"]
 
-    disp = Show(source, view)
-    disp.SetRepresentationType('Surface LIC')
-    ColorBy(disp, ('POINTS', FIELDS["total_pressure"]))
-    ctf = apply_color_preset(view, FIELDS["total_pressure"])
-    disp.SetScalarBarVisibility(view, True)
 
-    if apply_cam_func:
-        apply_cam_func(view, cam_dict)
-    else:
-        apply_perspective_camera(view, cam_dict)
+def stage_contours(car, fluid, view, out, name, opt):
+    apply_camera(view, CAM_ISO)
+    save_contour(car, view, FIELDS["static_pressure"], f"{name}_iso_static.png", out)
+    save_contour(car, view, FIELDS["total_pressure"], f"{name}_iso_total.png", out)
+    apply_camera(view, CAM_UNDERSIDE_ISO)
+    save_contour(car, view, FIELDS["static_pressure"], f"{name}_under_static.png", out)
+    save_contour(car, view, FIELDS["total_pressure"], f"{name}_under_total.png", out)
 
-    Render()
-    SaveScreenshot(os.path.join(sub_dir, filename), view, ImageResolution=IMG_SIZE)
-    GetScalarBar(ctf, view).Visibility = 0
-    Hide(source, view)
+
+def stage_streamlines(car, fluid, view, out, name, opt):
+    apply_camera(view, CAM_ISO)
+    save_streamlines(fluid, car, view, FIELDS["static_pressure"], f"{name}_iso_sl_static.png", out)
+    save_streamlines(fluid, car, view, FIELDS["velocity"], f"{name}_iso_sl_velocity.png", out)
+    apply_camera(view, CAM_UNDERSIDE_ISO)
+    save_streamlines(fluid, car, view, FIELDS["static_pressure"], f"{name}_under_sl_static.png", out)
+    save_streamlines(fluid, car, view, FIELDS["velocity"], f"{name}_under_sl_velocity.png", out)
+
+
+def stage_graphs(car, fluid, view, out, name, opt):
+    save_centerline_graph(fluid, out, name)
+    save_spanwise_graphs(fluid, out, name)
+
+
+def stage_movies(car, fluid, view, out, name, opt):
+    for fk in opt["fields"]:
+        for vn in opt["views"]:
+            print(f"    movie: {fk} / {vn}")
+            make_sweep_movie(fluid, vn, view, FIELDS[fk], WASH_BOUNDS, out, name, fk)
+
+
+def stage_slices(car, fluid, view, out, name, opt):
+    for fk in opt["fields"]:
+        for vn in opt["views"]:
+            print(f"    slice deck: {fk} / {vn}")
+            make_slice_deck(fluid, vn, view, FIELDS[fk], WASH_BOUNDS, out, name, fk)
+
+
+def stage_lic(car, fluid, view, out, name, opt):
+    save_surface_lic(car, view, CAM_ISO, f"{name}_iso_lic.png", out)
+    save_surface_lic(car, view, CAM_UNDERSIDE_ISO, f"{name}_under_lic.png", out)
+
+
+def stage_iso(car, fluid, view, out, name, opt):
+    save_isosurface(fluid, car, view, CAM_ISO, f"{name}_iso_qcrit.png", out)
+    save_isosurface(fluid, car, view, CAM_UNDERSIDE_ISO, f"{name}_under_qcrit.png", out)
+
+
+STAGE_FUNCS = {
+    "contours": stage_contours,
+    "streamlines": stage_streamlines,
+    "graphs": stage_graphs,
+    "movies": stage_movies,
+    "slices": stage_slices,
+    "lic": stage_lic,
+    "iso": stage_iso,
+}
 
 
 # ============================================================
-# MAIN PER-CASE PIPELINE
+# MAIN
 # ============================================================
-def process_case(case):
-    os.makedirs(case["out"], exist_ok=True)
-    sources = build_pipeline(case["file"])
-    car_source = sources["car"]
-    fluid_source = sources["fluid"]
+def process_case(case, opt):
     name = case["name"]
+    out = case["out"]
+    os.makedirs(out, exist_ok=True)
+    print(f"\n=== {name} ===")
+
+    src = build_pipeline(case["file"])
+    car, fluid = src["car"], src["fluid"]
+
+    if opt["probe_only"]:
+        print("  [probe-only] pipeline resolved, stopping before any rendering")
+        Delete(car)
+        Delete(fluid)
+        return
 
     view = GetActiveViewOrCreate('RenderView')
-    view.ViewSize = IMG_SIZE  # needed for correct legend font scaling
+    view.ViewSize = IMG_SIZE
 
-    # --- 1-2: contours (car surface, static + total pressure - velocity omitted, no-slip means it's ~0 on the surface) ---
-    apply_perspective_camera(view, CAM_ISO)
-    save_contour(car_source, view, FIELDS["static_pressure"], f"{name}_iso_pressure.png", case["out"])
-    save_contour(car_source, view, FIELDS["total_pressure"], f"{name}_iso_total_pressure.png", case["out"])
+    stages = opt["stages"]
+    for i, s in enumerate(stages, 1):
+        print(f"  [{i}/{len(stages)}] {s}")
+        t0 = datetime.datetime.now()
+        STAGE_FUNCS[s](car, fluid, view, out, name, opt)
+        dt = (datetime.datetime.now() - t0).total_seconds()
+        print(f"      {s} took {dt:.1f}s")
 
-    apply_perspective_camera(view, CAM_UNDERSIDE_ISO)
-    save_contour(car_source, view, FIELDS["static_pressure"], f"{name}_under_pressure.png", case["out"])
-    save_contour(car_source, view, FIELDS["total_pressure"], f"{name}_under_total_pressure.png", case["out"])
+    Delete(car)
+    Delete(fluid)
+    print(f"=== done: {name} ===")
 
-    # --- 5: centerline graph (fluid domain, so points off the surface still sample real data) ---
-    save_centerline_graph(fluid_source, case["out"], name)
 
-    # --- 6-9: streamlines (fluid domain - car surface has ~0 velocity at the wall) ---
-    apply_perspective_camera(view, CAM_ISO)
-    save_streamlines(fluid_source, car_source, view, FIELDS["static_pressure"],
-                      f"{name}_iso_streamlines_pressure.png", case["out"])
-    save_streamlines(fluid_source, car_source, view, FIELDS["velocity"],
-                      f"{name}_iso_streamlines_velocity.png", case["out"])
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="batch_postprocess",
+        description="ParaView batch post-processing for FSAE aero CFD.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # just check the block selectors resolve, render nothing
+  pvpython %(prog)s.py --probe-only
 
-    apply_perspective_camera(view, CAM_UNDERSIDE_ISO)
-    save_streamlines(fluid_source, car_source, view, FIELDS["static_pressure"],
-                      f"{name}_under_streamlines_pressure.png", case["out"])
-    save_streamlines(fluid_source, car_source, view, FIELDS["velocity"],
-                      f"{name}_under_streamlines_velocity.png", case["out"])
+  # one movie, one field, one view, low res, few frames (fast smoke test)
+  pvpython %(prog)s.py --stage movies --fields static_pressure --views side \\
+                       --frames 10 --resolution 1280 720
 
-    # --- 10: sweeping movies (fluid domain, velocity/static/total pressure x bottom/side/front) ---
-    for field_key in ["velocity", "static_pressure", "total_pressure"]:
-        for view_name in ["top", "side", "front"]:
-            make_sweep_movie_native(fluid_source, view_name, view, FIELDS[field_key],
-                                     WASH_BOUNDS, case["out"], name, field_key)
+  # contours only
+  pvpython %(prog)s.py --stage contours
 
-    # --- 11: 50mm slice decks (fluid domain) ---
-    for field_key in ["velocity", "static_pressure", "total_pressure"]:
-        for view_name in ["top", "side", "front"]:
-            make_slice_deck(fluid_source, view_name, view, FIELDS[field_key], WASH_BOUNDS, case["out"], name, field_key)
+  # everything except the slow stuff
+  pvpython %(prog)s.py --stage contours streamlines graphs lic iso
 
-    # --- 12: spanwise pressure graphs (fluid domain) ---
-    make_spanwise_pressure_graphs(fluid_source, case["out"], name)
-
-    # --- 13: surface LIC streamlines (car surface) ---
-    apply_perspective_camera(view, CAM_ISO)
-    save_surface_lic(car_source, view, CAM_ISO, f"{name}_iso_surface_lic.png", case["out"])
-    save_surface_lic(car_source, view, CAM_UNDERSIDE_ISO, f"{name}_under_surface_lic.png", case["out"])
-
-    # --- 14: Q-criterion isosurfaces (vortex structures / drag source locator) ---
-    save_isosurface(fluid_source, car_source, view, CAM_ISO, f"{name}_iso_qcriterion.png", case["out"])
-    save_isosurface(fluid_source, car_source, view, CAM_UNDERSIDE_ISO, f"{name}_under_qcriterion.png", case["out"])
-
-    Delete(car_source)
-    Delete(fluid_source)
-    print(f"Done: {name}")
+  # full run
+  pvpython %(prog)s.py --stage all
+""")
+    p.add_argument("--stage", nargs="+", default=["all"],
+                   choices=ALL_STAGES + ["all"],
+                   help="which stage(s) to run (default: all)")
+    p.add_argument("--views", nargs="+", default=ALL_VIEWS, choices=ALL_VIEWS,
+                   help="limit movies/slices to these views (default: all three)")
+    p.add_argument("--fields", nargs="+", default=ALL_FIELDS, choices=ALL_FIELDS,
+                   help="limit movies/slices to these fields (default: all three)")
+    p.add_argument("--case", nargs="+", default=None,
+                   help="only run cases with these names (default: all in CASES)")
+    p.add_argument("--frames", type=int, default=None,
+                   help=f"override sweep frame count (default {N_SWEEP_FRAMES})")
+    p.add_argument("--fps", type=int, default=None,
+                   help=f"override movie framerate (default {MOVIE_FRAMERATE})")
+    p.add_argument("--slice-step", type=float, default=None,
+                   help=f"override slice spacing in metres (default {SLICE_STEP})")
+    p.add_argument("--resolution", nargs=2, type=int, metavar=("W", "H"), default=None,
+                   help=f"override output resolution (default {IMG_SIZE[0]} {IMG_SIZE[1]})")
+    p.add_argument("--probe-only", action="store_true",
+                   help="resolve block selectors and exit without rendering")
+    p.add_argument("--list-stages", action="store_true",
+                   help="print available stages and exit")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    for case in CASES:
-        process_case(case)
+    args = parse_args()
+
+    if args.list_stages:
+        print("stages:")
+        for s in ALL_STAGES:
+            print(f"  {s}")
+        sys.exit(0)
+
+    # apply overrides to module-level settings
+    if args.frames is not None:
+        N_SWEEP_FRAMES = args.frames
+    if args.fps is not None:
+        MOVIE_FRAMERATE = args.fps
+    if args.slice_step is not None:
+        SLICE_STEP = args.slice_step
+    if args.resolution is not None:
+        IMG_SIZE = list(args.resolution)
+
+    stages = ALL_STAGES if "all" in args.stage else [s for s in ALL_STAGES if s in args.stage]
+
+    opt = {
+        "stages": stages,
+        "views": [v for v in ALL_VIEWS if v in args.views],
+        "fields": [f for f in ALL_FIELDS if f in args.fields],
+        "probe_only": args.probe_only,
+    }
+
+    cases = CASES if args.case is None else [c for c in CASES if c["name"] in args.case]
+    if not cases:
+        print(f"!! no cases matched {args.case}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"batch_postprocess version {SCRIPT_VERSION}")
+    print(f"started {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+    try:
+        print(f"ParaView {GetParaViewVersion()}")
+    except Exception:
+        pass
+    print(f"stages     : {', '.join(stages) if not args.probe_only else '(probe only)'}")
+    print(f"views      : {', '.join(opt['views'])}")
+    print(f"fields     : {', '.join(opt['fields'])}")
+    print(f"resolution : {IMG_SIZE[0]}x{IMG_SIZE[1]}")
+    print(f"frames/fps : {N_SWEEP_FRAMES} @ {MOVIE_FRAMERATE}")
+    print(f"slice step : {SLICE_STEP} m")
+    print(f"cases      : {', '.join(c['name'] for c in cases)}")
+
+    run_start = datetime.datetime.now()
+    for case in cases:
+        try:
+            process_case(case, opt)
+        except Exception as e:
+            print(f"!! {case['name']} failed: {e}", file=sys.stderr)
+            raise
+    print(f"\ntotal runtime {(datetime.datetime.now() - run_start).total_seconds():.1f}s")
