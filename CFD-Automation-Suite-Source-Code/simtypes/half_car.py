@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 
 from utils.fluent_log import FluentLogCapture
+from utils.naming import RunIdentity
 from utils.refinement import refinement_boxes, WHEEL_BOX_SIZE, WHEEL_BOX_RATIOS
 
 NAME = "Half Car"
@@ -32,6 +33,10 @@ AIR_DENSITY = 1.225          # kg/m^3
 # Passed to Fluent as -mpi=<type>. "default" omits the flag entirely.
 MPI_TYPES = ["intel", "openmpi", "msmpi", "default"]
 
+# Seconds to wait for Fluent to come up. Parallel start-up on a busy node can
+# be slow; beyond this it is hung rather than slow.
+FLUENT_START_TIMEOUT = 300
+
 
 # =============================================================================
 #  NAMED SELECTIONS
@@ -40,27 +45,31 @@ MPI_TYPES = ["intel", "openmpi", "msmpi", "default"]
 # =============================================================================
 
 NAMED_SELECTIONS = {
-    # label            (boundary type,     description)
-    "inlet":           ("velocity-inlet",  "Domain inlet, upstream face"),
-    "outlet":          ("pressure-outlet", "Domain outlet, downstream face"),
-    "walls":           ("wall, slip",      "Far-field tunnel walls, zero shear"),
-    "ground":          ("wall, moving",    "Ground plane, translating at car speed"),
-    "symmetry":        ("symmetry",        "Symmetry plane at z = 0"),
+    # label            (boundary type,     required, description)
+    "inlet":           ("velocity-inlet",  True,  "Domain inlet, upstream face"),
+    "outlet":          ("pressure-outlet", True,  "Domain outlet, downstream face"),
+    "walls":           ("wall, slip",      True,  "Far-field tunnel walls, zero shear"),
+    "ground":          ("wall, moving",    True,  "Ground plane, translating at car speed"),
+    "symmetry":        ("symmetry",        True,  "Symmetry plane at z = 0"),
 
-    "frontwing":       ("wall",            "Front wing, all elements"),
-    "rearwing":        ("wall",            "Rear wing, all elements"),
-    "undertray":       ("wall",            "Undertray and diffuser"),
-    "chassis":         ("wall",            "Chassis, nose and body"),
-    "sidepod":         ("wall",            "Sidepod, optional"),
+    "frontwing":       ("wall",            True,  "Front wing, all elements"),
+    "rearwing":        ("wall",            True,  "Rear wing, all elements"),
+    "undertray":       ("wall",            True,  "Undertray and diffuser"),
+    "chassis":         ("wall",            True,  "Chassis, nose and body"),
+    "sidepod":         ("wall",            False, "Sidepod, only in some geometries"),
 
-    "fw":              ("wall, rotating",  "Front wheel"),
-    "fwb":             ("wall, rotating",  "Front wheel block"),
-    "rw":              ("wall, rotating",  "Rear wheel"),
-    "rwb":             ("wall, rotating",  "Rear wheel block"),
+    "fw":              ("wall, rotating",  True,  "Front wheel"),
+    "fwb":             ("wall, rotating",  True,  "Front wheel block"),
+    "rw":              ("wall, rotating",  True,  "Rear wheel"),
+    "rwb":             ("wall, rotating",  True,  "Rear wheel block"),
 
-    "front-suspension": ("wall",           "Front suspension members, optional"),
-    "rear-suspension":  ("wall",           "Rear suspension members, optional"),
+    "front-suspension": ("wall",           False, "Front suspension members"),
+    "rear-suspension":  ("wall",           False, "Rear suspension members"),
 }
+
+# Labels the simulation cannot run correctly without.
+REQUIRED_LABELS = [name for name, (_, required, _d)
+                   in NAMED_SELECTIONS.items() if required]
 
 AERO       = ["frontwing", "rearwing", "undertray"]
 BODY       = ["chassis", "sidepod"]
@@ -121,11 +130,18 @@ REPORT_DEFINITIONS = {
 
 @dataclass
 class Settings:
-    # ── Identity and paths ───────────────────────────────────────────────
-    name:          str = "Half Car Sim"
+    # ── Identity ─────────────────────────────────────────────────────────
+    # Project / Run / MAP match the CFD Rolling Report workbook, so a run's
+    # folder name is the same string as its Master Log Point ID.
+    project:    str = ""
+    run:        str = ""
+    map_number: int = 1
+    description: str = ""       # free text, copied into the results file
+
+    # Where the Project/Run/MAP tree is created. Set once under Settings.
+    output_root: str = ""
+
     geometry_path: str = ""
-    output_dir:    str = ""
-    results_dir:   str = ""
 
     # Point this at an existing .msh.h5 to skip meshing entirely.
     existing_mesh: str = ""
@@ -140,7 +156,10 @@ class Settings:
     speed_mph: float = 40.0
 
     # ── Fluent session ───────────────────────────────────────────────────
-    processes:        int  = 40
+    # Defaults to the cores this machine actually has, capped at 40. A count
+    # above the physical core count stalls Fluent during parallel start-up.
+    processes:        int  = field(
+        default_factory=lambda: min(40, max(1, (os.cpu_count() or 4))))
     double_precision: bool = True
 
     # MPI implementation. intel suits the Xeon Gold nodes; openmpi is the
@@ -175,6 +194,26 @@ class Settings:
 
     # ── Derived ──────────────────────────────────────────────────────────
     @property
+    def identity(self) -> RunIdentity:
+        return RunIdentity(project=self.project, run=self.run,
+                           map_number=self.map_number, root=self.output_root)
+
+    @property
+    def name(self) -> str:
+        """Point ID, e.g. R018-MAP01. Used for every file this run writes."""
+        return self.identity.point_id
+
+    @property
+    def output_dir(self) -> str:
+        """<root>/<project>/<run>/<point id>"""
+        return self.identity.map_dir
+
+    @property
+    def results_dir(self) -> str:
+        """Results sit beside the case files."""
+        return self.output_dir
+
+    @property
     def speed_ms(self) -> float:
         return self.speed_mph * MPH_TO_MS
 
@@ -189,26 +228,184 @@ class Settings:
 
     def validate(self) -> list:
         """Return a list of problems, empty if the settings are usable."""
-        problems = []
-        if not self.name.strip():
-            problems.append("Simulation name is empty")
+        problems = list(self.identity.validate())
         if not self.existing_mesh and not self.geometry_path:
             problems.append("No geometry file and no existing mesh")
         if self.geometry_path and not self.geometry_path.lower().endswith(
                 (".pmdb", ".dsco")):
             problems.append("Geometry must be .pmdb or .dsco")
-        if not self.output_dir:
-            problems.append("No output directory")
         if self.speed_mph <= 0:
             problems.append("Speed must be greater than zero")
         if self.processes < 1:
             problems.append("Process count must be at least 1")
+        available = os.cpu_count() or 1
+        if self.processes > available:
+            problems.append(
+                f"{self.processes} processes requested but this machine has "
+                f"{available} cores. Fluent will stall during parallel "
+                f"start-up.")
         if self.mpi_type not in MPI_TYPES:
             problems.append(
                 f"MPI type must be one of {', '.join(MPI_TYPES)}")
         if self.surface_min >= self.surface_max:
             problems.append("Surface min size must be below max size")
         return problems
+
+
+
+
+# =============================================================================
+#  NAMED SELECTION HANDLING
+# =============================================================================
+
+def _available_labels(workflow, log) -> list:
+    """
+    The face labels the imported geometry actually defines.
+
+    Returns an empty list if Fluent will not report them, in which case the
+    caller passes its labels through unfiltered rather than guessing.
+    """
+    try:
+        task = workflow.TaskObject["Add Local Sizing"]
+    except Exception:
+        return []
+
+    for attempt in (
+        lambda: task.Arguments.get_attr("BOIFaceLabelList/allowedValues"),
+        lambda: task.Arguments.getAttribValue("BOIFaceLabelList/allowedValues"),
+        lambda: task.Arguments["BOIFaceLabelList"].get_attr("allowedValues"),
+    ):
+        try:
+            values = attempt()
+            if values:
+                return sorted(str(v) for v in values)
+        except Exception:
+            continue
+
+    log.debug("  Could not query the geometry's labels")
+    return []
+
+
+def _filter(labels: list, available: list, purpose: str, log) -> list:
+    """
+    Keep only labels the geometry defines.
+
+    Passing a label Fluent does not know rejects the whole control, so an
+    optional selection that is absent would otherwise take the required ones
+    down with it.
+    """
+    if not available:
+        return labels                       # unknown, so change nothing
+
+    kept = [l for l in labels if l in available]
+    missing = [l for l in labels if l not in available]
+    if missing:
+        log.info(f"    {purpose}: skipping absent {missing}")
+    return kept
+
+
+def check_named_selections(workflow, log) -> list:
+    """
+    Report which named selections the geometry provides, straight after
+    import. Returns the missing required ones.
+    """
+    available = _available_labels(workflow, log)
+    if not available:
+        log.warning("  Could not read the geometry's named selections; "
+                    "continuing without checking them")
+        return []
+
+    log.info(f"  Geometry defines {len(available)} labels: {available}")
+
+    missing_required = []
+    missing_optional = []
+    for name, (_type, required, _desc) in NAMED_SELECTIONS.items():
+        if name in available:
+            continue
+        (missing_required if required else missing_optional).append(name)
+
+    if missing_optional:
+        log.info(f"  Optional labels not present: {missing_optional}")
+
+    if missing_required:
+        log.error(f"  MISSING REQUIRED LABELS: {missing_required}")
+        log.error("  Add these named selections in Ansys Discovery and "
+                  "re-export the .pmdb. The mesh will be wrong without them.")
+
+    unexpected = [l for l in available
+                  if l not in NAMED_SELECTIONS
+                  and not l.startswith("enclosure")]
+    if unexpected:
+        log.info(f"  Labels in the geometry the suite does not use: "
+                 f"{unexpected}")
+
+    return missing_required
+
+
+# =============================================================================
+#  FLUENT LAUNCH
+# =============================================================================
+
+def _launch(mode: str, s: Settings, log):
+    """
+    Start Fluent and report exactly what was requested.
+
+    A run that appears to hang with no CPU activity is almost always a launch
+    problem rather than a meshing problem, so the arguments, the core count
+    and the MPI choice are all logged before the call and the connection is
+    confirmed afterwards.
+    """
+    import ansys.fluent.core as pyfluent
+
+    available = os.cpu_count() or 1
+    requested = int(s.processes)
+
+    if requested > available:
+        log.warning(
+            f"  {requested} processes requested but this machine reports "
+            f"{available} cores.")
+        log.warning(
+            f"  Fluent may fail to start or stall during parallel setup. "
+            f"Lower the process count on the General tab.")
+
+    args = dict(
+        mode=mode,
+        processor_count=requested,
+        precision="double" if s.double_precision else "single",
+        product_version="26.1",
+        cleanup_on_exit=True,
+        start_timeout=FLUENT_START_TIMEOUT,
+    )
+    if s.mpi_type and s.mpi_type != "default":
+        args["additional_arguments"] = f"-mpi={s.mpi_type}"
+
+    log.info(f"  mode           {mode}")
+    log.info(f"  processes      {requested}  (machine has {available} cores)")
+    log.info(f"  precision      {args['precision']}")
+    log.info(f"  mpi            {s.mpi_type}")
+    log.info(f"  extra args     {args.get('additional_arguments', '(none)')}")
+    log.info(f"  start timeout  {FLUENT_START_TIMEOUT}s")
+    log.info(f"  AWP_ROOT261    {os.environ.get('AWP_ROOT261', 'NOT SET')}")
+
+    started = time.time()
+    session = pyfluent.launch_fluent(**args)
+    log.info(f"  Fluent connected in {time.time() - started:.1f}s")
+
+    # Confirm the session really is parallel. A silent fall back to serial is
+    # the usual reason a run appears to hang with one core busy and the rest
+    # idle.
+    try:
+        actual = session.scheme_eval.scheme_eval("(rpgetvar 'parallel/nprocs)")
+        log.info(f"  Fluent reports  {actual} compute node(s)")
+        if requested > 1 and str(actual).strip() in ("1", "1.0"):
+            log.warning(
+                f"  Fluent started SERIAL despite requesting {requested} "
+                f"processes. Check the MPI type: intel needs Intel MPI "
+                f"installed, msmpi is the usual Windows fallback.")
+    except Exception as exc:
+        log.debug(f"  Could not read node count: {exc}")
+
+    return session
 
 
 # =============================================================================
@@ -223,8 +420,6 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
     `control` lets the queue stop the run: step() checks it, and the session
     is registered so it can be forced down mid-call.
     """
-    import ansys.fluent.core as pyfluent
-
     def step(pct, msg):
         if control:
             control.check()
@@ -237,17 +432,7 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
 
     step(0, f"Launching Fluent Meshing "
             f"({s.processes} processes, {s.mpi_type} MPI)")
-    launch_args = dict(
-        mode="meshing",
-        processor_count=s.processes,
-        precision="double" if s.double_precision else "single",
-        product_version="26.1",
-        cleanup_on_exit=True,
-    )
-    if s.mpi_type and s.mpi_type != "default":
-        launch_args["additional_arguments"] = f"-mpi={s.mpi_type}"
-
-    session = pyfluent.launch_fluent(**launch_args)
+    session = _launch("meshing", s, log)
     if control:
         control.register(session)
 
@@ -270,6 +455,18 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
             "LengthUnit": "m",
         }
         workflow.TaskObject["Import Geometry"].Execute()
+
+        # ── Named selections ──────────────────────────────────────────────
+        # Checked here, immediately after import, so a geometry missing a
+        # label fails in seconds rather than after an hour of meshing.
+        step(8, "Checking named selections")
+        missing = check_named_selections(workflow, log)
+        if missing:
+            raise RuntimeError(
+                "Geometry is missing required named selections: "
+                + ", ".join(missing)
+                + ". Add them in Ansys Discovery and re-export the .pmdb.")
+        available = _available_labels(workflow, log)
 
         # ── Local refinement regions ──────────────────────────────────────
         step(12, "Creating refinement regions")
@@ -300,9 +497,15 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
         # Wheel boxes are sized relative to the wheel body, so they need the
         # wheel labels rather than coordinates.
         for region_name, labels in (
-            ("local-refinement-frontwheel", FRONT_WHEEL),
-            ("local-refinement-rearwheel",  REAR_WHEEL),
+            ("local-refinement-frontwheel",
+             _filter(FRONT_WHEEL, available, "front wheel box", log)),
+            ("local-refinement-rearwheel",
+             _filter(REAR_WHEEL, available, "rear wheel box", log)),
         ):
+            if not labels:
+                log.warning(f"  {region_name}: no wheel labels present, "
+                            f"skipped")
+                continue
             refine.Arguments.set_state({
                 "RefinementRegionsName": region_name,
                 "CreationMethod":        "Box",
@@ -329,7 +532,8 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
             "AddChild": "yes",
             "BOIControlName": "curvature_stuff",
             "BOIExecution": "Curvature",
-            "BOIFaceLabelList": BODY + FRONT_SUS + REAR_SUS,
+            "BOIFaceLabelList": _filter(BODY + FRONT_SUS + REAR_SUS,
+                                        available, "curvature_stuff", log),
             "BOIZoneorLabel": "label",
             "BOIScopeTo": "faces and edges",
             "BOICurvatureNormalAngle": 12,
@@ -345,7 +549,8 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
             "AddChild": "yes",
             "BOIControlName": "curvature_aero",
             "BOIExecution": "Curvature",
-            "BOIFaceLabelList": AERO,
+            "BOIFaceLabelList": _filter(AERO, available,
+                                        "curvature_aero", log),
             "BOIZoneorLabel": "label",
             "BOIScopeTo": "faces and edges",
             "BOICurvatureNormalAngle": 9,
@@ -361,7 +566,8 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
             "AddChild": "yes",
             "BOIControlName": "curvature_wheels",
             "BOIExecution": "Curvature",
-            "BOIFaceLabelList": FRONT_WHEEL + REAR_WHEEL,
+            "BOIFaceLabelList": _filter(FRONT_WHEEL + REAR_WHEEL,
+                                        available, "curvature_wheels", log),
             "BOIZoneorLabel": "label",
             "BOIScopeTo": "faces",          # faces only, not edges
             "BOICurvatureNormalAngle": 18,
@@ -420,7 +626,8 @@ def mesh(s: Settings, log, progress=None, control=None) -> str:
             "FirstHeight": s.bl_first_height,
             "FaceScope": {"GrowOn": "selected-zones"},
             "LocalPrismPreferences": {"Continuous": "Continuous"},
-            "ZoneSelectionList": AERO + ["ground"],
+            "ZoneSelectionList": _filter(AERO + ["ground"], available,
+                                         "boundary layers", log),
         })
         workflow.TaskObject["Add Boundary Layers"].AddChildAndUpdate(
             DeferUpdate=False, RetainValues=True
@@ -479,8 +686,6 @@ def solve(s: Settings, mesh_file: str, log, progress=None,
     `control` lets the queue stop the run: step() checks it, and the session
     is registered so it can be forced down mid-iteration.
     """
-    import ansys.fluent.core as pyfluent
-
     def step(pct, msg):
         if control:
             control.check()
@@ -490,17 +695,7 @@ def solve(s: Settings, mesh_file: str, log, progress=None,
 
     step(0, f"Launching Fluent solver "
             f"({s.processes} processes, {s.mpi_type} MPI)")
-    launch_args = dict(
-        mode="solver",
-        processor_count=s.processes,
-        precision="double" if s.double_precision else "single",
-        product_version="26.1",
-        cleanup_on_exit=True,
-    )
-    if s.mpi_type and s.mpi_type != "default":
-        launch_args["additional_arguments"] = f"-mpi={s.mpi_type}"
-
-    session = pyfluent.launch_fluent(**launch_args)
+    session = _launch("solver", s, log)
     if control:
         control.register(session)
 
@@ -615,19 +810,45 @@ def _boundary_conditions(session, s: Settings, log) -> None:
     """Inlet, outlet, ground, far-field walls and rotating wheels."""
     bc = session.settings.setup.boundary_conditions
 
+    # What the mesh actually contains. A boundary condition applied to a
+    # zone that is not there raises, so each is checked first and reported
+    # rather than taking the whole run down.
+    try:
+        walls = list(bc.wall.keys())
+    except Exception:
+        walls = []
+    log.info(f"  mesh has {len(walls)} wall zone(s)")
+
     # Inlet
-    inlet = bc.velocity_inlet["inlet"]
-    inlet.momentum.velocity_magnitude.value = s.speed_ms
-    inlet.turbulence.turbulent_intensity = 0.01
-    inlet.turbulence.turbulent_viscosity_ratio = 1.0
-    log.info(f"  inlet          {s.speed_ms:.3f} m/s")
+    try:
+        inlet = bc.velocity_inlet["inlet"]
+        inlet.momentum.velocity_magnitude.value = s.speed_ms
+        inlet.turbulence.turbulent_intensity = 0.01
+        inlet.turbulence.turbulent_viscosity_ratio = 1.0
+        log.info(f"  inlet          {s.speed_ms:.3f} m/s")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not set the inlet boundary condition: {exc}. "
+            f"The mesh must contain a velocity-inlet zone named 'inlet'."
+        ) from exc
 
     # Outlet
-    bc.pressure_outlet["outlet"].momentum.gauge_pressure.value = 0.0
-    log.info("  outlet         0 Pa gauge")
+    try:
+        bc.pressure_outlet["outlet"].momentum.gauge_pressure.value = 0.0
+        log.info("  outlet         0 Pa gauge")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not set the outlet boundary condition: {exc}. "
+            f"The mesh must contain a pressure-outlet zone named 'outlet'."
+        ) from exc
 
     # Ground: moving wall, translational along +X, relative to the adjacent
-    # cell zone.
+    # cell zone. Without it the floor is stationary and the underbody flow is
+    # wrong, so a missing ground stops the run.
+    if "ground" not in walls and walls:
+        raise RuntimeError(
+            "The mesh has no wall zone named 'ground'. Without a moving "
+            "ground the underbody flow is invalid.")
     ground = bc.wall["ground"]
     ground.momentum.wall_motion = "Moving Wall"
     ground.momentum.relative = True
@@ -649,6 +870,8 @@ def _boundary_conditions(session, s: Settings, log) -> None:
         log.info("  walls          specified zero shear, slip")
     except Exception as exc:
         log.warning(f"  walls: {exc}")
+        log.warning("  Far-field walls are no-slip; a boundary layer will "
+                    "grow on them and inflate drag.")
 
     # Rotating wheels. Moving wall, absolute, rotational about the axle.
     omega = s.wheel_omega
@@ -656,7 +879,12 @@ def _boundary_conditions(session, s: Settings, log) -> None:
         (FRONT_WHEEL, s.front_wheel_origin, "front"),
         (REAR_WHEEL,  s.rear_wheel_origin,  "rear"),
     ):
-        for label in labels:
+        present = [l for l in labels if not walls or l in walls]
+        if not present:
+            log.warning(f"  {corner} wheel: none of {labels} are in the mesh, "
+                        f"so it will not rotate")
+            continue
+        for label in present:
             try:
                 wall = bc.wall[label]
                 wall.momentum.wall_motion = "Moving Wall"
@@ -896,6 +1124,12 @@ def run(s: Settings, log, progress=None, control=None) -> dict:
     `control` is supplied by the queue and allows the run to be stopped.
     """
     started = time.time()
+
+    # Create <root>/<project>/<run>/<point id> up front so mesh, case files,
+    # EnSight export and the results file all land together.
+    s.identity.create_dirs()
+    log.info(f"Point ID   {s.name}")
+    log.info(f"Folder     {s.output_dir}")
 
     if s.existing_mesh:
         if not os.path.isfile(s.existing_mesh):
