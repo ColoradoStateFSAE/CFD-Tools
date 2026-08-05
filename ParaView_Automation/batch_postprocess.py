@@ -1,17 +1,8 @@
 # ============================================================================
 # batch_postprocess.py
-# VERSION: 2026-08-05_0207
+# VERSION: 2026-08-05_0247
 # ============================================================================
 # Written fresh against a confirmed ParaView 6.2.0-RC1 GUI trace.
-#
-# WHY THE PREVIOUS VERSION BROKE:
-#   ParaView changed from 6.1.1 to 6.2.0-RC1. Block selector names changed:
-#       6.1.1  ->  /Root/enclosureenclosure11
-#       6.2.0  ->  /Root/enclosure-enclosure11     (hyphen added)
-#   ExtractBlock does NOT error on a bad selector, it just returns 0 cells,
-#   so everything downstream silently rendered blank. This script now probes
-#   candidate selector strings at runtime and uses whichever actually returns
-#   cells, so a future rename cannot silently break it again.
 #
 # Run with:   pvpython batch_postprocess_2026-08-05_0202.py
 # Headless:   pvbatch --mesa batch_postprocess_2026-08-05_0202.py
@@ -20,12 +11,14 @@
 from paraview.simple import *
 import os
 import sys
+import shutil
 import argparse
+import subprocess
 import datetime
 
 paraview.simple._DisableFirstRenderCameraReset()
 
-SCRIPT_VERSION = "2026-08-05_0207"
+SCRIPT_VERSION = "2026-08-05_0247"
 
 # ============================================================
 # CASES
@@ -96,6 +89,56 @@ N_SWEEP_FRAMES = 120        # 5 seconds at 24fps
 MOVIE_FRAMERATE = 24
 MOVIE_BITRATE = 10000000
 SLICE_STEP = 0.05           # 50mm
+
+# ============================================================
+# MOVIE ENCODER BACKENDS
+#
+# 'paraview' uses vtkMP4Writer (Windows Media Foundation). Two hard limits:
+#   1. H.264 encodes in 16x16 macroblocks, so BOTH dimensions must be
+#      divisible by 16. 1920x1080 FAILS because 1080/16 = 67.5. The standard
+#      padded height is 1088. 1280x720 works because both divide cleanly.
+#   2. It will not initialize above roughly 1920x1088 in an offscreen
+#      pvpython process, so true 4K movies are not possible on this path.
+#
+# 'ffmpeg' renders PNG frames at full resolution and encodes them externally.
+# No macroblock or dimension limits, so 4K movies work. Requires ffmpeg on
+# PATH (see README for install instructions).
+#
+# 'auto' (default) picks ffmpeg when it is available and the requested size
+# exceeds what vtkMP4Writer can handle, otherwise uses ParaView directly.
+# ============================================================
+MOVIE_ENCODER = "auto"          # auto | paraview | ffmpeg
+FFMPEG_PATH = "ffmpeg"          # or a full path like r"C:\ffmpeg\bin\ffmpeg.exe"
+FFMPEG_CRF = 18                 # 0 lossless, 18 visually lossless, 23 default
+FFMPEG_PRESET = "medium"        # ultrafast..veryslow, slower = smaller file
+KEEP_FRAMES = False             # keep the PNG frames after encoding
+MACROBLOCK = 16
+MP4_MAX_WIDTH = 1920
+MP4_MAX_HEIGHT = 1088
+
+
+def ffmpeg_available():
+    if os.path.isabs(FFMPEG_PATH):
+        return os.path.exists(FFMPEG_PATH)
+    return shutil.which(FFMPEG_PATH) is not None
+
+
+def snap_to_macroblock(size):
+    """Round each dimension up to the next multiple of 16 for H.264."""
+    return [((v + MACROBLOCK - 1) // MACROBLOCK) * MACROBLOCK for v in size]
+
+
+def within_mp4_writer_limits(size):
+    return size[0] <= MP4_MAX_WIDTH and size[1] <= MP4_MAX_HEIGHT
+
+
+def choose_encoder(size):
+    """Return 'paraview' or 'ffmpeg' for the requested movie resolution."""
+    if MOVIE_ENCODER in ("paraview", "ffmpeg"):
+        return MOVIE_ENCODER
+    if within_mp4_writer_limits(snap_to_macroblock(size)) or not ffmpeg_available():
+        return "paraview"
+    return "ffmpeg"
 
 # ============================================================
 # CAMERAS (from .pvcc state files, perspective projection)
@@ -433,16 +476,86 @@ def make_sweep_movie(fluid, view_name, view, field, bounds, out_dir, name, field
                   Mode='Interpolate Camera', Interpolation='Spline',
                   KeyFrames=[ckf0, ckf1], DataSource=None)
 
-    out_path = os.path.join(d, f"{name}_{view_name}_{field_key}.mp4").replace("\\", "/")
-    SaveAnimation(filename=out_path, viewOrLayout=view,
-                  ImageResolution=IMG_SIZE,
-                  FrameRate=MOVIE_FRAMERATE,
-                  FrameStride=1,
-                  FrameWindow=[0, N_SWEEP_FRAMES - 1],
-                  BitRate=MOVIE_BITRATE)
+    stem = f"{name}_{view_name}_{field_key}"
+    encoder = choose_encoder(IMG_SIZE)
 
-    ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
-    print(f"  [movie] {'wrote' if ok else 'FAILED'} {out_path}")
+    if encoder == "paraview":
+        size = snap_to_macroblock(IMG_SIZE)
+        if size != IMG_SIZE:
+            print(f"    [encoder] snapped {IMG_SIZE[0]}x{IMG_SIZE[1]} -> "
+                  f"{size[0]}x{size[1]} (H.264 needs multiples of {MACROBLOCK})")
+        if not within_mp4_writer_limits(size):
+            print(f"    [encoder] WARNING {size[0]}x{size[1]} exceeds the vtkMP4Writer "
+                  f"limit of {MP4_MAX_WIDTH}x{MP4_MAX_HEIGHT}. Install ffmpeg and use "
+                  f"--encoder ffmpeg for this resolution.")
+        out_path = os.path.join(d, f"{stem}.mp4").replace("\\", "/")
+        SaveAnimation(filename=out_path, viewOrLayout=view,
+                      ImageResolution=size,
+                      FrameRate=MOVIE_FRAMERATE,
+                      FrameStride=1,
+                      FrameWindow=[0, N_SWEEP_FRAMES - 1],
+                      BitRate=MOVIE_BITRATE)
+        ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
+        print(f"  [movie] {'wrote' if ok else 'FAILED'} {out_path}")
+
+    else:
+        # Render PNG frames at full requested resolution, then encode with ffmpeg.
+        # No macroblock or dimension limits on this path.
+        frame_dir = os.path.join(d, "frames", stem)
+        os.makedirs(frame_dir, exist_ok=True)
+        for old in os.listdir(frame_dir):
+            if old.endswith(".png"):
+                try:
+                    os.remove(os.path.join(frame_dir, old))
+                except OSError:
+                    pass
+
+        frame_pattern_pv = os.path.join(frame_dir, f"{stem}.png").replace("\\", "/")
+        SaveAnimation(filename=frame_pattern_pv, viewOrLayout=view,
+                      ImageResolution=IMG_SIZE,
+                      FrameRate=MOVIE_FRAMERATE,
+                      FrameStride=1,
+                      FrameWindow=[0, N_SWEEP_FRAMES - 1])
+
+        frames = sorted(f for f in os.listdir(frame_dir) if f.endswith(".png"))
+        if not frames:
+            print(f"  [movie] FAILED no frames written to {frame_dir}")
+        else:
+            # ParaView numbers frames as <stem>.NNNN.png
+            digits = len(frames[0].rsplit(".", 2)[1])
+            in_pattern = os.path.join(frame_dir, f"{stem}.%0{digits}d.png")
+            out_path = os.path.join(d, f"{stem}.mp4")
+            cmd = [FFMPEG_PATH, "-y",
+                   "-framerate", str(MOVIE_FRAMERATE),
+                   "-i", in_pattern,
+                   "-c:v", "libx264",
+                   "-preset", FFMPEG_PRESET,
+                   "-crf", str(FFMPEG_CRF),
+                   "-pix_fmt", "yuv420p",
+                   "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                   out_path]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                size_mb = os.path.getsize(out_path) / 1e6
+                print(f"  [movie] wrote {out_path} ({size_mb:.1f} MB, {len(frames)} frames, ffmpeg)")
+                if not KEEP_FRAMES:
+                    for f in frames:
+                        try:
+                            os.remove(os.path.join(frame_dir, f))
+                        except OSError:
+                            pass
+                    try:
+                        os.rmdir(frame_dir)
+                    except OSError:
+                        pass
+            except FileNotFoundError:
+                print(f"  [movie] ffmpeg not found. Frames kept at {frame_dir}")
+                print(f"          encode manually: ffmpeg -framerate {MOVIE_FRAMERATE} "
+                      f"-i \"{in_pattern}\" -c:v libx264 -crf {FFMPEG_CRF} "
+                      f"-pix_fmt yuv420p \"{out_path}\"")
+            except subprocess.CalledProcessError as e:
+                tail = e.stderr.decode(errors="ignore")[-600:] if e.stderr else "(no output)"
+                print(f"  [movie] ffmpeg failed for {stem}:\n{tail}")
 
     # tear the tracks back down so the next movie starts clean
     cam_track.Enabled = 0
@@ -675,6 +788,16 @@ examples:
                    help=f"override slice spacing in metres (default {SLICE_STEP})")
     p.add_argument("--resolution", nargs=2, type=int, metavar=("W", "H"), default=None,
                    help=f"override output resolution (default {IMG_SIZE[0]} {IMG_SIZE[1]})")
+    p.add_argument("--encoder", choices=["auto", "paraview", "ffmpeg"], default=None,
+                   help="movie encoder backend (default: auto). 'paraview' is capped at "
+                        "1920x1088 and needs dimensions divisible by 16; 'ffmpeg' has no "
+                        "such limits and is required for 4K movies")
+    p.add_argument("--ffmpeg-path", default=None,
+                   help="full path to ffmpeg.exe if it is not on PATH")
+    p.add_argument("--crf", type=int, default=None,
+                   help=f"ffmpeg quality, 0 lossless to 51 worst (default {FFMPEG_CRF})")
+    p.add_argument("--keep-frames", action="store_true",
+                   help="keep the intermediate PNG frames after ffmpeg encoding")
     p.add_argument("--probe-only", action="store_true",
                    help="resolve block selectors and exit without rendering")
     p.add_argument("--list-stages", action="store_true",
@@ -700,6 +823,14 @@ if __name__ == "__main__":
         SLICE_STEP = args.slice_step
     if args.resolution is not None:
         IMG_SIZE = list(args.resolution)
+    if args.encoder is not None:
+        MOVIE_ENCODER = args.encoder
+    if args.ffmpeg_path is not None:
+        FFMPEG_PATH = args.ffmpeg_path
+    if args.crf is not None:
+        FFMPEG_CRF = args.crf
+    if args.keep_frames:
+        KEEP_FRAMES = True
 
     stages = ALL_STAGES if "all" in args.stage else [s for s in ALL_STAGES if s in args.stage]
 
@@ -727,6 +858,18 @@ if __name__ == "__main__":
     print(f"resolution : {IMG_SIZE[0]}x{IMG_SIZE[1]}")
     print(f"frames/fps : {N_SWEEP_FRAMES} @ {MOVIE_FRAMERATE}")
     print(f"slice step : {SLICE_STEP} m")
+    if "movies" in stages and not args.probe_only:
+        chosen = choose_encoder(IMG_SIZE)
+        have_ff = ffmpeg_available()
+        print(f"encoder    : {MOVIE_ENCODER} -> using '{chosen}' "
+              f"(ffmpeg {'found' if have_ff else 'NOT found'})")
+        if chosen == "paraview":
+            snapped = snap_to_macroblock(IMG_SIZE)
+            if snapped != IMG_SIZE:
+                print(f"             movie size will snap to {snapped[0]}x{snapped[1]}")
+            if not within_mp4_writer_limits(snapped):
+                print(f"             WARNING above the {MP4_MAX_WIDTH}x{MP4_MAX_HEIGHT} "
+                      f"vtkMP4Writer limit, install ffmpeg for this resolution")
     print(f"cases      : {', '.join(c['name'] for c in cases)}")
 
     run_start = datetime.datetime.now()
