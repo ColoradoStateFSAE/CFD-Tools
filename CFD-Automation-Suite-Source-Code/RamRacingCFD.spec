@@ -77,7 +77,7 @@ application_modules = [
     "simtypes", "simtypes.half_car",
     "gui", "gui.app", "gui.sim_editor", "gui.reference_tabs",
     "gui.settings_dialog", "gui.theme",
-    "utils", "utils.refinement", "utils.resource_path",
+    "utils", "utils.refinement", "utils.resource_path", "utils.fluent_log", "utils.naming",
     "utils.results_exporter",
 ]
 
