@@ -25,8 +25,8 @@ SCRIPT_VERSION = "2026-08-05_0247"
 # ============================================================
 CASES = [
     {"name": "case_001",
-     "file": r"C:\Users\HayesDodson\Downloads\data\FLTG-Setup-Output.encas",
-     "out":  r"C:\Users\HayesDodson\Downloads\test"},
+     "file": r"C:\Users\Hayes Dodson\Downloads\data\FLTG-Setup-Output.encas",
+     "out":  r"C:\Users\Hayes Dodson\Downloads\test"},
 ]
 
 # ============================================================
@@ -55,7 +55,7 @@ CAR_BOUNDS = {
 WASH_BOUNDS = {
     "x": (-1.0, 2.5),
     "y": (0.0, 1.8),
-    "z": (0.0, 1.8),
+    "z": (0.0, 1),
 }
 
 # ============================================================
@@ -85,8 +85,8 @@ ISOSURFACE_COLOR_FIELD = 'Velocity_Magnitude'
 # ImageResolution=[3840, 2160] successfully).
 # ============================================================
 IMG_SIZE = [3840, 2160]
-N_SWEEP_FRAMES = 120        # 5 seconds at 24fps
-MOVIE_FRAMERATE = 24
+N_SWEEP_FRAMES = 300        # 5 seconds at 60fps
+MOVIE_FRAMERATE = 60
 MOVIE_BITRATE = 10000000
 SLICE_STEP = 0.05           # 50mm
 
