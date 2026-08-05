@@ -63,7 +63,8 @@ class SettingsDialog(QDialog):
         form.addRow("", self.cb_ensight)
 
         self.e_output = QLineEdit()
-        self.e_output.setPlaceholderText("Starting folder for new simulations")
+        self.e_output.setPlaceholderText(
+            "Where the Project / Run / MAP folders are created")
         output_row = QWidget()
         browse_row = QHBoxLayout(output_row)
         browse_row.setContentsMargins(0, 0, 0, 0)
@@ -73,7 +74,18 @@ class SettingsDialog(QDialog):
         browse.setFixedWidth(84)
         browse.clicked.connect(self._pick_output)
         browse_row.addWidget(browse)
-        form.addRow("Output folder:", output_row)
+        form.addRow("Output root:", output_row)
+
+        root_note = QLabel(
+            "Every simulation writes to "
+            "&lt;root&gt;/&lt;project&gt;/&lt;run&gt;/&lt;point id&gt;, "
+            "for example  Dauntless/R018/R018-MAP01.  Point ID matches the "
+            "CFD Rolling Report, so a folder and its Master Log row share a "
+            "name. Put this on the shared drive to keep the team's runs "
+            "together.")
+        root_note.setObjectName("muted")
+        root_note.setWordWrap(True)
+        form.addRow("", root_note)
 
         layout.addWidget(defaults)
 
@@ -138,7 +150,7 @@ class SettingsDialog(QDialog):
 
     def _pick_output(self) -> None:
         path = QFileDialog.getExistingDirectory(
-            self, "Default Output Folder", self.e_output.text())
+            self, "Output Root Folder", self.e_output.text())
         if path:
             self.e_output.setText(path)
 
@@ -150,7 +162,7 @@ class SettingsDialog(QDialog):
         self.combo_mpi.setCurrentText(self.store.value("mpi_type", "intel"))
         self.cb_ensight.setChecked(
             self.store.value("export_ensight", True, type=bool))
-        self.e_output.setText(self.store.value("output_dir", ""))
+        self.e_output.setText(self.store.value("output_root", ""))
         self.combo_log.setCurrentText(self.store.value("log_level", "INFO"))
 
     def _save(self) -> None:
@@ -158,7 +170,7 @@ class SettingsDialog(QDialog):
         self.store.setValue("double_precision", self.cb_double.isChecked())
         self.store.setValue("mpi_type", self.combo_mpi.currentText())
         self.store.setValue("export_ensight", self.cb_ensight.isChecked())
-        self.store.setValue("output_dir", self.e_output.text().strip())
+        self.store.setValue("output_root", self.e_output.text().strip())
         self.store.setValue("log_level", self.combo_log.currentText())
 
         import logging
@@ -189,6 +201,6 @@ def apply_defaults(settings) -> None:
         settings.mpi_type = store.value("mpi_type", settings.mpi_type)
     settings.export_ensight = store.value(
         "export_ensight", settings.export_ensight, type=bool)
-    output = store.value("output_dir", "")
-    if output:
-        settings.output_dir = output
+    root = store.value("output_root", "")
+    if root and hasattr(settings, "output_root"):
+        settings.output_root = root
