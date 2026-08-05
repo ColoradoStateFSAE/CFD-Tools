@@ -45,12 +45,17 @@ def write_results(settings, sim_type_name: str, results: dict, log) -> str:
         "   Ram Racing Aerodynamics -- CFD Results",
         "=" * 70,
         "",
-        _row("Simulation", settings.name),
+        _row("Point ID", settings.name),
+        _row("Project", getattr(settings, "project", "")),
+        _row("Run", getattr(settings, "run", "")),
+        _row("MAP #", getattr(settings, "map_number", "")),
         _row("Type", sim_type_name),
         _row("Speed", settings.speed_ms, "m/s"),
         _row("Speed", settings.speed_mph, "mph"),
         _row("Exported", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     ]
+    if getattr(settings, "description", ""):
+        lines.append(_row("Description", settings.description))
     if getattr(settings, "geometry_path", ""):
         lines.append(_row("Geometry", os.path.basename(settings.geometry_path)))
     if results.get("runtime_s"):
