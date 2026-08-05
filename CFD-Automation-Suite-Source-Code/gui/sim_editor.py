@@ -183,24 +183,65 @@ class SimEditor(QDialog):
         _, form = self._tab("  General  ")
 
         self._sub(form, "Identity")
-        self.e_name = QLineEdit()
-        form.addRow("Simulation name:", self.e_name)
+        self._note(form,
+                   "Project, Run and MAP match the CFD Rolling Report. The "
+                   "Point ID built from them names this run's folder and "
+                   "every file in it, so a folder and its Master Log row "
+                   "always share a name.")
 
-        self._sub(form, "Files")
+        from utils.naming import existing_projects, existing_runs
+
+        # Project: editable, but offers what is already on disk
+        self.combo_project = QComboBox()
+        self.combo_project.setEditable(True)
+        self.combo_project.setPlaceholderText("e.g. Dauntless")
+        self.combo_project.currentTextChanged.connect(self._project_changed)
+        form.addRow("Project:", self.combo_project)
+
+        self.combo_run = QComboBox()
+        self.combo_run.setEditable(True)
+        self.combo_run.setPlaceholderText("e.g. 18  or  R018")
+        self.combo_run.currentTextChanged.connect(self._run_changed)
+        form.addRow("Run:", self.combo_run)
+
+        map_row = QWidget()
+        map_layout = QHBoxLayout(map_row)
+        map_layout.setContentsMargins(0, 0, 0, 0)
+        map_layout.setSpacing(6)
+        self.sb_map = self._spin(1, 999)
+        self.sb_map.valueChanged.connect(self._refresh_identity)
+        map_layout.addWidget(self.sb_map, 1)
+        next_button = QPushButton("Next free")
+        next_button.setFixedWidth(84)
+        next_button.setToolTip(
+            "Use the first MAP number this run has not used yet")
+        next_button.clicked.connect(self._use_next_map)
+        map_layout.addWidget(next_button)
+        form.addRow("MAP number:", map_row)
+
+        self.lbl_point_id = QLabel("")
+        self.lbl_point_id.setObjectName("value")
+        form.addRow("Point ID:", self.lbl_point_id)
+
+        self.e_description = QLineEdit()
+        self.e_description.setPlaceholderText(
+            "Optional: what this point is testing, for the Master Log")
+        form.addRow("Description:", self.e_description)
+
+        self.lbl_folder = QLabel("")
+        self.lbl_folder.setObjectName("muted")
+        self.lbl_folder.setWordWrap(True)
+        self.lbl_folder.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow("Folder:", self.lbl_folder)
+
+        self._hr(form)
+        self._sub(form, "Geometry")
         self.e_geometry = QLineEdit()
         self.e_geometry.setPlaceholderText("Watertight .pmdb exported from Discovery")
         form.addRow("Geometry:", self._browse_row(
             self.e_geometry, "Select Geometry",
             "Ansys Geometry (*.pmdb *.dsco);;All Files (*)"))
-
-        self.e_output = QLineEdit()
-        form.addRow("Output folder:", self._browse_row(
-            self.e_output, "Select Output Folder", directory=True))
-
-        self.e_results = QLineEdit()
-        self.e_results.setPlaceholderText("Leave blank to use the output folder")
-        form.addRow("Results folder:", self._browse_row(
-            self.e_results, "Select Results Folder", directory=True))
 
         self._hr(form)
         self._sub(form, "Skip Meshing")
@@ -225,10 +266,22 @@ class SimEditor(QDialog):
         form.addRow("", self.lbl_speed)
 
         self._sub(form, "Fluent Session")
+        import os as _os
+        cores = _os.cpu_count() or 1
         self.sb_processes = self._spin(1, 512)
+        self.sb_processes.valueChanged.connect(self._check_processes)
         form.addRow("Processes:", self.sb_processes)
+
+        self.lbl_processes = QLabel("")
+        self.lbl_processes.setObjectName("muted")
+        self.lbl_processes.setWordWrap(True)
+        form.addRow("", self.lbl_processes)
+        self._machine_cores = cores
+
         self._note(form,
-                   "ThreadRipper 40–50 · Xeon Gold 60–70 · Big Boi 128–170")
+                   "ThreadRipper 40–50 · Xeon Gold 60–70 · Big Boi 128–170. "
+                   "Asking for more processes than the machine has cores "
+                   "stalls Fluent during parallel start-up.")
 
         self.combo_mpi = QComboBox()
         try:
@@ -380,10 +433,27 @@ class SimEditor(QDialog):
 
     def _load(self) -> None:
         s = self.settings
-        self.e_name.setText(s.name)
+        from utils.naming import existing_projects, existing_runs
+
+        root = getattr(s, "output_root", "")
+        self.combo_project.blockSignals(True)
+        self.combo_project.clear()
+        if root:
+            self.combo_project.addItems(existing_projects(root))
+        self.combo_project.setCurrentText(s.project)
+        self.combo_project.blockSignals(False)
+
+        self.combo_run.blockSignals(True)
+        self.combo_run.clear()
+        if root and s.project:
+            self.combo_run.addItems(existing_runs(root, s.project))
+        self.combo_run.setCurrentText(s.run)
+        self.combo_run.blockSignals(False)
+
+        self.sb_map.setValue(max(1, s.map_number))
+
+        self.e_description.setText(getattr(s, "description", ""))
         self.e_geometry.setText(s.geometry_path)
-        self.e_output.setText(s.output_dir)
-        self.e_results.setText(s.results_dir)
         self.e_existing.setText(s.existing_mesh)
         self.sb_speed.setValue(s.speed_mph)
         self.sb_processes.setValue(s.processes)
@@ -415,14 +485,18 @@ class SimEditor(QDialog):
             for widget, value in zip(self.rear_xyz, s.rear_wheel_origin):
                 widget.setValue(value)
 
+        self._check_processes()
+        self._refresh_identity()
         self._refresh_boxes()
 
     def _save(self) -> None:
         s = self.settings
-        s.name = self.e_name.text().strip()
+        s.project = self.combo_project.currentText().strip()
+        s.run = self.combo_run.currentText().strip()
+        s.map_number = self.sb_map.value()
+
+        s.description = self.e_description.text().strip()
         s.geometry_path = self.e_geometry.text().strip()
-        s.output_dir = self.e_output.text().strip()
-        s.results_dir = self.e_results.text().strip() or s.output_dir
         s.existing_mesh = self.e_existing.text().strip()
         s.speed_mph = self.sb_speed.value()
         s.processes = self.sb_processes.value()
@@ -463,6 +537,78 @@ class SimEditor(QDialog):
         self.accept()
 
     # ── Live feedback ────────────────────────────────────────────────────
+
+    # ── Identity ─────────────────────────────────────────────────────────
+
+    def _project_changed(self) -> None:
+        """Repopulate the run list for the project just chosen."""
+        from utils.naming import existing_runs
+        root = getattr(self.settings, "output_root", "")
+        project = self.combo_project.currentText().strip()
+
+        current = self.combo_run.currentText()
+        self.combo_run.blockSignals(True)
+        self.combo_run.clear()
+        if root and project:
+            self.combo_run.addItems(existing_runs(root, project))
+        self.combo_run.setCurrentText(current)
+        self.combo_run.blockSignals(False)
+
+        self._refresh_identity()
+
+    def _run_changed(self) -> None:
+        self._refresh_identity()
+
+    def _use_next_map(self) -> None:
+        """Jump to the first MAP number this run has not used."""
+        from utils.naming import next_map_number
+        root = getattr(self.settings, "output_root", "")
+        self.sb_map.setValue(next_map_number(
+            root,
+            self.combo_project.currentText().strip(),
+            self.combo_run.currentText().strip(),
+        ))
+
+    def _refresh_identity(self) -> None:
+        """Show the Point ID and folder these three fields produce."""
+        from utils.naming import RunIdentity
+
+        identity = RunIdentity(
+            project=self.combo_project.currentText().strip(),
+            run=self.combo_run.currentText().strip(),
+            map_number=self.sb_map.value(),
+            root=getattr(self.settings, "output_root", ""),
+        )
+
+        self.lbl_point_id.setText(identity.point_id or "—")
+
+        problems = identity.validate()
+        if problems:
+            self.lbl_folder.setText(problems[0])
+            self.lbl_folder.setStyleSheet("color: #e5c07b;")
+        elif identity.exists:
+            self.lbl_folder.setText(
+                f"{identity.map_dir}\n"
+                f"This point already exists and will be overwritten.")
+            self.lbl_folder.setStyleSheet("color: #e5c07b;")
+        else:
+            self.lbl_folder.setText(identity.map_dir)
+            self.lbl_folder.setStyleSheet("color: #7f8593;")
+
+        self._refresh_summary()
+
+    def _check_processes(self) -> None:
+        """Warn as soon as the process count exceeds the machine's cores."""
+        cores = getattr(self, "_machine_cores", 1)
+        requested = self.sb_processes.value()
+        if requested > cores:
+            self.lbl_processes.setText(
+                f"This machine has {cores} cores. {requested} processes will "
+                f"stall Fluent during start-up.")
+            self.lbl_processes.setStyleSheet("color: #e06c75;")
+        else:
+            self.lbl_processes.setText(f"This machine has {cores} cores.")
+            self.lbl_processes.setStyleSheet("color: #7f8593;")
 
     def _refresh_boxes(self) -> None:
         """Show the refinement boxes the current dimensions produce."""
@@ -508,7 +654,10 @@ class SimEditor(QDialog):
                     self.lbl_omega.setText(
                         f"{omega:.2f} rad/s     {omega * 60 / 6.283185:.0f} rpm")
 
+            point = self.lbl_point_id.text()
+            prefix = f"{point}   ·   " if point and point != "—" else ""
             self.summary.setText(
+                f"{prefix}"
                 f"{self.sb_speed.value():.0f} mph   ·   "
                 f"{total:,} iterations   ·   "
                 f"{self.sb_processes.value()} processes")
