@@ -63,8 +63,8 @@ NAMED_SELECTIONS = {
     "rw":              ("wall, rotating",  True,  "Rear wheel"),
     "rwb":             ("wall, rotating",  True,  "Rear wheel block"),
 
-    "front-suspension": ("wall",           False, "Front suspension members"),
-    "rear-suspension":  ("wall",           False, "Rear suspension members"),
+    "fl_sus":          ("wall",           False, "Front left suspension members"),
+    "rl_sus":          ("wall",           False, "Rear left suspension members"),
 }
 
 # Labels the simulation cannot run correctly without.
@@ -73,8 +73,8 @@ REQUIRED_LABELS = [name for name, (_, required, _d)
 
 AERO       = ["frontwing", "rearwing", "undertray"]
 BODY       = ["chassis", "sidepod"]
-FRONT_SUS  = ["front-suspension"]
-REAR_SUS   = ["rear-suspension"]
+FRONT_SUS  = ["fl_sus"]
+REAR_SUS   = ["rl_sus"]
 FRONT_WHEEL = ["fw", "fwb"]
 REAR_WHEEL  = ["rw", "rwb"]
 CAR = AERO + BODY + FRONT_SUS + REAR_SUS + FRONT_WHEEL + REAR_WHEEL
@@ -889,11 +889,11 @@ def _boundary_conditions(session, s: Settings, log) -> None:
     # Far-field walls: zero shear, i.e. slip. Without this a boundary layer
     # grows on the tunnel walls and progressively blocks the domain.
     try:
-        walls = bc.wall["walls"]
-        walls.momentum.shear_condition = "Specified Shear"
-        walls.momentum.shear_stress.x = 0.0
-        walls.momentum.shear_stress.y = 0.0
-        walls.momentum.shear_stress.z = 0.0
+        far_field = bc.wall["walls"]     # do not shadow the `walls` name list
+        far_field.momentum.shear_condition = "Specified Shear"
+        far_field.momentum.shear_stress.x = 0.0
+        far_field.momentum.shear_stress.y = 0.0
+        far_field.momentum.shear_stress.z = 0.0
         log.info("  walls          specified zero shear, slip")
     except Exception as exc:
         log.warning(f"  walls: {exc}")
