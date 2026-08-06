@@ -20,6 +20,8 @@ from PyQt6.QtGui import QAction, QColor, QFont
 
 import simtypes
 from core.queue_manager import SimQueue, JobState
+from core.web_monitor import MonitorServer
+from utils.log_buffer import LogBuffer
 from gui.sim_editor import SimEditor
 from gui.theme import STATE_COLOURS, TEXT_MUTED, ACCENT, OK, ERROR
 from utils.resource_path import resource_path
@@ -158,6 +160,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_ui()
         self._setup_logging()
+        self._start_monitor()
 
         # Set the initial button states rather than leaving them all enabled
         self._refresh_queue()
@@ -194,6 +197,11 @@ class MainWindow(QMainWindow):
         settings_action.setShortcut("Ctrl+,")
         settings_action.triggered.connect(self._open_settings)
         file_menu.addAction(settings_action)
+        file_menu.addSeparator()
+
+        monitor_action = QAction("&Phone Monitor…", self)
+        monitor_action.triggered.connect(self._show_monitor_info)
+        file_menu.addAction(monitor_action)
         file_menu.addSeparator()
 
         queue_menu = self.menuBar().addMenu("&Queue")
@@ -376,6 +384,53 @@ class MainWindow(QMainWindow):
         root.setLevel(logging.INFO)
         root.addHandler(self._log_bridge)
 
+        # A rolling buffer the web monitor reads from. Kept separate from
+        # the GUI's own handler since the monitor runs on its own thread
+        # and must not touch Qt widgets.
+        self._log_buffer = LogBuffer()
+        root.addHandler(self._log_buffer)
+
+    # ── Phone monitor ────────────────────────────────────────────────────
+
+    def _start_monitor(self) -> None:
+        """Start the web monitor if enabled in Settings."""
+        from PyQt6.QtCore import QSettings
+        store = QSettings("Ram Racing FSAE", "CFD Automation")
+        enabled = store.value("monitor_enabled", True, type=bool)
+        port = int(store.value("monitor_port", 8765))
+
+        self.monitor = MonitorServer(self.queue, self._log_buffer, port=port)
+        if enabled:
+            if self.monitor.start():
+                urls = "\n    ".join(self.monitor.urls())
+                logging.getLogger().info(
+                    f"Phone monitor: \n    {urls}")
+            else:
+                logging.getLogger().warning(
+                    f"Phone monitor could not start on port {port} "
+                    f"(already in use?)")
+
+    def _restart_monitor(self) -> None:
+        """Apply a port or enabled/disabled change made in Settings."""
+        if getattr(self, "monitor", None) is not None:
+            self.monitor.stop()
+        self._start_monitor()
+
+    def _show_monitor_info(self) -> None:
+        urls = self.monitor.urls() if self.monitor.running else []
+        if not urls:
+            QMessageBox.information(
+                self, "Phone Monitor",
+                "The monitor is not running. Enable it in "
+                "File > Settings.")
+            return
+        QMessageBox.information(
+            self, "Phone Monitor",
+            "Open on your phone (same Tailscale network):\n\n"
+            + "\n".join(urls)
+            + "\n\nShows the queue and the live log. Updates every "
+              "2 seconds.")
+
     # ── Actions ──────────────────────────────────────────────────────────
 
     def _new_simulation(self) -> None:
@@ -400,7 +455,8 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self) -> None:
         from gui.settings_dialog import SettingsDialog
-        SettingsDialog(self).exec()
+        if SettingsDialog(self).exec():
+            self._restart_monitor()
 
     def _edit_selected(self) -> None:
         job = self._selected_job()
@@ -621,6 +677,8 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.StandardButton.Yes:
                 self.queue.kill(job.job_id)
         self.queue.stop()
+        if getattr(self, "monitor", None) is not None:
+            self.monitor.stop()
 
         # Detach the log handler before Qt destroys it. Without this,
         # logging's atexit shutdown reaches a deleted C++ object and
