@@ -80,8 +80,8 @@ NAMED_SELECTIONS = {
     "rw":              ("wall, rotating",  False, "Rear wheel (rear quarter only)"),
     "rwb":             ("wall, rotating",  False, "Rear wheel block (rear quarter only)"),
 
-    "front-suspension": ("wall",           False, "Front suspension members"),
-    "rear-suspension":  ("wall",           False, "Rear suspension members"),
+    "fl_sus": ("wall",           False, "Front left suspension members"),
+    "rl_sus": ("wall",           False, "Rear left suspension members"),
 }
 
 # Labels the simulation cannot run correctly without, regardless of which
@@ -108,8 +108,8 @@ BODY      = ["chassis", "sidepod"]
 # There is no undertray split that makes sense for a quarter model -- the
 # diffuser spans the car's centreline -- so it is left out entirely here.
 
-FRONT_SUS = ["front-suspension"]
-REAR_SUS  = ["rear-suspension"]
+FRONT_SUS = ["fl_sus"]
+REAR_SUS  = ["rl_sus"]
 
 
 def _car_labels(end: str) -> list:
