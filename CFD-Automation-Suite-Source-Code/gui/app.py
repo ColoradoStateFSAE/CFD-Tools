@@ -289,20 +289,6 @@ class MainWindow(QMainWindow):
             "Begin running queued simulations, oldest first")
         self.btn_start.clicked.connect(self._start_queue)
         control.addWidget(self.btn_start)
-
-        self.btn_pause = QPushButton("⏸  Pause")
-        self.btn_pause.setToolTip(
-            "Stop picking up new simulations.\n"
-            "The one running now continues; use Kill to stop that too.")
-        self.btn_pause.clicked.connect(self._pause_queue)
-        control.addWidget(self.btn_pause)
-
-        self.btn_kill = QPushButton("■  Kill")
-        self.btn_kill.setObjectName("danger")
-        self.btn_kill.setToolTip(
-            "Force the running simulation to stop and shut Fluent down")
-        self.btn_kill.clicked.connect(self._kill_running)
-        control.addWidget(self.btn_kill)
         layout.addLayout(control)
 
         return pane
@@ -439,38 +425,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Queue started", 4000)
         self._refresh_queue()
 
-    def _pause_queue(self) -> None:
-        self.queue.pause()
-        running = self.queue.current
-        message = ("Queue paused. "
-                   + (f"{running.name} will finish first."
-                      if running else "No simulation is running."))
-        self.statusBar().showMessage(message, 6000)
-        self._refresh_queue()
-
-    def _kill_running(self) -> None:
-        job = self.queue.current
-        if job is None:
-            QMessageBox.information(self, "Nothing running",
-                                    "No simulation is running.")
-            return
-
-        answer = QMessageBox.question(
-            self, "Stop simulation",
-            f"Stop “{job.name}” now?\n\n"
-            "Fluent will be shut down and the work so far is lost. "
-            "Any case files already written are kept.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        if self.queue.kill(job.job_id):
-            self.statusBar().showMessage(
-                f"Stopping {job.name}; Fluent may take a few seconds "
-                f"to close", 8000)
-        self._refresh_queue()
-
     def _cancel_selected(self) -> None:
         job = self._selected_job()
         if job is None:
@@ -552,8 +506,6 @@ class MainWindow(QMainWindow):
 
         worker_live = self.queue.running
         self.btn_start.setEnabled(not worker_live and pending > 0)
-        self.btn_pause.setEnabled(worker_live)
-        self.btn_kill.setEnabled(running > 0)
         self.btn_start.setText(
             "▶  Start Queue" if not worker_live else "▶  Running…")
 
@@ -655,8 +607,8 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self, "Simulation running",
                 f"“{job.name}” is still running.\n\n"
-                "Yes  — stop it and quit\n"
-                "No   — leave it running and quit anyway\n"
+                "Yes    — stop it and quit\n"
+                "No     — leave it running and quit anyway\n"
                 "Cancel — stay open",
                 QMessageBox.StandardButton.Yes
                 | QMessageBox.StandardButton.No
