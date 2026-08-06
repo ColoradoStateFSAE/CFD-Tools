@@ -73,11 +73,11 @@ for source, destination in (
 # follows them statically. They are listed here as well so a build does not
 # break silently if that changes.
 application_modules = [
-    "core", "core.queue_manager",
+    "core", "core.queue_manager", "core.web_monitor",
     "simtypes", "simtypes.half_car",
     "gui", "gui.app", "gui.sim_editor", "gui.reference_tabs",
     "gui.settings_dialog", "gui.theme",
-    "utils", "utils.refinement", "utils.resource_path", "utils.fluent_log", "utils.naming",
+    "utils", "utils.refinement", "utils.resource_path", "utils.fluent_log", "utils.naming", "utils.log_buffer",
     "utils.results_exporter",
 ]
 
