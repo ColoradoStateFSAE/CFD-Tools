@@ -714,10 +714,26 @@ def solve(s: Settings, mesh_file: str, log, progress=None,
         # ── Turbulence ────────────────────────────────────────────────────
         step(5, "GEKO k-omega")
         viscous = setup.models.viscous
-        viscous.model = "k-omega"
-        viscous.k_omega_model = "geko"
-        viscous.options.production_limiter = True
-        viscous.options.curvature_correction = False   # on at ramp 3
+
+        # Each set individually and logged, so a Scheme-level failure (e.g.
+        # "ASSQ: invalid argument: improper list") names the exact call that
+        # caused it instead of aborting the whole run with no attribution.
+        def _set_viscous(attr_path: str, value):
+            obj = viscous
+            parts = attr_path.split(".")
+            try:
+                for part in parts[:-1]:
+                    obj = getattr(obj, part)
+                setattr(obj, parts[-1], value)
+                log.info(f"  viscous.{attr_path} = {value}")
+            except Exception as exc:
+                log.error(f"  viscous.{attr_path} = {value}  FAILED: {exc}")
+                raise
+
+        _set_viscous("model", "k-omega")
+        _set_viscous("k_omega_model", "geko")
+        _set_viscous("options.production_limiter", True)
+        _set_viscous("options.curvature_correction", False)   # on at ramp 3
 
         # ── Boundary conditions ───────────────────────────────────────────
         step(8, "Boundary conditions")
