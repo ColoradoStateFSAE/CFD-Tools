@@ -133,9 +133,15 @@ class NamedSelectionsTab(_FilterTable):
         )
 
     def load(self, sim_type) -> None:
-        rows = [(label, kind, description)
-                for label, (kind, description)
-                in sim_type.NAMED_SELECTIONS.items()]
+        rows = []
+        for label, entry in sim_type.NAMED_SELECTIONS.items():
+            if len(entry) == 3:
+                kind, required, description = entry
+            else:                       # older two-part form
+                kind, description = entry
+                required = True
+            marker = "" if required else "optional -- "
+            rows.append((label, kind, f"{marker}{description}"))
         self._fill(rows, TYPE_COLOURS)
 
 
