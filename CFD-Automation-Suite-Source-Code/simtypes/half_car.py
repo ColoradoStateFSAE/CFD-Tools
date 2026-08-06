@@ -354,6 +354,13 @@ def _launch(mode: str, s: Settings, log):
     problem rather than a meshing problem, so the arguments, the core count
     and the MPI choice are all logged before the call and the connection is
     confirmed afterwards.
+
+    Fluent writes its transcript, cleanup scripts and other working files to
+    the process's working directory. Without `cwd`, that is wherever the
+    suite itself was launched from -- the VS Code project folder when run
+    from source, or the install folder when run as an exe -- rather than the
+    run's own output folder. Setting cwd here fixes it in both cases; the
+    exe alone would not have.
     """
     import ansys.fluent.core as pyfluent
 
@@ -368,6 +375,8 @@ def _launch(mode: str, s: Settings, log):
             f"  Fluent may fail to start or stall during parallel setup. "
             f"Lower the process count on the General tab.")
 
+    work_dir = s.identity.create_dirs()
+
     args = dict(
         mode=mode,
         processor_count=requested,
@@ -375,6 +384,7 @@ def _launch(mode: str, s: Settings, log):
         product_version="26.1",
         cleanup_on_exit=True,
         start_timeout=FLUENT_START_TIMEOUT,
+        cwd=work_dir,
     )
     if s.mpi_type and s.mpi_type != "default":
         args["additional_arguments"] = f"-mpi={s.mpi_type}"
@@ -384,6 +394,7 @@ def _launch(mode: str, s: Settings, log):
     log.info(f"  precision      {args['precision']}")
     log.info(f"  mpi            {s.mpi_type}")
     log.info(f"  extra args     {args.get('additional_arguments', '(none)')}")
+    log.info(f"  working dir    {work_dir}")
     log.info(f"  start timeout  {FLUENT_START_TIMEOUT}s")
     log.info(f"  AWP_ROOT261    {os.environ.get('AWP_ROOT261', 'NOT SET')}")
 
