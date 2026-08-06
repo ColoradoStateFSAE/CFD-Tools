@@ -1,48 +1,43 @@
-# RamRacingCFD.spec — Cross-platform build (Windows + Linux)
-# Python 3.12 / PyQt6 / PyFluent 0.39 / Ansys 2026 R1 (v261)
+# RamRacingCFD.spec -- PyInstaller build
+# Python 3.12 | PyQt6 | PyFluent 0.39 | Ansys Fluent 2026 R1 (v261)
 #
-# Build:
-#   source .venv/bin/activate          (Linux)
-#   .\.venv\Scripts\Activate.ps1       (Windows)
-#   rm -rf build dist                  (or: rmdir /s /q build dist)
 #   pyinstaller --clean RamRacingCFD.spec
 #
-# Run:
-#   export AWP_ROOT261=/path/to/ansys_inc/v261    (Linux)
-#   set AWP_ROOT261=C:\path\to\ANSYS Inc\v261     (Windows)
-#   ./dist/RamRacingCFD/RamRacingCFD              (Linux)
-#   dist\RamRacingCFD\RamRacingCFD.exe             (Windows)
+# Output: dist/RamRacingCFD/RamRacingCFD[.exe]
+#
+# The bundle is self-contained: Python runtime, PyQt6 and PyFluent are all
+# included, so the target machine needs only Ansys Fluent installed.
 
-import sys
 import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metadata
 
 block_cipher = None
+PROJECT_ROOT = Path(".").resolve()
 
-# ── Collect ansys packages (includes all data files like cfg.yaml) ────────────
-ansys_datas = []
-ansys_bins  = []
-ansys_hidden = []
-for pkg in [
+print("\n=== Ram Racing CFD build ===")
+
+# ── Ansys packages ───────────────────────────────────────────────────────────
+ansys_datas, ansys_bins, ansys_hidden = [], [], []
+for package in (
     "ansys.fluent.core",
     "ansys.units",
     "ansys.api.fluent",
     "ansys.platform",
     "ansys.tools.common",
-]:
+):
     try:
-        d, b, h = collect_all(pkg)
-        ansys_datas  += d
-        ansys_bins   += b
-        ansys_hidden += h
+        datas, binaries, hidden = collect_all(package)
+        ansys_datas += datas
+        ansys_bins += binaries
+        ansys_hidden += hidden
+        print(f"  collected  {package}")
     except Exception:
-        pass  # package not installed
+        print(f"  skipped    {package}  (not installed)")
 
-# Package metadata — needed by packages that call importlib.metadata.version()
-from PyInstaller.utils.hooks import copy_metadata
+# Metadata for packages that call importlib.metadata.version() at import time.
 meta_datas = []
-for pkg in [
+for package in (
     "ansys-platform-instancemanagement",
     "ansys-fluent-core",
     "ansys-units",
@@ -54,38 +49,45 @@ for pkg in [
     "PyQt6-sip",
     "grpcio",
     "numpy",
-    "pandas",
-]:
+):
     try:
-        meta_datas += copy_metadata(pkg)
+        meta_datas += copy_metadata(package)
     except Exception:
         pass
 
-grpc_h  = collect_submodules("grpc")
-proto_h = collect_submodules("google.protobuf")
-
-# ── Application data files ────────────────────────────────────────────────────
+# ── Application data ─────────────────────────────────────────────────────────
 app_datas = []
-
-# Only include files that actually exist (prevents build failure in CI)
-optional_files = [
-    ("assets/logo.png",                  "assets"),
-    ("utils/Wheel_MRF_Setup_Guide.pdf",  "utils"),
-]
-for src, dest in optional_files:
-    if os.path.exists(src):
-        app_datas.append((src, dest))
-        print(f"  Including: {src}")
+for source, destination in (
+    ("assets/logo.png",                 "assets"),
+    ("assets/logo.ico",                 "assets"),
+    ("utils/Wheel_MRF_Setup_Guide.pdf", "utils"),
+):
+    if os.path.exists(source):
+        app_datas.append((source, destination))
+        print(f"  bundling   {source}")
     else:
-        print(f"  Skipping (not found): {src}")
+        print(f"  missing    {source}  (skipped)")
 
-all_datas = meta_datas + ansys_datas + app_datas
+# ── Hidden imports ───────────────────────────────────────────────────────────
+# simtypes/__init__.py imports each simulation type explicitly, so PyInstaller
+# follows them statically. They are listed here as well so a build does not
+# break silently if that changes.
+application_modules = [
+    "core", "core.queue_manager", "core.web_monitor",
+    "simtypes", "simtypes.half_car", "simtypes.full_car",
+    "simtypes.quarter_model",
+    "gui", "gui.app", "gui.sim_editor", "gui.reference_tabs",
+    "gui.settings_dialog", "gui.theme",
+    "utils", "utils.refinement", "utils.resource_path", "utils.fluent_log", "utils.naming", "utils.log_buffer",
+    "utils.results_exporter",
+]
 
-all_binaries = ansys_bins
-
-all_hidden = list(set(
-    ansys_hidden + grpc_h + proto_h + [
-        # grpc / protobuf core
+all_hidden = sorted(set(
+    ansys_hidden
+    + collect_submodules("grpc")
+    + collect_submodules("google.protobuf")
+    + application_modules
+    + [
         "grpc",
         "grpc._cython",
         "grpc._cython.cygrpc",
@@ -94,34 +96,16 @@ all_hidden = list(set(
         "google.protobuf.descriptor_pool",
         "google.protobuf.reflection",
         "google.protobuf.symbol_database",
-        # our modules
-        "simtypes",
-        "simtypes.configs",
-        "core",
-        "core.runner",
-        "core.queue_manager",
-        "gui",
-        "gui.app",
-        "gui.theme",
-        "gui.sim_editor",
-        "gui.wheel_editor",
-        "gui.settings_dialog",
-        "gui.resource_path",
-        "utils",
-        "utils.results_exporter",
-        # misc
         "lxml",
         "lxml.etree",
-        "PIL",
-        "PIL.Image",
     ]
 ))
 
-a = Analysis(
+analysis = Analysis(
     ["main.py"],
-    pathex=[str(Path(".").resolve())],
-    binaries=all_binaries,
-    datas=all_datas,
+    pathex=[str(PROJECT_ROOT)],
+    binaries=ansys_bins,
+    datas=meta_datas + ansys_datas + app_datas,
     hiddenimports=all_hidden,
     hookspath=[],
     hooksconfig={},
@@ -134,6 +118,7 @@ a = Analysis(
         "jupyter",
         "sphinx",
         "pytest",
+        "pandas",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -141,34 +126,38 @@ a = Analysis(
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(analysis.pure, analysis.zipped_data, cipher=block_cipher)
 
-exe = EXE(
+icon_file = "assets/logo.ico" if os.path.exists("assets/logo.ico") else None
+
+executable = EXE(
     pyz,
-    a.scripts,
+    analysis.scripts,
     [],
     exclude_binaries=True,
     name="RamRacingCFD",
-    icon=None,
+    icon=icon_file,
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,            # don't strip on Windows
+    strip=False,        # stripping corrupts Windows DLLs
     upx=False,
     upx_exclude=["*"],
-    console=True,           # show console for debugging — set False for release
+    console=True,       # set False once a build has been verified
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
 )
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+collection = COLLECT(
+    executable,
+    analysis.binaries,
+    analysis.zipfiles,
+    analysis.datas,
     strip=False,
     upx=False,
     upx_exclude=["*"],
     name="RamRacingCFD",
 )
+
+print("=== build configured ===\n")

@@ -36946,3 +36946,17 @@ CFD-Automation-Suite-Source-Code/dist/RamRacingCFD/_internal/wrapt/_wrappers.cpy
 CFD-Automation-Suite-Source-Code/dist/RamRacingCFD/_internal/yaml/_yaml.cpython-312-x86_64-linux-gnu.so
 CFD-Automation-Suite-Source-Code/nohup.out
 CFD-Automation-Suite-Source-Code/pyfluent.log
+ParaView_Automation/__pycache__/batch_postprocess.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/core/__pycache__/queue_manager.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/gui/__pycache__/app.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/gui/__pycache__/reference_tabs.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/gui/__pycache__/settings_dialog.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/gui/__pycache__/sim_editor.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/gui/__pycache__/theme.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/simtypes/__pycache__/__init__.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/simtypes/__pycache__/half_car.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/utils/__pycache__/fluent_log.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/utils/__pycache__/naming.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/utils/__pycache__/refinement.cpython-312.pyc
+CFD-Automation-Suite-Source-Code/utils/__pycache__/resource_path.cpython-312.pyc
+fluent-20260806-115419-44180.trn

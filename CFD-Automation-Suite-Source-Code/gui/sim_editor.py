@@ -1,763 +1,665 @@
 """
-Simulation configuration editor — PyQt6.
-Tabbed dialog: General | Meshing | Ramp-Up | Wheel MRF
-CoP is derived automatically from Fluent moment reports — no geometry tab needed.
+Simulation editor.
+
+Edits a simulation type's Settings dataclass. Fields are bound by attribute
+name, so any simulation type exposing the standard names works here without
+changes; anything it does not define is simply skipped.
+
+Tabs: General, Meshing, Solver, Wheels, plus the two reference tables.
 """
 import os
+
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QTabWidget, QWidget, QVBoxLayout,
-    QHBoxLayout, QFormLayout, QGroupBox, QLabel, QLineEdit,
-    QDoubleSpinBox, QSpinBox, QComboBox, QCheckBox, QPushButton,
-    QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem,
-    QAbstractItemView, QHeaderView, QFrame, QSizePolicy, QTextEdit
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QWidget,
+    QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton,
+    QFrame, QScrollArea, QFileDialog, QMessageBox, QGroupBox, QComboBox,
 )
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtCore import Qt
 
-from simtypes.configs import BaseSimConfig, WheelMRFConfig, SIM_TYPE_REGISTRY
-
-MPI_OPTIONS = ["openmpi", "intel", "default"]
+from gui.reference_tabs import NamedSelectionsTab, ReportDefinitionsTab
+from utils.refinement import refinement_boxes
 
 
-def _browse_file(parent, var: QLineEdit, title: str,
-                 filters: str = "All Files (*)"):
-    path, _ = QFileDialog.getOpenFileName(parent, title, "", filters)
-    if path:
-        var.setText(path)
+class SimEditor(QDialog):
+    """Modal editor for one simulation's settings."""
 
-
-def _browse_dir(parent, var: QLineEdit, title: str = "Select Directory"):
-    path = QFileDialog.getExistingDirectory(parent, title, "")
-    if path:
-        var.setText(path)
-
-
-class SimEditorDialog(QDialog):
-    def __init__(self, parent, config: BaseSimConfig):
+    def __init__(self, sim_type, settings, parent=None, is_new=False):
         super().__init__(parent)
-        self.config = config
-        self.accepted_ok = False
+        self.sim_type = sim_type
+        self.settings = settings
+
         self.setWindowTitle(
-            f"Edit Simulation — {config.sim_type.value}"
+            f"{'New' if is_new else 'Edit'} Simulation — {sim_type.NAME}"
         )
-        self.setMinimumSize(680, 620)
-        self.setModal(True)
-        self._build()
-        self._load_from_config()
+        self.setMinimumSize(820, 720)
 
-    # ── Main layout ───────────────────────────────────────────────────────────
-
-    def _build(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Header bar
-        hdr = QFrame()
-        hdr.setStyleSheet(
-            "QFrame { background-color: #282c34; border-bottom: 1px solid #3e4451; }"
-        )
-        hdr.setFixedHeight(52)
-        hdr_l = QHBoxLayout(hdr)
-        hdr_l.setContentsMargins(16, 0, 16, 0)
-        title = QLabel(f"⚙  {self.config.sim_type.value} Configuration")
-        title.setObjectName("subheading")
-        hdr_l.addWidget(title)
-        root.addWidget(hdr)
+        # ── Header ───────────────────────────────────────────────────────
+        header = QFrame()
+        header.setStyleSheet("QFrame { background-color: #282c34; "
+                             "border-bottom: 1px solid #3e4451; }")
+        head_layout = QVBoxLayout(header)
+        head_layout.setContentsMargins(18, 12, 18, 12)
+        title = QLabel(sim_type.NAME)
+        title.setObjectName("heading")
+        head_layout.addWidget(title)
+        subtitle = QLabel(sim_type.__doc__.strip().splitlines()[0]
+                          if sim_type.__doc__ else "")
+        subtitle.setObjectName("muted")
+        head_layout.addWidget(subtitle)
+        root.addWidget(header)
 
-        # Tab widget
+        # ── Tabs ─────────────────────────────────────────────────────────
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        root.addWidget(self.tabs)
-
-        self._build_general_tab()
-        self._build_mesh_tab()
-        self._build_rampup_tab()
-        if self.config.use_wheel_mrf:
-            self._build_wheel_tab()
-        from simtypes.configs import SimType
-        if self.config.sim_type == SimType.TURNING:
-            self._build_turning_tab()
-
-        # Button row
-        btn_frame = QFrame()
-        btn_frame.setStyleSheet(
-            "QFrame { background-color: #282c34; border-top: 1px solid #3e4451; }"
-        )
-        btn_l = QHBoxLayout(btn_frame)
-        btn_l.setContentsMargins(16, 10, 16, 10)
-        btn_l.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_l.addWidget(cancel_btn)
-
-        ok_btn = QPushButton("✔  Accept")
-        ok_btn.setObjectName("accent")
-        ok_btn.setDefault(True)
-        ok_btn.clicked.connect(self._accept)
-        btn_l.addWidget(ok_btn)
-
-        root.addWidget(btn_frame)
-
-    # ── General tab ───────────────────────────────────────────────────────────
-
-    def _build_general_tab(self):
-        w = self._scroll_tab("  General  ")
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setSpacing(9)
-        form.setContentsMargins(20, 16, 20, 16)
-
-        self.e_name = QLineEdit()
-        form.addRow("Simulation Name:", self.e_name)
-
-        self.sb_speed = QDoubleSpinBox()
-        self.sb_speed.setRange(1, 300)
-        self.sb_speed.setDecimals(1)
-        self.sb_speed.setSuffix("  mph")
-        form.addRow("Vehicle Speed:", self.sb_speed)
-
-        form.addRow(self._hsep())
-
-        # Geometry path — pmdb/dsco only
-        self.e_geom = QLineEdit()
-        self.e_geom.setPlaceholderText("Select .pmdb or .dsco file from Discovery…")
-        geom_btn = QPushButton("Browse…")
-        geom_btn.clicked.connect(
-            lambda: _browse_file(
-                self, self.e_geom,
-                "Select Geometry (.pmdb or .dsco)",
-                "Ansys Discovery Files (*.pmdb *.dsco);;PMDB (*.pmdb);;DSCO (*.dsco)"
-            )
-        )
-        form.addRow("Geometry File:", self._browse_row(self.e_geom, geom_btn))
-
-        # Output dirs
-        self.e_output = QLineEdit()
-        self.e_output.setPlaceholderText("Where Fluent saves .cas.h5 files…")
-        out_btn = QPushButton("Browse…")
-        out_btn.clicked.connect(
-            lambda: _browse_dir(self, self.e_output, "Select Simulation Output Directory")
-        )
-        form.addRow("Sim Output Dir:", self._browse_row(self.e_output, out_btn))
-
-        self.e_results = QLineEdit()
-        self.e_results.setPlaceholderText("Where the results .txt report is saved…")
-        res_btn = QPushButton("Browse…")
-        res_btn.clicked.connect(
-            lambda: _browse_dir(self, self.e_results, "Select Results Export Directory")
-        )
-        form.addRow("Results Export Dir:", self._browse_row(self.e_results, res_btn))
-
-        form.addRow(self._hsep())
-
-        # HPC settings
-        hpc_label = QLabel("HPC / Solver Settings")
-        hpc_label.setObjectName("subheading")
-        form.addRow(hpc_label)
-
-        self.sb_procs = QSpinBox()
-        self.sb_procs.setRange(1, 512)
-        self.sb_procs.setToolTip(
-            "ThreadRipper: 40–50  |  Xeon Gold: 60  |  Big Boi: 128–170"
-        )
-        form.addRow("Processes:", self.sb_procs)
-
-        self.sb_timeout = QSpinBox()
-        self.sb_timeout.setRange(60, 1800)
-        self.sb_timeout.setSingleStep(30)
-        self.sb_timeout.setSuffix(" s")
-        self.sb_timeout.setToolTip(
-            "How long to wait for Fluent to start before giving up. "
-            "Increase to 300-600s on slow HPC cluster machines."
-        )
-        form.addRow("Launch Timeout:", self.sb_timeout)
-
-        self.cb_mpi = QComboBox()
-        self.cb_mpi.addItems(MPI_OPTIONS)
-        self.cb_mpi.setToolTip(
-            "ThreadRipper → openmpi  |  Xeon Gold → intel  |  Big Boi → default"
-        )
-        form.addRow("MPI Type:", self.cb_mpi)
-
-        self.chk_double = QCheckBox("Double Precision  (recommended)")
-        form.addRow("", self.chk_double)
-
-        form.addRow(self._hsep())
-
-        # Car dimensions
-        dim_label = QLabel("Car Dimensions  (for refinement box sizing)")
-        dim_label.setObjectName("subheading")
-        form.addRow(dim_label)
-
-        self.sb_cl = QDoubleSpinBox()
-        self.sb_cl.setRange(0.1, 10); self.sb_cl.setDecimals(3); self.sb_cl.setSuffix(" m")
-        form.addRow("Length L (X axis):", self.sb_cl)
-
-        self.sb_cw = QDoubleSpinBox()
-        self.sb_cw.setRange(0.1, 10); self.sb_cw.setDecimals(3); self.sb_cw.setSuffix(" m")
-        form.addRow("Width W (Z axis):", self.sb_cw)
-
-        self.sb_ch = QDoubleSpinBox()
-        self.sb_ch.setRange(0.1, 10); self.sb_ch.setDecimals(3); self.sb_ch.setSuffix(" m")
-        form.addRow("Height H (Y axis):", self.sb_ch)
-
-        form.addRow(self._hsep())
-
-        wb_label = QLabel("CoP Calculation")
-        wb_label.setObjectName("subheading")
-        form.addRow(wb_label)
-
-        self.sb_wheelbase = QDoubleSpinBox()
-        self.sb_wheelbase.setRange(10.0, 300.0)
-        self.sb_wheelbase.setDecimals(2)
-        self.sb_wheelbase.setSingleStep(0.5)
-        self.sb_wheelbase.setSuffix(" in")
-        self.sb_wheelbase.setToolTip(
-            "Front-to-rear axle distance. Used to compute front/rear aero balance %.\n"
-            "Lf, Lr, Lu are derived automatically from Fluent moment reports — "
-            "no hand measurement needed."
-        )
-        note_wb = QLabel("Lf / Lr / Lu derived from simulation moment data automatically.")
-        note_wb.setObjectName("muted")
-        note_wb.setWordWrap(True)
-        form.addRow("Wheelbase L:", self.sb_wheelbase)
-        form.addRow(note_wb)
-
-        w.layout().addLayout(form)
-        w.layout().addStretch()
-
-    # ── Mesh tab ──────────────────────────────────────────────────────────────
-
-    def _build_mesh_tab(self):
-        w = self._scroll_tab("  Meshing  ")
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setSpacing(9)
-        form.setContentsMargins(20, 16, 20, 16)
-
-        # Issue #15: existing_mesh_path field — skip meshing and use pre-built mesh
-        skip_head = QLabel("Skip Meshing")
-        skip_head.setObjectName("subheading")
-        form.addRow(skip_head)
-
-        self.e_existing_mesh = QLineEdit()
-        self.e_existing_mesh.setPlaceholderText(
-            "Optional: path to existing .msh.h5 — leave blank to run full meshing pipeline…"
-        )
-        mesh_btn = QPushButton("Browse…")
-        mesh_btn.clicked.connect(
-            lambda: _browse_file(
-                self, self.e_existing_mesh,
-                "Select Existing Mesh File",
-                "Fluent Mesh (*.msh.h5 *.msh);;All Files (*)",
-            )
-        )
-        skip_note = QLabel(
-            "When set, the meshing pipeline is skipped entirely and this file is "
-            "loaded directly into the solver. Useful for iterating on solver "
-            "settings without re-meshing (saves ~90 min per run)."
-        )
-        skip_note.setObjectName("muted")
-        skip_note.setWordWrap(True)
-        form.addRow("Existing Mesh:", self._browse_row(self.e_existing_mesh, mesh_btn))
-        form.addRow(skip_note)
-
-        form.addRow(self._hsep())
-
-        surf = QLabel("Surface Mesh")
-        surf.setObjectName("subheading")
-        form.addRow(surf)
-
-        self.sb_surf_min = self._mspin()
-        self.sb_surf_max = self._mspin(max_v=1.0)
-        form.addRow("Min Size [m]:", self.sb_surf_min)
-        form.addRow("Max Size [m]:", self.sb_surf_max)
-
-        form.addRow(self._hsep())
-
-        vol = QLabel("Volume Mesh")
-        vol.setObjectName("subheading")
-        form.addRow(vol)
-
-        self.sb_vol_min = self._mspin()
-        self.sb_vol_max = self._mspin(max_v=1.0)
-        form.addRow("Min Size [m]:", self.sb_vol_min)
-        form.addRow("Max Size [m]:", self.sb_vol_max)
-
-        form.addRow(self._hsep())
-
-        bl = QLabel("Boundary Layers")
-        bl.setObjectName("subheading")
-        form.addRow(bl)
-
-        self.sb_bl_layers = QSpinBox()
-        self.sb_bl_layers.setRange(1, 30)
-        form.addRow("Number of Layers:", self.sb_bl_layers)
-
-        self.sb_bl_first = self._mspin(max_v=0.01, step=0.0001, decimals=5)
-        form.addRow("First Height [m]:", self.sb_bl_first)
-
-        self.sb_bl_trans = QDoubleSpinBox()
-        self.sb_bl_trans.setRange(0.1, 1.0)
-        self.sb_bl_trans.setDecimals(4)
-        self.sb_bl_trans.setSingleStep(0.01)
-        form.addRow("Transition Ratio:", self.sb_bl_trans)
-
-        w.layout().addLayout(form)
-        w.layout().addStretch()
-
-    # ── Ramp-up tab ───────────────────────────────────────────────────────────
-
-    def _build_rampup_tab(self):
-        w = self._scroll_tab("  Ramp-Up  ")
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setSpacing(9)
-        form.setContentsMargins(20, 16, 20, 16)
-
-        lbl = QLabel("Ramp-Up Iterations")
-        lbl.setObjectName("subheading")
-        form.addRow(lbl)
-
-        ramps = [
-            ("sb_r0", "Ramp 0  (1st order stabilisation):", 50, 5000),
-            ("sb_r1", "Ramp 1  (2nd order + Presto pressure):", 50, 5000),
-            ("sb_r2", "Ramp 2  (Full 2nd order, no CC):", 50, 5000),
-            ("sb_r3", "Ramp 3  (Full Send — CC on):", 50, 10000),
-        ]
-        for attr, label, lo, hi in ramps:
-            sb = QSpinBox()
-            sb.setRange(lo, hi)
-            sb.setSingleStep(50)
-            setattr(self, attr, sb)
-            form.addRow(label, sb)
-
-        form.addRow(self._hsep())
-
-        turb = QLabel("Turbulence Options")
-        turb.setObjectName("subheading")
-        form.addRow(turb)
-
-        self.chk_cc = QCheckBox(
-            "Enable Curvature Correction on Ramp 3  (Full Send)"
-        )
-        self.chk_pl = QCheckBox("Enable Production Limiter  (recommended ON)")
-        form.addRow("", self.chk_cc)
-        form.addRow("", self.chk_pl)
-
-        note = QLabel(
-            "Curvature correction is always OFF for Ramps 0–2 regardless of "
-            "this setting. When enabled here it is applied during Ramp 3 only."
-        )
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        form.addRow(note)
-
-        w.layout().addLayout(form)
-        w.layout().addStretch()
-
-    # ── Wheel MRF tab ─────────────────────────────────────────────────────────
-
-    def _build_wheel_tab(self):
-        w = self._scroll_tab("  Wheel MRF  ")
-        v = w.layout()
-        v.setContentsMargins(16, 12, 16, 12)
-        v.setSpacing(10)
-
-        top = QHBoxLayout()
-        self.chk_mrf = QCheckBox(
-            "Enable Wheel Moving Reference Frame (MRF)"
-        )
-        top.addWidget(self.chk_mrf)
-        top.addStretch()
-        v.addLayout(top)
-
-        note = QLabel(
-            "Each wheel needs a cylindrical MRF cell zone created in Ansys Discovery. "
-            "See the Wheel MRF Setup Guide PDF for step-by-step instructions.\n"
-            "RPM = 0 → auto-calculated from vehicle speed and wheel radius."
-        )
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        v.addWidget(note)
-
-        # Table
-        cols = ["Name", "Zone Name", "Cx [m]", "Cy [m]", "Cz [m]",
-                "Ax", "Ay", "Az", "Radius [m]", "RPM"]
-        self.wheel_table = QTableWidget(0, len(cols))
-        self.wheel_table.setHorizontalHeaderLabels(cols)
-        self.wheel_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self.wheel_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.wheel_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.wheel_table.setAlternatingRowColors(True)
-        self.wheel_table.verticalHeader().setVisible(False)
-        self.wheel_table.setMinimumHeight(160)
-        v.addWidget(self.wheel_table)
-
-        # Buttons
-        btn_row = QHBoxLayout()
-        for label, slot in [
-            ("＋  Add Wheel",    self._add_wheel),
-            ("✎  Edit",         self._edit_wheel),
-            ("✕  Remove",       self._remove_wheel),
-        ]:
-            btn = QPushButton(label)
-            if "Add" in label:
-                btn.setObjectName("accent")
-            elif "Remove" in label:
-                btn.setObjectName("danger")
-            btn.clicked.connect(slot)
-            btn_row.addWidget(btn)
-        btn_row.addStretch()
-        reset_btn = QPushButton("↺  Reset Defaults")
-        reset_btn.clicked.connect(self._reset_wheels)
-        btn_row.addWidget(reset_btn)
-        v.addLayout(btn_row)
-
-        v.addStretch()
-        self._refresh_wheel_table()
-
-    # ── Wheel table helpers ───────────────────────────────────────────────────
-
-    def _refresh_wheel_table(self):
-        if not hasattr(self, "wheel_table"):
-            return
-        t = self.wheel_table
-        t.setRowCount(0)
-        for w in self.config.wheel_mrf_zones:
-            r = t.rowCount()
-            t.insertRow(r)
-            vals = [
-                w.name, w.zone_name,
-                f"{w.center_x:.3f}", f"{w.center_y:.3f}", f"{w.center_z:.3f}",
-                f"{w.axis_x:.0f}", f"{w.axis_y:.0f}", f"{w.axis_z:.0f}",
-                f"{w.wheel_radius:.4f}",
-                "auto" if w.rpm == 0 else f"{w.rpm:.0f}",
-            ]
-            for c, val in enumerate(vals):
-                item = QTableWidgetItem(str(val))
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                t.setItem(r, c, item)
-
-    def _selected_wheel_idx(self):
-        rows = self.wheel_table.selectedItems()
-        if not rows:
-            return None
-        return self.wheel_table.currentRow()
-
-    def _add_wheel(self):
-        from gui.wheel_editor import WheelMRFEditorDialog
-        dlg = WheelMRFEditorDialog(self, WheelMRFConfig(name="NEW", zone_name="mrf_new"))
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.config.wheel_mrf_zones.append(dlg.wheel)
-            self._refresh_wheel_table()
-
-    def _edit_wheel(self):
-        idx = self._selected_wheel_idx()
-        if idx is None:
-            return
-        from gui.wheel_editor import WheelMRFEditorDialog
-        dlg = WheelMRFEditorDialog(self, self.config.wheel_mrf_zones[idx])
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.config.wheel_mrf_zones[idx] = dlg.wheel
-            self._refresh_wheel_table()
-
-    def _remove_wheel(self):
-        idx = self._selected_wheel_idx()
-        if idx is None:
-            return
-        del self.config.wheel_mrf_zones[idx]
-        self._refresh_wheel_table()
-
-    def _reset_wheels(self):
-        default = SIM_TYPE_REGISTRY[self.config.sim_type]()
-        self.config.wheel_mrf_zones = default.wheel_mrf_zones
-        self._refresh_wheel_table()
-
-    # ── Load / write config ───────────────────────────────────────────────────
-
-    def _load_from_config(self):
-        c = self.config
-        self.e_name.setText(c.name)
-        self.sb_speed.setValue(c.vehicle_speed_mph)
-        self.e_geom.setText(c.geometry_path)
-        self.e_output.setText(c.output_dir)
-        self.e_results.setText(c.results_dir)
-        self.sb_procs.setValue(c.num_processes)
-        self.sb_timeout.setValue(c.launch_timeout)
-        self.cb_mpi.setCurrentText(c.mpi_type)
-        self.chk_double.setChecked(c.double_precision)
-        self.sb_cl.setValue(c.car_length_m)
-        self.sb_cw.setValue(c.car_width_m)
-        self.sb_ch.setValue(c.car_height_m)
-        self.sb_wheelbase.setValue(c.wheelbase_in)
-
-        self.e_existing_mesh.setText(getattr(c, "existing_mesh_path", ""))
-        self.sb_surf_min.setValue(c.surface_mesh_min)
-        self.sb_surf_max.setValue(c.surface_mesh_max)
-        self.sb_vol_min.setValue(c.volume_mesh_min)
-        self.sb_vol_max.setValue(c.volume_mesh_max)
-        self.sb_bl_layers.setValue(c.bl_num_layers)
-        self.sb_bl_first.setValue(c.bl_first_height)
-        self.sb_bl_trans.setValue(c.bl_transition_ratio)
-
-        self.sb_r0.setValue(c.ramp0_iters)
-        self.sb_r1.setValue(c.ramp1_iters)
-        self.sb_r2.setValue(c.ramp2_iters)
-        self.sb_r3.setValue(c.ramp3_iters)
-        self.chk_cc.setChecked(c.use_curvature_correction)
-        self.chk_pl.setChecked(c.use_production_limiter)
-
-        if hasattr(self, "chk_mrf"):
-            self.chk_mrf.setChecked(c.use_wheel_mrf)
-
-        # Turning tab
-        if hasattr(self, "sb_turn_radius"):
-            self.sb_turn_radius.setValue(c.turn_radius_m)
-            self.sb_track_width.setValue(c.track_width_m)
-            self.chk_auto_yaw.setChecked(c.auto_yaw)
-            self.sb_yaw.setValue(c.yaw_angle_deg)
-            self._update_yaw_preview()
-
-
-    def _write_to_config(self):
-        c = self.config
-        c.name              = self.e_name.text().strip()
-        c.vehicle_speed_mph = self.sb_speed.value()
-        c.geometry_path     = self.e_geom.text().strip()
-        c.output_dir        = self.e_output.text().strip()
-        c.results_dir       = self.e_results.text().strip()
-        c.num_processes     = self.sb_procs.value()
-        c.launch_timeout    = self.sb_timeout.value()
-        c.mpi_type          = self.cb_mpi.currentText()
-        c.double_precision  = self.chk_double.isChecked()
-        c.car_length_m      = self.sb_cl.value()
-        c.car_width_m       = self.sb_cw.value()
-        c.car_height_m      = self.sb_ch.value()
-        c.wheelbase_in      = self.sb_wheelbase.value()
-
-        c.existing_mesh_path = self.e_existing_mesh.text().strip()
-        c.surface_mesh_min  = self.sb_surf_min.value()
-        c.surface_mesh_max  = self.sb_surf_max.value()
-        c.volume_mesh_min   = self.sb_vol_min.value()
-        c.volume_mesh_max   = self.sb_vol_max.value()
-        c.bl_num_layers     = self.sb_bl_layers.value()
-        c.bl_first_height   = self.sb_bl_first.value()
-        c.bl_transition_ratio = self.sb_bl_trans.value()
-
-        c.ramp0_iters              = self.sb_r0.value()
-        c.ramp1_iters              = self.sb_r1.value()
-        c.ramp2_iters              = self.sb_r2.value()
-        c.ramp3_iters              = self.sb_r3.value()
-        c.use_curvature_correction = self.chk_cc.isChecked()
-        c.use_production_limiter   = self.chk_pl.isChecked()
-
-        if hasattr(self, "chk_mrf"):
-            c.use_wheel_mrf = self.chk_mrf.isChecked()
-
-        # Turning tab
-        if hasattr(self, "sb_turn_radius"):
-            c.turn_radius_m  = self.sb_turn_radius.value()
-            c.track_width_m  = self.sb_track_width.value()
-            c.auto_yaw       = self.chk_auto_yaw.isChecked()
-            c.yaw_angle_deg  = self.sb_yaw.value()
-
-
-    def _accept(self):
-        try:
-            self._write_to_config()
-        except Exception as e:
-            QMessageBox.critical(self, "Input Error", str(e))
-            return
-        errors = self.config.validate()
-        if errors:
-            QMessageBox.warning(self, "Validation Error", "\n".join(errors))
-            return
-        self.accepted_ok = True
-        self.accept()
-
-    # ── Turning tab ───────────────────────────────────────────────────────────
-
-    def _build_turning_tab(self):
-        w = self._scroll_tab("  Cornering  ")
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setSpacing(9)
-        form.setContentsMargins(20, 16, 20, 16)
-
-        # Section heading
-        head = QLabel("Cornering Parameters")
-        head.setObjectName("subheading")
-        form.addRow(head)
-
-        # Turn radius
-        self.sb_turn_radius = QDoubleSpinBox()
-        self.sb_turn_radius.setRange(0.5, 500.0)
-        self.sb_turn_radius.setDecimals(2)
-        self.sb_turn_radius.setSingleStep(0.5)
-        self.sb_turn_radius.setSuffix(" m")
-        self.sb_turn_radius.setToolTip(
-            "Radius from the car centreline to the turn centre.\n"
-            "Typical autocross: 6–12 m.  Skidpad: 7.625 m (SAE)."
-        )
-        form.addRow("Turn Radius:", self.sb_turn_radius)
-
-        # Track width
-        self.sb_track_width = QDoubleSpinBox()
-        self.sb_track_width.setRange(0.1, 5.0)
-        self.sb_track_width.setDecimals(3)
-        self.sb_track_width.setSingleStep(0.05)
-        self.sb_track_width.setSuffix(" m")
-        self.sb_track_width.setToolTip(
-            "Lateral distance from car centreline to wheel centre.\n"
-            "Used to compute inner/outer wheel speed asymmetry."
-        )
-        form.addRow("Track Width (½ car):", self.sb_track_width)
-
-        form.addRow(self._hsep())
-
-        # Yaw angle — auto or manual
-        yaw_head = QLabel("Inlet Yaw Angle")
-        yaw_head.setObjectName("subheading")
-        form.addRow(yaw_head)
-
-        self.chk_auto_yaw = QCheckBox("Auto  (derived from speed and radius)")
-        self.chk_auto_yaw.setToolTip(
-            "When enabled, yaw = atan(v² / (g·R)).\n"
-            "This is the aerodynamic slip angle approximation.\n"
-            "Uncheck to set a manual yaw angle instead."
-        )
-        form.addRow("", self.chk_auto_yaw)
-
-        self.sb_yaw = QDoubleSpinBox()
-        self.sb_yaw.setRange(-89.0, 89.0)
-        self.sb_yaw.setDecimals(2)
-        self.sb_yaw.setSingleStep(0.5)
-        self.sb_yaw.setSuffix(" °")
-        self.sb_yaw.setToolTip(
-            "Manual yaw angle applied to the inlet velocity vector.\n"
-            "Positive = nose-right / left-hand turn.\n"
-            "Only used when Auto is unchecked."
-        )
-        form.addRow("Manual Yaw Angle:", self.sb_yaw)
-
-        # Preview label — shows the resolved yaw angle live
-        self._yaw_preview = QLabel("—")
-        self._yaw_preview.setObjectName("muted")
-        form.addRow("Resolved Yaw:", self._yaw_preview)
-
-        # Wire auto-yaw toggle and preview updates
-        self.chk_auto_yaw.toggled.connect(self._update_yaw_preview)
-        self.sb_turn_radius.valueChanged.connect(self._update_yaw_preview)
-        self.sb_speed.valueChanged.connect(self._update_yaw_preview)   # General tab
-        self.sb_yaw.valueChanged.connect(self._update_yaw_preview)
-
-        form.addRow(self._hsep())
-
-        # Wheel speed note
-        info_head = QLabel("Wheel Speed Asymmetry")
-        info_head.setObjectName("subheading")
-        form.addRow(info_head)
-
-        note = QLabel(
-            "Outer wheels travel a longer path than inner wheels.\n"
-            "RPMs are calculated automatically at solve time:\n\n"
-            "  v_outer = v_car × (R + track) / R\n"
-            "  v_inner = v_car × (R − track) / R\n"
-            "  ω = v / r_wheel\n\n"
-            "Left-side wheels (axis_z = +1) are outer wheels for a\n"
-            "positive yaw (left-hand turn).  Individual RPM overrides\n"
-            "in the Wheel MRF tab will take precedence."
-        )
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        form.addRow(note)
-
-        form.addRow(self._hsep())
-
-        # Outputs note
-        out_head = QLabel("Additional Outputs")
-        out_head.setObjectName("subheading")
-        form.addRow(out_head)
-
-        out_note = QLabel(
-            "Yaw Moment (lbf·ft) — about car centroid, Y axis.\n"
-            "Lateral Force (lbf) — total side force, Z axis.\n\n"
-            "+ve yaw moment = oversteer tendency.\n"
-            "−ve yaw moment = understeer tendency."
-        )
-        out_note.setObjectName("muted")
-        out_note.setWordWrap(True)
-        form.addRow(out_note)
-
-        w.layout().addLayout(form)
-        w.layout().addStretch()
-
-    def _update_yaw_preview(self):
-        """Recompute and display the resolved yaw angle in the Cornering tab."""
-        if not hasattr(self, "chk_auto_yaw"):
-            return
-        if self.chk_auto_yaw.isChecked():
-            import math
-            speed_ms = self.sb_speed.value() * 0.44704
-            R = self.sb_turn_radius.value()
-            if R > 0:
-                # Issue #11 fix: atan(v²/(g·R)) — aerodynamic slip angle
-                g = 9.81
-                yaw = math.degrees(math.atan(speed_ms ** 2 / (g * R)))
-                self._yaw_preview.setText(f"{yaw:.2f}°  (auto)")
-            else:
-                self._yaw_preview.setText("—  (invalid radius)")
-            self.sb_yaw.setEnabled(False)
-        else:
-            self._yaw_preview.setText(f"{self.sb_yaw.value():.2f}°  (manual)")
-            self.sb_yaw.setEnabled(True)
-
-    # ── Utility widget builders ───────────────────────────────────────────────
-
-    def _scroll_tab(self, title: str) -> QWidget:
-        """Create a tab page with a VBoxLayout and add to notebook."""
-        from PyQt6.QtWidgets import QScrollArea
+        root.addWidget(self.tabs, 1)
+
+        self._build_general()
+        self._build_meshing()
+        self._build_solver()
+        if hasattr(settings, "front_wheel_origin"):
+            self._build_wheels()
+
+        selections = NamedSelectionsTab()
+        selections.load(sim_type)
+        self.tabs.addTab(selections, "  Named Selections  ")
+
+        reports = ReportDefinitionsTab()
+        reports.load(sim_type)
+        self.tabs.addTab(reports, "  Reports  ")
+
+        # ── Buttons ──────────────────────────────────────────────────────
+        footer = QFrame()
+        footer.setStyleSheet("QFrame { background-color: #282c34; "
+                             "border-top: 1px solid #3e4451; }")
+        foot = QHBoxLayout(footer)
+        foot.setContentsMargins(18, 11, 18, 11)
+
+        self.summary = QLabel("")
+        self.summary.setObjectName("muted")
+        foot.addWidget(self.summary)
+        foot.addStretch()
+
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        foot.addWidget(cancel)
+
+        accept = QPushButton("Save")
+        accept.setObjectName("accent")
+        accept.setDefault(True)
+        accept.clicked.connect(self._accept)
+        foot.addWidget(accept)
+
+        root.addWidget(footer)
+
+        self._load()
+        self._refresh_summary()
+
+    # ── Tab construction helpers ─────────────────────────────────────────
+
+    def _tab(self, title: str):
+        """Return a (page, form) pair already added as a scrollable tab."""
         page = QWidget()
-        page.setLayout(QVBoxLayout())
-        page.layout().setContentsMargins(0, 0, 0, 0)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(22, 18, 22, 18)
+        outer.setSpacing(4)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setSpacing(9)
+        outer.addLayout(form)
+        outer.addStretch()
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(page)
-
         self.tabs.addTab(scroll, title)
-        return page
+        return page, form
 
-    def _browse_row(self, edit: QLineEdit, btn: QPushButton) -> QWidget:
-        row = QWidget()
-        row.setStyleSheet("background: transparent;")
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(6)
-        h.addWidget(edit)
-        h.addWidget(btn)
-        return row
+    @staticmethod
+    def _sub(form, text: str) -> None:
+        label = QLabel(text)
+        label.setObjectName("subheading")
+        form.addRow(label)
 
-    def _hsep(self) -> QFrame:
+    @staticmethod
+    def _note(form, text: str) -> None:
+        label = QLabel(text)
+        label.setObjectName("muted")
+        label.setWordWrap(True)
+        form.addRow("", label)
+
+    @staticmethod
+    def _hr(form) -> None:
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet(f"color: #3e4451;")
-        return line
+        form.addRow(line)
 
-    def _mspin(self, min_v=0.0001, max_v=0.1, step=0.001, decimals=4):
-        sb = QDoubleSpinBox()
-        sb.setRange(min_v, max_v)
-        sb.setDecimals(decimals)
-        sb.setSingleStep(step)
-        sb.setSuffix(" m")
-        return sb
+    def _browse_row(self, edit: QLineEdit, caption: str,
+                    file_filter: str = "", directory: bool = False) -> QWidget:
+        """A line edit with a Browse button beside it."""
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(edit, 1)
+
+        button = QPushButton("Browse…")
+        button.setFixedWidth(84)
+
+        def pick():
+            if directory:
+                path = QFileDialog.getExistingDirectory(self, caption,
+                                                        edit.text())
+            else:
+                path, _ = QFileDialog.getOpenFileName(self, caption,
+                                                      edit.text(), file_filter)
+            if path:
+                edit.setText(path)
+
+        button.clicked.connect(pick)
+        row.addWidget(button)
+        return box
+
+    @staticmethod
+    def _spin(minimum, maximum, decimals=0, step=1.0, suffix=""):
+        widget = QSpinBox() if decimals == 0 else QDoubleSpinBox()
+        widget.setRange(int(minimum) if decimals == 0 else minimum,
+                        int(maximum) if decimals == 0 else maximum)
+        if decimals:
+            widget.setDecimals(decimals)
+            widget.setSingleStep(step)
+        if suffix:
+            widget.setSuffix(f"  {suffix}")
+        return widget
+
+    # ── General ──────────────────────────────────────────────────────────
+
+    def _build_general(self):
+        _, form = self._tab("  General  ")
+
+        self._sub(form, "Identity")
+        self._note(form,
+                   "Project, Run and MAP match the CFD Rolling Report. The "
+                   "Point ID built from them names this run's folder and "
+                   "every file in it, so a folder and its Master Log row "
+                   "always share a name.")
+
+        from utils.naming import existing_projects, existing_runs
+
+        # Project: editable, but offers what is already on disk
+        self.combo_project = QComboBox()
+        self.combo_project.setEditable(True)
+        self.combo_project.setPlaceholderText("e.g. Dauntless")
+        self.combo_project.currentTextChanged.connect(self._project_changed)
+        form.addRow("Project:", self.combo_project)
+
+        self.combo_run = QComboBox()
+        self.combo_run.setEditable(True)
+        self.combo_run.setPlaceholderText("e.g. 18  or  R018")
+        self.combo_run.currentTextChanged.connect(self._run_changed)
+        form.addRow("Run:", self.combo_run)
+
+        map_row = QWidget()
+        map_layout = QHBoxLayout(map_row)
+        map_layout.setContentsMargins(0, 0, 0, 0)
+        map_layout.setSpacing(6)
+        self.sb_map = self._spin(1, 999)
+        self.sb_map.valueChanged.connect(self._refresh_identity)
+        map_layout.addWidget(self.sb_map, 1)
+        next_button = QPushButton("Next free")
+        next_button.setFixedWidth(84)
+        next_button.setToolTip(
+            "Use the first MAP number this run has not used yet")
+        next_button.clicked.connect(self._use_next_map)
+        map_layout.addWidget(next_button)
+        form.addRow("MAP number:", map_row)
+
+        self.lbl_point_id = QLabel("")
+        self.lbl_point_id.setObjectName("value")
+        form.addRow("Point ID:", self.lbl_point_id)
+
+        self.e_description = QLineEdit()
+        self.e_description.setPlaceholderText(
+            "Optional: what this point is testing, for the Master Log")
+        form.addRow("Description:", self.e_description)
+
+        self.lbl_folder = QLabel("")
+        self.lbl_folder.setObjectName("muted")
+        self.lbl_folder.setWordWrap(True)
+        self.lbl_folder.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow("Folder:", self.lbl_folder)
+
+        self._hr(form)
+        self._sub(form, "Geometry")
+        self.e_geometry = QLineEdit()
+        self.e_geometry.setPlaceholderText("Watertight .pmdb exported from Discovery")
+        form.addRow("Geometry:", self._browse_row(
+            self.e_geometry, "Select Geometry",
+            "Ansys Geometry (*.pmdb *.dsco);;All Files (*)"))
+
+        self._hr(form)
+        self._sub(form, "Skip Meshing")
+        self.e_existing = QLineEdit()
+        self.e_existing.setPlaceholderText(
+            "Optional: an existing .msh.h5 to solve directly")
+        form.addRow("Existing mesh:", self._browse_row(
+            self.e_existing, "Select Mesh",
+            "Fluent Mesh (*.msh.h5 *.msh *.cas.h5);;All Files (*)"))
+        self._note(form,
+                   "When set, meshing is skipped entirely and the solver runs "
+                   "against this file. Useful for trying solver settings "
+                   "without waiting on a remesh.")
+
+        self._hr(form)
+        self._sub(form, "Operating Point")
+        self.sb_speed = self._spin(1, 300, 1, 1.0, "mph")
+        self.sb_speed.valueChanged.connect(self._refresh_summary)
+        form.addRow("Vehicle speed:", self.sb_speed)
+        self.lbl_speed = QLabel("")
+        self.lbl_speed.setObjectName("muted")
+        form.addRow("", self.lbl_speed)
+
+        self._sub(form, "Fluent Session")
+        import os as _os
+        cores = _os.cpu_count() or 1
+        self.sb_processes = self._spin(1, 512)
+        self.sb_processes.valueChanged.connect(self._check_processes)
+        form.addRow("Processes:", self.sb_processes)
+
+        self.lbl_processes = QLabel("")
+        self.lbl_processes.setObjectName("muted")
+        self.lbl_processes.setWordWrap(True)
+        form.addRow("", self.lbl_processes)
+        self._machine_cores = cores
+
+        self._note(form,
+                   "ThreadRipper 40–50 · Xeon Gold 60–70 · Big Boi 128–170. "
+                   "Asking for more processes than the machine has cores "
+                   "stalls Fluent during parallel start-up.")
+
+        self.combo_mpi = QComboBox()
+        try:
+            from simtypes.half_car import MPI_TYPES
+            self.combo_mpi.addItems(MPI_TYPES)
+        except Exception:
+            self.combo_mpi.addItems(["intel", "openmpi", "msmpi", "default"])
+        form.addRow("MPI type:", self.combo_mpi)
+        self._note(form,
+                   "intel for the Xeon Gold nodes · openmpi for ThreadRipper · "
+                   "default lets Fluent choose. Passed as -mpi=<type>.")
+
+        self.cb_double = QCheckBox("Double precision")
+        form.addRow("", self.cb_double)
+
+    # ── Meshing ──────────────────────────────────────────────────────────
+
+    def _build_meshing(self):
+        _, form = self._tab("  Meshing  ")
+
+        self._sub(form, "Car Dimensions")
+        self._note(form, "Drive the Near / Mid / Far refinement boxes below.")
+        self.sb_length = self._spin(0.1, 20, 3, 0.05, "m")
+        self.sb_width  = self._spin(0.1, 10, 3, 0.05, "m")
+        self.sb_height = self._spin(0.1, 10, 3, 0.05, "m")
+        for widget in (self.sb_length, self.sb_width, self.sb_height):
+            widget.valueChanged.connect(self._refresh_boxes)
+        form.addRow("Length  (x):", self.sb_length)
+        form.addRow("Width   (z):", self.sb_width)
+        form.addRow("Height  (y):", self.sb_height)
+
+        self.sb_wheelbase = self._spin(0.1, 10, 3, 0.01, "m")
+        form.addRow("Wheelbase:", self.sb_wheelbase)
+
+        self._hr(form)
+        self._sub(form, "Refinement Regions")
+        self.lbl_boxes = QLabel("")
+        self.lbl_boxes.setObjectName("muted")
+        self.lbl_boxes.setStyleSheet(
+            "font-family: 'Cascadia Mono', 'Consolas', monospace; "
+            "font-size: 11px;")
+        self.lbl_boxes.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow(self.lbl_boxes)
+
+        self._hr(form)
+        self._sub(form, "Surface Mesh")
+        self.sb_surf_min = self._spin(0.0001, 1, 4, 0.001, "m")
+        self.sb_surf_max = self._spin(0.001, 5, 3, 0.01, "m")
+        form.addRow("Minimum size:", self.sb_surf_min)
+        form.addRow("Maximum size:", self.sb_surf_max)
+
+        self._sub(form, "Volume Mesh")
+        self.sb_vol_min = self._spin(0.0001, 1, 4, 0.001, "m")
+        self.sb_vol_max = self._spin(0.001, 5, 3, 0.01, "m")
+        form.addRow("Minimum cell:", self.sb_vol_min)
+        form.addRow("Maximum cell:", self.sb_vol_max)
+
+        self._sub(form, "Boundary Layers")
+        self.sb_bl_layers = self._spin(1, 40)
+        self.sb_bl_height = self._spin(0.00001, 0.1, 5, 0.0001, "m")
+        form.addRow("Layer count:", self.sb_bl_layers)
+        form.addRow("First height:", self.sb_bl_height)
+        self._note(form, "Grown on the aero surfaces and the ground.")
+
+    # ── Solver ───────────────────────────────────────────────────────────
+
+    def _build_solver(self):
+        _, form = self._tab("  Solver  ")
+
+        self._sub(form, "Ramp Sequence")
+        self._note(form,
+                   "Three stages, each starting from the previous result. "
+                   "Raise the counts if the force monitors have not flattened "
+                   "by the end of a stage.")
+
+        self.sb_ramp1 = self._spin(0, 100000)
+        self.sb_ramp2 = self._spin(0, 100000)
+        self.sb_ramp3 = self._spin(0, 100000)
+        for widget in (self.sb_ramp1, self.sb_ramp2, self.sb_ramp3):
+            widget.setSingleStep(50)
+            widget.valueChanged.connect(self._refresh_summary)
+
+        form.addRow("1  First order:", self.sb_ramp1)
+        self._note(form, "Standard pressure, first order momentum. Stabilises "
+                         "the field from the hybrid initialisation.")
+        form.addRow("2  Second order:", self.sb_ramp2)
+        self._note(form, "PRESTO! pressure, second order momentum.")
+        form.addRow("3  Full send:", self.sb_ramp3)
+        self._note(form, "SIMPLEC, full second order, curvature correction on. "
+                         "The values reported come from this stage.")
+
+        self.lbl_total_iters = QLabel("")
+        self.lbl_total_iters.setObjectName("value")
+        form.addRow("Total:", self.lbl_total_iters)
+
+        self._hr(form)
+        self._sub(form, "Exports")
+        self.cb_ensight = QCheckBox(
+            "Write EnSight Gold for ParaView after solving")
+        form.addRow("", self.cb_ensight)
+        self._note(form,
+                   "Creates <output>/<name>_ensight/. Open the .encas file in "
+                   "ParaView. The results .txt is always written.")
+
+    # ── Wheels ───────────────────────────────────────────────────────────
+
+    def _build_wheels(self):
+        _, form = self._tab("  Wheels  ")
+
+        self._sub(form, "Rotating Walls")
+        self._note(form,
+                   "Wheels are modelled as rotating walls: moving wall, "
+                   "absolute, rotational about the axle. The rotation rate "
+                   "follows from the vehicle speed and wheel radius, so only "
+                   "the geometry is set here.")
+
+        self.sb_wheel_radius = self._spin(0.01, 1.0, 4, 0.001, "m")
+        self.sb_wheel_radius.valueChanged.connect(self._refresh_summary)
+        form.addRow("Wheel radius:", self.sb_wheel_radius)
+
+        self.lbl_omega = QLabel("")
+        self.lbl_omega.setObjectName("value")
+        form.addRow("Rotation rate:", self.lbl_omega)
+
+        self._hr(form)
+        self._sub(form, "Front Axle Origin")
+        self._note(form, "Axle centre in metres. Y is normally the wheel "
+                         "radius, so the wheel sits on the ground.")
+        self.front_xyz = []
+        for axis in ("X", "Y", "Z"):
+            widget = self._spin(-50, 50, 4, 0.001, "m")
+            self.front_xyz.append(widget)
+            form.addRow(f"Front  {axis}:", widget)
+
+        self._sub(form, "Rear Axle Origin")
+        self.rear_xyz = []
+        for axis in ("X", "Y", "Z"):
+            widget = self._spin(-50, 50, 4, 0.001, "m")
+            self.rear_xyz.append(widget)
+            form.addRow(f"Rear   {axis}:", widget)
+
+        self._note(form,
+                   "Both axles rotate about +Z. If the origin sits at the "
+                   "wheelbase centre rather than the front axle, the reported "
+                   "aero balance is measured from that centre.")
+
+    # ── Load and save ────────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        s = self.settings
+        from utils.naming import existing_projects, existing_runs
+
+        root = getattr(s, "output_root", "")
+        self.combo_project.blockSignals(True)
+        self.combo_project.clear()
+        if root:
+            self.combo_project.addItems(existing_projects(root))
+        self.combo_project.setCurrentText(s.project)
+        self.combo_project.blockSignals(False)
+
+        self.combo_run.blockSignals(True)
+        self.combo_run.clear()
+        if root and s.project:
+            self.combo_run.addItems(existing_runs(root, s.project))
+        self.combo_run.setCurrentText(s.run)
+        self.combo_run.blockSignals(False)
+
+        self.sb_map.setValue(max(1, s.map_number))
+
+        self.e_description.setText(getattr(s, "description", ""))
+        self.e_geometry.setText(s.geometry_path)
+        self.e_existing.setText(s.existing_mesh)
+        self.sb_speed.setValue(s.speed_mph)
+        self.sb_processes.setValue(s.processes)
+        self.cb_double.setChecked(s.double_precision)
+        if hasattr(s, "mpi_type"):
+            index = self.combo_mpi.findText(s.mpi_type)
+            self.combo_mpi.setCurrentIndex(index if index >= 0 else 0)
+
+        self.sb_length.setValue(s.car_length)
+        self.sb_width.setValue(s.car_width)
+        self.sb_height.setValue(s.car_height)
+        self.sb_wheelbase.setValue(s.wheelbase)
+        self.sb_surf_min.setValue(s.surface_min)
+        self.sb_surf_max.setValue(s.surface_max)
+        self.sb_vol_min.setValue(s.volume_min)
+        self.sb_vol_max.setValue(s.volume_max)
+        self.sb_bl_layers.setValue(s.bl_layers)
+        self.sb_bl_height.setValue(s.bl_first_height)
+
+        self.sb_ramp1.setValue(s.ramp1_iters)
+        self.sb_ramp2.setValue(s.ramp2_iters)
+        self.sb_ramp3.setValue(s.ramp3_iters)
+        self.cb_ensight.setChecked(s.export_ensight)
+
+        if hasattr(self, "front_xyz"):
+            self.sb_wheel_radius.setValue(s.wheel_radius)
+            for widget, value in zip(self.front_xyz, s.front_wheel_origin):
+                widget.setValue(value)
+            for widget, value in zip(self.rear_xyz, s.rear_wheel_origin):
+                widget.setValue(value)
+
+        self._check_processes()
+        self._refresh_identity()
+        self._refresh_boxes()
+
+    def _save(self) -> None:
+        s = self.settings
+        s.project = self.combo_project.currentText().strip()
+        s.run = self.combo_run.currentText().strip()
+        s.map_number = self.sb_map.value()
+
+        s.description = self.e_description.text().strip()
+        s.geometry_path = self.e_geometry.text().strip()
+        s.existing_mesh = self.e_existing.text().strip()
+        s.speed_mph = self.sb_speed.value()
+        s.processes = self.sb_processes.value()
+        s.double_precision = self.cb_double.isChecked()
+        if hasattr(s, "mpi_type"):
+            s.mpi_type = self.combo_mpi.currentText()
+
+        s.car_length = self.sb_length.value()
+        s.car_width = self.sb_width.value()
+        s.car_height = self.sb_height.value()
+        s.wheelbase = self.sb_wheelbase.value()
+        s.surface_min = self.sb_surf_min.value()
+        s.surface_max = self.sb_surf_max.value()
+        s.volume_min = self.sb_vol_min.value()
+        s.volume_max = self.sb_vol_max.value()
+        s.bl_layers = self.sb_bl_layers.value()
+        s.bl_first_height = self.sb_bl_height.value()
+
+        s.ramp1_iters = self.sb_ramp1.value()
+        s.ramp2_iters = self.sb_ramp2.value()
+        s.ramp3_iters = self.sb_ramp3.value()
+        s.export_ensight = self.cb_ensight.isChecked()
+
+        if hasattr(self, "front_xyz"):
+            s.wheel_radius = self.sb_wheel_radius.value()
+            s.front_wheel_origin = [w.value() for w in self.front_xyz]
+            s.rear_wheel_origin = [w.value() for w in self.rear_xyz]
+
+    def _accept(self) -> None:
+        self._save()
+        problems = self.settings.validate()
+        if problems:
+            QMessageBox.warning(
+                self, "Incomplete settings",
+                "Fix the following before saving:\n\n  • "
+                + "\n  • ".join(problems))
+            return
+        self.accept()
+
+    # ── Live feedback ────────────────────────────────────────────────────
+
+    # ── Identity ─────────────────────────────────────────────────────────
+
+    def _project_changed(self) -> None:
+        """Repopulate the run list for the project just chosen."""
+        from utils.naming import existing_runs
+        root = getattr(self.settings, "output_root", "")
+        project = self.combo_project.currentText().strip()
+
+        current = self.combo_run.currentText()
+        self.combo_run.blockSignals(True)
+        self.combo_run.clear()
+        if root and project:
+            self.combo_run.addItems(existing_runs(root, project))
+        self.combo_run.setCurrentText(current)
+        self.combo_run.blockSignals(False)
+
+        self._refresh_identity()
+
+    def _run_changed(self) -> None:
+        self._refresh_identity()
+
+    def _use_next_map(self) -> None:
+        """Jump to the first MAP number this run has not used."""
+        from utils.naming import next_map_number
+        root = getattr(self.settings, "output_root", "")
+        self.sb_map.setValue(next_map_number(
+            root,
+            self.combo_project.currentText().strip(),
+            self.combo_run.currentText().strip(),
+        ))
+
+    def _refresh_identity(self) -> None:
+        """Show the Point ID and folder these three fields produce."""
+        from utils.naming import RunIdentity
+
+        identity = RunIdentity(
+            project=self.combo_project.currentText().strip(),
+            run=self.combo_run.currentText().strip(),
+            map_number=self.sb_map.value(),
+            root=getattr(self.settings, "output_root", ""),
+        )
+
+        self.lbl_point_id.setText(identity.point_id or "—")
+
+        problems = identity.validate()
+        if problems:
+            self.lbl_folder.setText(problems[0])
+            self.lbl_folder.setStyleSheet("color: #e5c07b;")
+        elif identity.exists:
+            self.lbl_folder.setText(
+                f"{identity.map_dir}\n"
+                f"This point already exists and will be overwritten.")
+            self.lbl_folder.setStyleSheet("color: #e5c07b;")
+        else:
+            self.lbl_folder.setText(identity.map_dir)
+            self.lbl_folder.setStyleSheet("color: #7f8593;")
+
+        self._refresh_summary()
+
+    def _check_processes(self) -> None:
+        """Warn as soon as the process count exceeds the machine's cores."""
+        cores = getattr(self, "_machine_cores", 1)
+        requested = self.sb_processes.value()
+        if requested > cores:
+            self.lbl_processes.setText(
+                f"This machine has {cores} cores. {requested} processes will "
+                f"stall Fluent during start-up.")
+            self.lbl_processes.setStyleSheet("color: #e06c75;")
+        else:
+            self.lbl_processes.setText(f"This machine has {cores} cores.")
+            self.lbl_processes.setStyleSheet("color: #7f8593;")
+
+    def _refresh_boxes(self) -> None:
+        """Show the refinement boxes the current dimensions produce."""
+        half = "half" in self.sim_type.KEY or "quarter" in self.sim_type.KEY
+        try:
+            boxes = refinement_boxes(self.sb_length.value(),
+                                     self.sb_width.value(),
+                                     self.sb_height.value(),
+                                     half_model=half)
+        except Exception:
+            return
+        lines = []
+        for box in boxes:
+            label = box.name.replace("local-refinement-", "")
+            lines.append(
+                f"{label:10s} {box.size:5.3f} m   "
+                f"X [{box.x_min:7.2f}, {box.x_max:7.2f}]   "
+                f"Y [{box.y_min:6.2f}, {box.y_max:6.2f}]   "
+                f"Z [{box.z_min:6.2f}, {box.z_max:6.2f}]"
+            )
+        if half:
+            lines.append("")
+            lines.append("z_min clamped to 0 for the half model")
+        self.lbl_boxes.setText("\n".join(lines))
+        self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
+        """Footer summary plus the derived speed and wheel rate."""
+        try:
+            speed_ms = self.sb_speed.value() * 0.44704
+            self.lbl_speed.setText(
+                f"{speed_ms:.3f} m/s     dynamic pressure "
+                f"{0.5 * 1.225 * speed_ms ** 2:.1f} Pa")
+
+            total = (self.sb_ramp1.value() + self.sb_ramp2.value()
+                     + self.sb_ramp3.value())
+            self.lbl_total_iters.setText(f"{total:,} iterations")
+
+            if hasattr(self, "lbl_omega"):
+                radius = self.sb_wheel_radius.value()
+                if radius > 0:
+                    omega = speed_ms / radius
+                    self.lbl_omega.setText(
+                        f"{omega:.2f} rad/s     {omega * 60 / 6.283185:.0f} rpm")
+
+            point = self.lbl_point_id.text()
+            prefix = f"{point}   ·   " if point and point != "—" else ""
+            self.summary.setText(
+                f"{prefix}"
+                f"{self.sb_speed.value():.0f} mph   ·   "
+                f"{total:,} iterations   ·   "
+                f"{self.sb_processes.value()} processes")
+        except Exception:
+            pass
