@@ -19,10 +19,14 @@ To add a simulation type: copy the closest existing module, edit it, and add
 it to the import list below.
 """
 from simtypes import half_car
+from simtypes import full_car
+from simtypes import quarter_model
 
 # Ordered as they appear in the GUI.
 MODULES = [
     half_car,
+    full_car,
+    quarter_model,
 ]
 
 SIM_TYPES = {module.KEY: module for module in MODULES}
