@@ -4,7 +4,7 @@ Run identification and output folder layout.
 Matches CFD_Rolling_Report.xlsx, so a simulation and its Master Log row carry
 the same identifier and nothing has to be cross-referenced by hand.
 
-    Project     the car or study, e.g. "RR27"
+    Project     the car or study, e.g. "Dauntless"
     Run         a batch of related points, e.g. "R018"
     MAP #       one attitude within that run, e.g. 1
 
@@ -129,6 +129,21 @@ class RunIdentity:
         """True if this point already has a folder, i.e. it has been run."""
         path = self.map_dir
         return bool(path) and os.path.isdir(path)
+
+    def create_dirs(self) -> str:
+        """
+        Make the Project/Run/Point folder tree and return the point folder.
+
+        Safe to call every run: existing folders are left alone, and any
+        prior output for this exact Point ID is not touched or cleared here.
+        """
+        path = self.map_dir
+        if not path:
+            problems = self.validate()
+            raise ValueError(
+                "Cannot create the output folder: " + "; ".join(problems))
+        os.makedirs(path, exist_ok=True)
+        return path
 
     def describe(self) -> str:
         """One line summarising where output will go."""
