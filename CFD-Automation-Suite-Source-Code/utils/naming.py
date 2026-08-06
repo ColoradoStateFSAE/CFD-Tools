@@ -4,7 +4,7 @@ Run identification and output folder layout.
 Matches CFD_Rolling_Report.xlsx, so a simulation and its Master Log row carry
 the same identifier and nothing has to be cross-referenced by hand.
 
-    Project     the car or study, e.g. "Dauntless"
+    Project     the car or study, e.g. "RR27"
     Run         a batch of related points, e.g. "R018"
     MAP #       one attitude within that run, e.g. 1
 
