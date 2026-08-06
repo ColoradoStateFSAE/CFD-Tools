@@ -9,7 +9,7 @@ import os
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QGroupBox, QLabel, QSpinBox,
     QCheckBox, QComboBox, QDialogButtonBox, QLineEdit, QHBoxLayout,
-    QPushButton, QFileDialog, QWidget,
+    QPushButton, QFileDialog, QWidget, QSpinBox,
 )
 from PyQt6.QtCore import Qt, QSettings
 
@@ -106,6 +106,29 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(interface)
 
+        # ── Phone monitor ────────────────────────────────────────────────
+        monitor = QGroupBox("Phone Monitor")
+        monitor_form = QFormLayout(monitor)
+        monitor_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.cb_monitor = QCheckBox(
+            "Serve the queue and log over the network")
+        monitor_form.addRow("", self.cb_monitor)
+
+        self.sb_monitor_port = QSpinBox()
+        self.sb_monitor_port.setRange(1024, 65535)
+        monitor_form.addRow("Port:", self.sb_monitor_port)
+
+        monitor_note = QLabel(
+            "Open the URL on a phone connected to the same Tailscale "
+            "network to see live progress. No login: Tailscale is the "
+            "access control, so do not expose this port outside it.")
+        monitor_note.setObjectName("muted")
+        monitor_note.setWordWrap(True)
+        monitor_form.addRow("", monitor_note)
+
+        layout.addWidget(monitor)
+
         # ── Environment ──────────────────────────────────────────────────
         environment = QGroupBox("Environment")
         env_form = QFormLayout(environment)
@@ -164,6 +187,10 @@ class SettingsDialog(QDialog):
             self.store.value("export_ensight", True, type=bool))
         self.e_output.setText(self.store.value("output_root", ""))
         self.combo_log.setCurrentText(self.store.value("log_level", "INFO"))
+        self.cb_monitor.setChecked(
+            self.store.value("monitor_enabled", True, type=bool))
+        self.sb_monitor_port.setValue(
+            int(self.store.value("monitor_port", 8765)))
 
     def _save(self) -> None:
         self.store.setValue("processes", self.sb_processes.value())
@@ -172,6 +199,8 @@ class SettingsDialog(QDialog):
         self.store.setValue("export_ensight", self.cb_ensight.isChecked())
         self.store.setValue("output_root", self.e_output.text().strip())
         self.store.setValue("log_level", self.combo_log.currentText())
+        self.store.setValue("monitor_enabled", self.cb_monitor.isChecked())
+        self.store.setValue("monitor_port", self.sb_monitor_port.value())
 
         import logging
         logging.getLogger().setLevel(
@@ -186,6 +215,8 @@ class SettingsDialog(QDialog):
         self.cb_ensight.setChecked(True)
         self.e_output.clear()
         self.combo_log.setCurrentText("INFO")
+        self.cb_monitor.setChecked(True)
+        self.sb_monitor_port.setValue(8765)
 
 
 def apply_defaults(settings) -> None:
