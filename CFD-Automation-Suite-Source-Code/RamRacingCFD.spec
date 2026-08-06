@@ -74,7 +74,8 @@ for source, destination in (
 # break silently if that changes.
 application_modules = [
     "core", "core.queue_manager", "core.web_monitor",
-    "simtypes", "simtypes.half_car",
+    "simtypes", "simtypes.half_car", "simtypes.full_car",
+    "simtypes.quarter_model",
     "gui", "gui.app", "gui.sim_editor", "gui.reference_tabs",
     "gui.settings_dialog", "gui.theme",
     "utils", "utils.refinement", "utils.resource_path", "utils.fluent_log", "utils.naming", "utils.log_buffer",
