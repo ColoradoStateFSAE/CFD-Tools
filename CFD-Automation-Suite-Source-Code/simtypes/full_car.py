@@ -69,10 +69,10 @@ NAMED_SELECTIONS = {
     "rrw":             ("wall, rotating",  True,  "Rear right wheel"),
     "rrwb":            ("wall, rotating",  True,  "Rear right wheel block"),
 
-    "front-suspension-left":  ("wall", False, "Front left suspension members"),
-    "front-suspension-right": ("wall", False, "Front right suspension members"),
-    "rear-suspension-left":   ("wall", False, "Rear left suspension members"),
-    "rear-suspension-right":  ("wall", False, "Rear right suspension members"),
+    "fl_sus":          ("wall", False, "Front left suspension members"),
+    "fr_sus":          ("wall", False, "Front right suspension members"),
+    "rl_sus":          ("wall", False, "Rear left suspension members"),
+    "rr_sus":          ("wall", False, "Rear right suspension members"),
 }
 
 # Labels the simulation cannot run correctly without.
@@ -81,8 +81,8 @@ REQUIRED_LABELS = [name for name, (_, required, _d)
 
 AERO      = ["frontwing", "rearwing", "undertray"]
 BODY      = ["chassis", "sidepod"]
-FRONT_SUS = ["front-suspension-left", "front-suspension-right"]
-REAR_SUS  = ["rear-suspension-left",  "rear-suspension-right"]
+FRONT_SUS = ["fl_sus", "fr_sus"]
+REAR_SUS  = ["rl_sus", "rr_sus"]
 
 FRONT_LEFT_WHEEL  = ["flw", "flwb"]
 FRONT_RIGHT_WHEEL = ["frw", "frwb"]
