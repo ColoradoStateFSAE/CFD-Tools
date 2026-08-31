@@ -1,6 +1,6 @@
 # ============================================================================
 # batch_postprocess.py
-# VERSION: 2026-08-28_1645
+# VERSION: 2026-08-31_1901
 # ============================================================================
 # Written fresh against a confirmed ParaView 6.2.0-RC1 GUI trace.
 #
@@ -27,14 +27,14 @@ import datetime
 
 paraview.simple._DisableFirstRenderCameraReset()
 
-SCRIPT_VERSION = "2026-08-28_1645"
+SCRIPT_VERSION = "2026-08-31_1901"
 
 # ============================================================
 # CASES
 # ============================================================
 CASES = [
     {"name": "case_001",
-     "file": r"D:\ParaviewData\NemisisFullCar\FLTG-Setup-Output.encas",
+     "file": r"D:\ParaviewData\NemisisFullCar\FLTG.encas",
      "out":  r"D:\ParaviewData\NemisisFullCar\Photos"},
 ]
 
@@ -69,24 +69,52 @@ WASH_BOUNDS = {
 
 # ============================================================
 # FIELDS AND COLOR
+#
+# Ansys renamed every field between releases, so names are resolved at runtime
+# against whatever the file actually contains:
+#
+#   role              2025R2                      2026R1
+#   ----------------  --------------------------  ---------------------
+#   static pressure   Static_Pressure             pressure
+#   total pressure    Total_Pressure             total_pressure
+#   velocity mag      Velocity_Magnitude         velocity_magnitude
+#   velocity vector   Velocity                   velocity
+#   wall shear        Wall_Shear_Stress          wall_shear
+#   Q criterion       Q_Criterion_Normalized     q_criterion
+#   skin friction     Skin_Friction_Coefficient  skin_friction_coef
+#
+# Note 2026R1 has no "static_pressure"; static pressure is just "pressure".
+# Candidates are tried in order, first match wins. Add new spellings here if a
+# future release renames things again.
 # ============================================================
-FIELDS = {
-    "velocity": "Velocity_Magnitude",
-    "static_pressure": "Static_Pressure",
-    "total_pressure": "Total_Pressure",
+FIELD_CANDIDATES = {
+    "static_pressure": ["Static_Pressure", "pressure", "static_pressure"],
+    "total_pressure":  ["Total_Pressure", "total_pressure"],
+    "velocity":        ["Velocity_Magnitude", "velocity_magnitude"],
+    "velocity_vector": ["Velocity", "velocity"],
+    "wall_shear":      ["Wall_Shear_Stress", "wall_shear", "Wall_Shear", "wall_shear_stress"],
+    "q_criterion":     ["Q_Criterion_Normalized", "q_criterion",
+                        "Q_Criterion_Raw", "raw_q_criterion"],
+    "skin_friction":   ["Skin_Friction_Coefficient", "skin_friction_coef",
+                        "skin_friction_coefficient"],
 }
-FIELD_RANGES = {
-    "Velocity_Magnitude": [0, 30],
-    "Static_Pressure": [-750, 250],
-    "Total_Pressure": [-750, 300],
-}
-COLOR_PRESET = 'Rainbow Uniform'
-ALL_COLOR_FIELDS = ["Velocity_Magnitude", "Static_Pressure", "Total_Pressure",
-                    "Skin_Friction_Coefficient"]
 
-ISOSURFACE_FIELD = 'Q_Criterion_Normalized'
+# Ranges are keyed by ROLE, not by array name, so they survive the rename.
+FIELD_RANGES_BY_ROLE = {
+    "velocity":        [0, 30],
+    "static_pressure": [-750, 250],
+    "total_pressure":  [-750, 300],
+}
+
+# Populated by resolve_fields() once a case is opened. Maps role -> real array
+# name in this file, e.g. {"static_pressure": "pressure", ...}
+FIELDS = {}
+FIELD_RANGES = {}
+ALL_COLOR_FIELDS = []
+
+COLOR_PRESET = 'Rainbow Uniform'
+
 ISOSURFACE_VALUE = 1.0
-ISOSURFACE_COLOR_FIELD = 'Velocity_Magnitude'
 
 # ============================================================
 # SURFACE LIC (flow-vis paint comparison)
@@ -95,16 +123,75 @@ ISOSURFACE_COLOR_FIELD = 'Velocity_Magnitude'
 # under no-slip, so convolving along it yields a flat, directionless texture.
 # Wall shear stress is what actually drives streak direction in a real
 # oil-flow test, so it makes the render comparable to a paint photo.
-#
-# Confirmed present in the Fluent export: Wall_Shear_Stress plus the
-# X_/Y_/Z_Wall_Shear_Stress components.
 # ============================================================
-LIC_VECTOR_FIELD = 'Wall_Shear_Stress'
 LIC_NUMBER_OF_STEPS = 100       # ParaView default 40; higher = longer streaks
 LIC_STEP_SIZE = 0.2             # ParaView default 0.25; lower = finer detail
 LIC_INTENSITY = 0.9             # ParaView default 0.8; higher = stronger streaks
 LIC_ENHANCE_CONTRAST = 'Color Only'   # 'Off' | 'LIC Only' | 'LIC and Color' | 'Color Only'
 LIC_ANTIALIAS = 1               # 0 off, 1 on. Cleans up streak edges
+
+
+def available_arrays(proxy):
+    """Point-data array names present on this proxy."""
+    names = []
+    try:
+        pd = proxy.PointData
+        for i in range(len(pd)):
+            names.append(pd.GetArray(i).GetName())
+    except Exception as e:
+        print(f"  [fields] could not list arrays: {e}")
+    return names
+
+
+def resolve_fields(reader):
+    """Match each logical role to a real array name in this file.
+
+    Sets the module-level FIELDS, FIELD_RANGES and ALL_COLOR_FIELDS so the rest
+    of the script can keep referring to roles instead of release-specific names.
+    """
+    global FIELDS, FIELD_RANGES, ALL_COLOR_FIELDS
+
+    present = available_arrays(reader)
+    lookup = {n.lower(): n for n in present}
+
+    FIELDS = {}
+    missing = []
+    for role, candidates in FIELD_CANDIDATES.items():
+        for cand in candidates:
+            if cand in present:
+                FIELDS[role] = cand
+                break
+            if cand.lower() in lookup:
+                FIELDS[role] = lookup[cand.lower()]
+                break
+        else:
+            missing.append(role)
+
+    FIELD_RANGES = {FIELDS[r]: v for r, v in FIELD_RANGES_BY_ROLE.items() if r in FIELDS}
+    ALL_COLOR_FIELDS = [FIELDS[r] for r in
+                        ("velocity", "static_pressure", "total_pressure",
+                         "skin_friction", "wall_shear", "q_criterion")
+                        if r in FIELDS]
+
+    print(f"  [fields] {len(present)} arrays in file, resolved:")
+    for role in FIELD_CANDIDATES:
+        if role in FIELDS:
+            print(f"           {role:16s} -> {FIELDS[role]}")
+        else:
+            print(f"           {role:16s} -> NOT FOUND")
+
+    critical = ["static_pressure", "total_pressure", "velocity", "velocity_vector"]
+    lost = [r for r in critical if r not in FIELDS]
+    if lost:
+        raise RuntimeError(
+            f"Required fields not found: {', '.join(lost)}. "
+            f"Add the correct spelling to FIELD_CANDIDATES at the top of this script. "
+            f"Arrays present: {', '.join(sorted(present))}"
+        )
+    if missing:
+        print(f"  [fields] optional fields unavailable: {', '.join(missing)} "
+              f"(stages needing them will be skipped or fall back)")
+
 
 # ============================================================
 # OUTPUT SETTINGS
@@ -112,10 +199,10 @@ LIC_ANTIALIAS = 1               # 0 off, 1 on. Cleans up streak edges
 # ImageResolution=[3840, 2160] successfully).
 # ============================================================
 IMG_SIZE = [3840, 2160]
-MOVIE_FRAMERATE = 60        # playback framerate
+MOVIE_FRAMERATE = 20      # playback framerate
 MOVIE_SECONDS = 5           # clip length in seconds
-N_SWEEP_FRAMES = MOVIE_FRAMERATE * MOVIE_SECONDS   # 300 frames
-SLICE_STEP = 0.05           # 50mm
+N_SWEEP_FRAMES = MOVIE_FRAMERATE * MOVIE_SECONDS   
+SLICE_STEP = 0.01          # 10mm
 
 # ============================================================
 # FFMPEG
@@ -312,6 +399,8 @@ def build_pipeline(case_file):
     reader.UpdatePipeline()
     print(f"  [check] reader cells: {_cells(reader)}")
 
+    resolve_fields(reader)
+
     car_extract = resolve_car_blocks(reader)
     car = make_reflect(car_extract)            # mirror the car for full-width visuals
     print(f"  [check] car after reflect: {_cells(car)} cells")
@@ -363,7 +452,7 @@ def _tracer(source, seed):
     t.SeedType.Center = seed["center"]
     t.SeedType.Radius = seed["radius"]
     t.SeedType.NumberOfPoints = seed["n"]
-    t.Vectors = ['POINTS', 'Velocity']
+    t.Vectors = ['POINTS', FIELDS['velocity_vector']]
     t.MaximumStreamlineLength = 8
     return t
 
@@ -614,10 +703,15 @@ def save_surface_lic(car, view, cam, filename, out_dir):
     disp.SetRepresentationType('Surface LIC')
 
     try:
-        disp.SelectInputVectors = ['POINTS', LIC_VECTOR_FIELD]
-        print(f"    [lic] convolving along {LIC_VECTOR_FIELD}")
+        lic_vec = FIELDS.get('wall_shear') or FIELDS['velocity_vector']
+        disp.SelectInputVectors = ['POINTS', lic_vec]
+        if 'wall_shear' in FIELDS:
+            print(f"    [lic] convolving along {lic_vec}")
+        else:
+            print(f"    [lic] WARNING wall shear not in this file, using {lic_vec}; "
+                  f"streaks will look flat because velocity is ~0 at the wall")
     except Exception as e:
-        print(f"    [lic] WARNING could not set {LIC_VECTOR_FIELD!r} "
+        print(f"    [lic] WARNING could not set the LIC vector "
               f"({e}); falling back to the default vector, streaks may look flat")
 
     # More steps and a smaller step size give crisper streaks, which matters
@@ -648,12 +742,12 @@ def save_isosurface(fluid, car, view, cam, filename, out_dir):
     os.makedirs(d, exist_ok=True)
 
     c = Contour(Input=fluid)
-    c.ContourBy = ['POINTS', ISOSURFACE_FIELD]
+    c.ContourBy = ['POINTS', FIELDS['q_criterion']]
     c.Isosurfaces = [ISOSURFACE_VALUE]
     c.UpdatePipeline()
 
     if _cells(c) == 0:
-        print(f"  [warn] isosurface empty at {ISOSURFACE_FIELD}={ISOSURFACE_VALUE}, "
+        print(f"  [warn] isosurface empty at {FIELDS['q_criterion']}={ISOSURFACE_VALUE}, "
               f"try a lower ISOSURFACE_VALUE")
 
     car_disp = Show(car, view)
@@ -663,8 +757,8 @@ def save_isosurface(fluid, car, view, cam, filename, out_dir):
     car_disp.DiffuseColor = [0.6, 0.6, 0.6]
 
     disp = Show(c, view)
-    ColorBy(disp, ('POINTS', ISOSURFACE_COLOR_FIELD))
-    ctf = apply_color(view, ISOSURFACE_COLOR_FIELD)
+    ColorBy(disp, ('POINTS', FIELDS['velocity']))
+    ctf = apply_color(view, FIELDS['velocity'])
     disp.SetScalarBarVisibility(view, True)
     apply_camera(view, cam)
     Render()
@@ -728,6 +822,9 @@ def stage_lic(car, fluid, view, out, name, opt):
 
 
 def stage_iso(car, fluid, view, out, name, opt):
+    if 'q_criterion' not in FIELDS:
+        print("    skipped: no Q-criterion field in this export")
+        return
     save_isosurface(fluid, car, view, CAM_ISO, f"{name}_iso_qcrit.png", out)
     save_isosurface(fluid, car, view, CAM_UNDERSIDE_ISO, f"{name}_under_qcrit.png", out)
 
