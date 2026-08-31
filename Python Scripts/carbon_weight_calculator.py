@@ -90,7 +90,7 @@ CUSTOM_DRY_LABEL = "Custom dry carbon (enter gsm)"
 # INFUSION ASSUMPTIONS: used only when a dry gsm is entered instead of a
 # measured swatch. Adjust these if your process changes.
 # ---------------------------------------------------------------------------
-DEFAULT_FIBER_VOLUME_FRACTION = 0.50   # typical for vacuum infusion
+DEFAULT_FIBER_VOLUME_FRACTION = 0.40   # typical for vacuum infusion
 CARBON_FIBER_DENSITY_G_CM3 = 1.80      # standard 12k/3k carbon fiber
 INFUSION_RESIN_DENSITY_G_CM3 = 1.15    # typical infusion epoxy
 
@@ -212,6 +212,19 @@ class CarbonWeightCalculator(QWidget):
         row += 1
         self._load_core_default_thickness()
 
+        self.resin_absorb_check = QCheckBox("Core absorbs resin during infusion")
+        self.resin_absorb_check.stateChanged.connect(self._refresh_sandwich_state)
+        grid.addWidget(self.resin_absorb_check, row, 0, 1, 2)
+        row += 1
+
+        self.resin_pickup_label = QLabel("Resin pickup (% of dry core weight):")
+        self.resin_pickup_entry = QLineEdit()
+        self.resin_pickup_entry.setFixedWidth(140)
+        self.resin_pickup_entry.setText("0")
+        grid.addWidget(self.resin_pickup_label, row, 0)
+        grid.addWidget(self.resin_pickup_entry, row, 1)
+        row += 1
+
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
         grid.addWidget(sep2, row, 0, 1, 2)
@@ -224,7 +237,7 @@ class CarbonWeightCalculator(QWidget):
 
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
-        self.result_text.setFixedSize(420, 190)
+        self.result_text.setFixedSize(420, 230)
         grid.addWidget(self.result_text, row, 0, 1, 2)
 
         self._row_widgets = {
@@ -234,6 +247,8 @@ class CarbonWeightCalculator(QWidget):
             "skin2_gsm": (self.skin2_gsm_label, self.skin2_gsm_entry),
             "core": (self.core_label, self.core_combo),
             "core_thickness": (self.core_thickness_label, self.core_thickness_entry),
+            "resin_absorb": (self.resin_absorb_check, None),
+            "resin_pickup": (self.resin_pickup_label, self.resin_pickup_entry),
         }
 
     def _load_core_default_thickness(self):
@@ -252,7 +267,7 @@ class CarbonWeightCalculator(QWidget):
         skin1_custom = self.skin1_combo.currentText() == CUSTOM_DRY_LABEL
         self._set_visible("skin1_gsm", skin1_custom)
 
-        for key in ("same_skin", "core", "core_thickness"):
+        for key in ("same_skin", "core", "core_thickness", "resin_absorb"):
             self._set_visible(key, sandwich_on)
 
         if sandwich_on:
@@ -260,9 +275,11 @@ class CarbonWeightCalculator(QWidget):
             self._set_visible("skin2", not same_skin)
             skin2_custom = (not same_skin) and (self.skin2_combo.currentText() == CUSTOM_DRY_LABEL)
             self._set_visible("skin2_gsm", skin2_custom)
+            self._set_visible("resin_pickup", self.resin_absorb_check.isChecked())
         else:
             self._set_visible("skin2", False)
             self._set_visible("skin2_gsm", False)
+            self._set_visible("resin_pickup", False)
 
     # -----------------------------------------------------------------
     # Calculation
@@ -321,8 +338,20 @@ class CarbonWeightCalculator(QWidget):
                 return
 
             core = CORE_MATERIALS[self.core_combo.currentText()]
-            core_gsm = core_areal_weight_g_m2(core["density_kg_m3"], core_thickness_mm)
-            lines.append(f"Core ({self.core_combo.currentText()}, {core_thickness_mm:.2f} mm): {core_gsm:.2f} g/m^2")
+            core_dry_gsm = core_areal_weight_g_m2(core["density_kg_m3"], core_thickness_mm)
+            lines.append(f"Core dry ({self.core_combo.currentText()}, {core_thickness_mm:.2f} mm): {core_dry_gsm:.2f} g/m^2")
+
+            core_gsm = core_dry_gsm
+            if self.resin_absorb_check.isChecked():
+                try:
+                    pickup_pct = float(self.resin_pickup_entry.text())
+                except ValueError:
+                    QMessageBox.critical(self, "Input error", "Enter a valid resin pickup percentage.")
+                    return
+                resin_pickup_gsm = core_dry_gsm * (pickup_pct / 100.0)
+                core_gsm = core_dry_gsm + resin_pickup_gsm
+                lines.append(f"Resin absorbed by core ({pickup_pct:.1f}%): {resin_pickup_gsm:.2f} g/m^2")
+                lines.append(f"Core total (dry + absorbed resin): {core_gsm:.2f} g/m^2")
 
             total_gsm = skin1_gsm + skin2_gsm + core_gsm
 

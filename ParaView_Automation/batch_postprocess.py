@@ -1,8 +1,17 @@
 # ============================================================================
 # batch_postprocess.py
-# VERSION: 2026-08-05_1329
+# VERSION: 2026-08-28_1645
 # ============================================================================
 # Written fresh against a confirmed ParaView 6.2.0-RC1 GUI trace.
+#
+# WHY THE PREVIOUS VERSION BROKE:
+#   ParaView changed from 6.1.1 to 6.2.0-RC1. Block selector names changed:
+#       6.1.1  ->  /Root/enclosureenclosure11
+#       6.2.0  ->  /Root/enclosure-enclosure11     (hyphen added)
+#   ExtractBlock does NOT error on a bad selector, it just returns 0 cells,
+#   so everything downstream silently rendered blank. This script now probes
+#   candidate selector strings at runtime and uses whichever actually returns
+#   cells, so a future rename cannot silently break it again.
 #
 # Run with:   pvpython batch_postprocess_2026-08-05_0202.py
 # Headless:   pvbatch --mesa batch_postprocess_2026-08-05_0202.py
@@ -18,15 +27,15 @@ import datetime
 
 paraview.simple._DisableFirstRenderCameraReset()
 
-SCRIPT_VERSION = "2026-08-05_1329"
+SCRIPT_VERSION = "2026-08-28_1645"
 
 # ============================================================
 # CASES
 # ============================================================
 CASES = [
     {"name": "case_001",
-     "file": r"C:\Users\Hayes Dodson\Downloads\data\FLTG-Setup-Output.encas",
-     "out":  r"C:\Users\Hayes Dodson\Downloads\test"},
+     "file": r"D:\ParaviewData\NemisisFullCar\FLTG-Setup-Output.encas",
+     "out":  r"D:\ParaviewData\NemisisFullCar\Photos"},
 ]
 
 # ============================================================
@@ -55,7 +64,7 @@ CAR_BOUNDS = {
 WASH_BOUNDS = {
     "x": (-1.0, 2.5),
     "y": (0.0, 1.8),
-    "z": (0.0, 1),
+    "z": (0.0, 1.8),
 }
 
 # ============================================================
@@ -78,6 +87,24 @@ ALL_COLOR_FIELDS = ["Velocity_Magnitude", "Static_Pressure", "Total_Pressure",
 ISOSURFACE_FIELD = 'Q_Criterion_Normalized'
 ISOSURFACE_VALUE = 1.0
 ISOSURFACE_COLOR_FIELD = 'Velocity_Magnitude'
+
+# ============================================================
+# SURFACE LIC (flow-vis paint comparison)
+#
+# The convolution vector must be wall shear stress. Velocity is ~0 at the wall
+# under no-slip, so convolving along it yields a flat, directionless texture.
+# Wall shear stress is what actually drives streak direction in a real
+# oil-flow test, so it makes the render comparable to a paint photo.
+#
+# Confirmed present in the Fluent export: Wall_Shear_Stress plus the
+# X_/Y_/Z_Wall_Shear_Stress components.
+# ============================================================
+LIC_VECTOR_FIELD = 'Wall_Shear_Stress'
+LIC_NUMBER_OF_STEPS = 100       # ParaView default 40; higher = longer streaks
+LIC_STEP_SIZE = 0.2             # ParaView default 0.25; lower = finer detail
+LIC_INTENSITY = 0.9             # ParaView default 0.8; higher = stronger streaks
+LIC_ENHANCE_CONTRAST = 'Color Only'   # 'Off' | 'LIC Only' | 'LIC and Color' | 'Color Only'
+LIC_ANTIALIAS = 1               # 0 off, 1 on. Cleans up streak edges
 
 # ============================================================
 # OUTPUT SETTINGS
@@ -572,10 +599,40 @@ def make_slice_deck(fluid, view_name, view, field, bounds, out_dir, name, field_
 # OUTPUT 6: SURFACE LIC AND Q-CRITERION ISOSURFACES
 # ============================================================
 def save_surface_lic(car, view, cam, filename, out_dir):
+    """Surface LIC, the CFD analogue of oil-flow paint.
+
+    The convolution vector MUST be wall shear stress, not velocity. Velocity
+    goes to ~0 at the wall under no-slip, so convolving along it produces a
+    flat, directionless texture. Wall shear stress is what physically drives
+    the direction oil streaks on a real flow-vis run, so it is what makes the
+    CFD image comparable to a paint photo.
+    """
     d = os.path.join(out_dir, "surface_lic")
     os.makedirs(d, exist_ok=True)
+
     disp = Show(car, view)
     disp.SetRepresentationType('Surface LIC')
+
+    try:
+        disp.SelectInputVectors = ['POINTS', LIC_VECTOR_FIELD]
+        print(f"    [lic] convolving along {LIC_VECTOR_FIELD}")
+    except Exception as e:
+        print(f"    [lic] WARNING could not set {LIC_VECTOR_FIELD!r} "
+              f"({e}); falling back to the default vector, streaks may look flat")
+
+    # More steps and a smaller step size give crisper streaks, which matters
+    # when the point is to compare line-for-line against a paint photo.
+    try:
+        disp.NumberOfSteps = LIC_NUMBER_OF_STEPS
+        disp.StepSize = LIC_STEP_SIZE
+        disp.LICIntensity = LIC_INTENSITY
+        disp.EnhancedLIC = 1
+        disp.NormalizeVectors = 1
+        disp.EnhanceContrast = LIC_ENHANCE_CONTRAST
+        disp.AntiAlias = LIC_ANTIALIAS
+    except Exception as e:
+        print(f"    [lic] note: some LIC quality settings unavailable ({e})")
+
     ColorBy(disp, ('POINTS', FIELDS["total_pressure"]))
     ctf = apply_color(view, FIELDS["total_pressure"])
     disp.SetScalarBarVisibility(view, True)
