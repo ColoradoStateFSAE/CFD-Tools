@@ -198,7 +198,7 @@ def resolve_fields(reader):
 # 4K MP4 export is confirmed working in 6.2 (the trace exported
 # ImageResolution=[3840, 2160] successfully).
 # ============================================================
-IMG_SIZE = [3840, 2160]
+IMG_SIZE = [2560, 1440]
 MOVIE_FRAMERATE = 20      # playback framerate
 MOVIE_SECONDS = 5           # clip length in seconds
 N_SWEEP_FRAMES = MOVIE_FRAMERATE * MOVIE_SECONDS   

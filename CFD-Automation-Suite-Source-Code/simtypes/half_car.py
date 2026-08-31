@@ -728,23 +728,43 @@ def solve(s: Settings, mesh_file: str, log, progress=None,
 
         # Each set individually and logged, so a Scheme-level failure (e.g.
         # "ASSQ: invalid argument: improper list") names the exact call that
-        # caused it instead of aborting the whole run with no attribution.
-        def _set_viscous(attr_path: str, value):
-            obj = viscous
-            parts = attr_path.split(".")
-            try:
-                for part in parts[:-1]:
-                    obj = getattr(obj, part)
-                setattr(obj, parts[-1], value)
-                log.info(f"  viscous.{attr_path} = {value}")
-            except Exception as exc:
-                log.error(f"  viscous.{attr_path} = {value}  FAILED: {exc}")
-                raise
+        # caused it. `required=True` still aborts the run -- model and
+        # k_omega_model must succeed or GEKO isn't actually running.
+        # `required=False` logs a warning and moves on, since a turbulence
+        # option defaulting to Fluent's own value is not worth failing an
+        # hour-long run over. Several attribute paths are tried in order,
+        # since Fluent 2026 R1's settings API rejected "options.<flag>" for
+        # some flags on this build -- see CHANGELOG.md.
+        def _set_viscous(attr_paths, value, required=True):
+            paths = [attr_paths] if isinstance(attr_paths, str) else attr_paths
+            last_exc = None
+            for attr_path in paths:
+                obj = viscous
+                parts = attr_path.split(".")
+                try:
+                    for part in parts[:-1]:
+                        obj = getattr(obj, part)
+                    setattr(obj, parts[-1], value)
+                    log.info(f"  viscous.{attr_path} = {value}")
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    log.debug(f"  viscous.{attr_path} = {value}  failed: {exc}")
+            if required:
+                log.error(f"  viscous.{paths[0]} = {value}  FAILED "
+                          f"(tried {paths}): {last_exc}")
+                raise last_exc
+            log.warning(f"  viscous.{paths[0]} = {value}  could not be set "
+                       f"(tried {paths}) -- continuing with Fluent's default")
 
         _set_viscous("model", "k-omega")
         _set_viscous("k_omega_model", "geko")
-        _set_viscous("options.production_limiter", True)
-        _set_viscous("options.curvature_correction", False)   # on at ramp 3
+        _set_viscous(
+            ["options.production_limiter", "production_limiter"],
+            True, required=False)
+        _set_viscous(
+            ["options.curvature_correction", "curvature_correction"],
+            False, required=False)   # on at ramp 3
 
         # ── Boundary conditions ───────────────────────────────────────────
         step(8, "Boundary conditions")
@@ -804,7 +824,20 @@ def solve(s: Settings, mesh_file: str, log, progress=None,
             "k":        "second-order-upwind",
             "omega":    "second-order-upwind",
         }
-        viscous.options.curvature_correction = True
+        for _attr in ("options.curvature_correction", "curvature_correction"):
+            try:
+                obj = viscous
+                parts = _attr.split(".")
+                for part in parts[:-1]:
+                    obj = getattr(obj, part)
+                setattr(obj, parts[-1], True)
+                log.info(f"  viscous.{_attr} = True  (ramp 3)")
+                break
+            except Exception as _exc:
+                log.debug(f"  viscous.{_attr} ramp 3: {_exc}")
+        else:
+            log.warning("  Could not enable curvature correction for "
+                       "ramp 3 -- continuing without it")
         solution.run_calculation.iterate(iter_count=s.ramp3_iters)
         session.settings.file.write_case_data(file_name=f"{prefix}_final")
 
