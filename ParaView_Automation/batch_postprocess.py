@@ -199,8 +199,8 @@ def resolve_fields(reader):
 # ImageResolution=[3840, 2160] successfully).
 # ============================================================
 IMG_SIZE = [2560, 1440]
-MOVIE_FRAMERATE = 20      # playback framerate
-MOVIE_SECONDS = 5           # clip length in seconds
+MOVIE_FRAMERATE = 40     # playback framerate
+MOVIE_SECONDS = 10         # clip length in seconds
 N_SWEEP_FRAMES = MOVIE_FRAMERATE * MOVIE_SECONDS   
 SLICE_STEP = 0.01          # 10mm
 
