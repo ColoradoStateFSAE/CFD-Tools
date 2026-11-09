@@ -38,6 +38,10 @@ CORE_MATERIALS = {
         "density_kg_m3": 100.0,
         "default_thickness_mm": 2.0,
     },
+    "Roha (2mm default)": {
+            "density_kg_m3": 220.0,
+            "default_thickness_mm": 2.0,
+        },
     # Nomex aramid paper, ASTM D374/D646/D828-97 data sheet values.
     # Density (g/cc) converted to kg/m^3, typical thickness used as default mm.
     "Nomex Paper 2 mil (0.06mm)": {

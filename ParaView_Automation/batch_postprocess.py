@@ -1,6 +1,6 @@
 # ============================================================================
 # batch_postprocess.py
-# VERSION: 2026-08-31_1901
+# VERSION: 2026-11-09_1050
 # ============================================================================
 # Written fresh against a confirmed ParaView 6.2.0-RC1 GUI trace.
 #
@@ -18,6 +18,7 @@
 # ============================================================================
 
 from paraview.simple import *
+import math
 import os
 import sys
 import shutil
@@ -27,15 +28,15 @@ import datetime
 
 paraview.simple._DisableFirstRenderCameraReset()
 
-SCRIPT_VERSION = "2026-08-31_1901"
+SCRIPT_VERSION = "2026-11-09_1050"
 
 # ============================================================
 # CASES
 # ============================================================
 CASES = [
     {"name": "case_001",
-     "file": r"D:\ParaviewData\NemisisFullCar\FLTG.encas",
-     "out":  r"D:\ParaviewData\NemisisFullCar\Photos"},
+     "file": r"C:\Users\HayesDodson\Downloads\data\FLTG-Setup-Output.encas",
+     "out":  r"C:\Users\HayesDodson\Downloads\test"},
 ]
 
 # ============================================================
@@ -198,11 +199,11 @@ def resolve_fields(reader):
 # 4K MP4 export is confirmed working in 6.2 (the trace exported
 # ImageResolution=[3840, 2160] successfully).
 # ============================================================
-IMG_SIZE = [2560, 1440]
-MOVIE_FRAMERATE = 40     # playback framerate
-MOVIE_SECONDS = 10         # clip length in seconds
-N_SWEEP_FRAMES = MOVIE_FRAMERATE * MOVIE_SECONDS   
-SLICE_STEP = 0.01          # 10mm
+IMG_SIZE = [3840, 2160]
+MOVIE_FRAMERATE = 60        # playback framerate
+MOVIE_SECONDS = 5           # clip length in seconds
+N_SWEEP_FRAMES = MOVIE_FRAMERATE * MOVIE_SECONDS   # 300 frames
+SLICE_STEP = 0.05           # 50mm
 
 # ============================================================
 # FFMPEG
@@ -304,6 +305,75 @@ def apply_camera(view, cam):
     view.CameraPosition = cam["position"]
     view.CameraFocalPoint = cam["focal_point"]
     view.CameraViewUp = cam["view_up"]
+    view.CameraViewAngle = CAMERA_VIEW_ANGLE
+
+
+# ============================================================
+# CAMERA FRAMING
+#
+# The traced front camera sits ~2.06 m from its focal point. At a 30 deg view
+# angle that frames only ~1.1 m of height, but the front sweep plane spans the
+# full WASH_BOUNDS extent in Y and Z (1.8 m each). The plane overflowed the
+# frame, and because the traced focal point (y=0.91, z=1.17) is not the centre
+# of the slice region (y=0.9, z=0.9) it also sat high and to the right.
+#
+# fit_camera_to_bounds keeps the traced viewing direction and up vector but
+# recentres the focal point on the middle of the swept plane and pushes the
+# camera back far enough to contain both in-plane extents. Views listed in
+# FIT_VIEWS get this treatment; the rest keep their traced cameras untouched.
+# ============================================================
+FIT_VIEWS = ["front"]     # add "top" or "side" if either ever overflows too
+FIT_MARGIN = 1.15         # 15% breathing room around the plane
+
+
+def fit_camera_to_bounds(view_name, bounds, img_size, margin=FIT_MARGIN):
+    """Traced direction and up vector, but framed on the swept plane."""
+    base = CAMS_BY_VIEW[view_name]
+    depth = AXIS_INDEX[AXIS_FOR_VIEW[view_name]]
+    in_plane = [i for i in (0, 1, 2) if i != depth]
+
+    keys = ("x", "y", "z")
+    centre = [0.0, 0.0, 0.0]
+    for i in in_plane:
+        lo, hi = bounds[keys[i]]
+        centre[i] = (lo + hi) / 2.0
+    # keep the depth coordinate where the traced camera had it; the sweep
+    # loop moves it from there via shifted_camera()
+    centre[depth] = base["focal_point"][depth]
+
+    # vertical extent on screen is whichever in-plane axis the view_up follows
+    up = base["view_up"]
+    vert = max(in_plane, key=lambda i: abs(up[i]))
+    horiz = [i for i in in_plane if i != vert][0]
+
+    v_span = bounds[keys[vert]][1] - bounds[keys[vert]][0]
+    h_span = bounds[keys[horiz]][1] - bounds[keys[horiz]][0]
+    aspect = float(img_size[0]) / float(img_size[1])
+
+    half = math.radians(CAMERA_VIEW_ANGLE) / 2.0
+    d_v = (v_span * margin / 2.0) / math.tan(half)
+    d_h = (h_span * margin / 2.0) / (math.tan(half) * aspect)
+    dist = max(d_v, d_h)
+
+    sign = 1.0 if base["position"][depth] >= base["focal_point"][depth] else -1.0
+    position = list(centre)
+    position[depth] = centre[depth] + sign * dist
+
+    print(f"    [camera] {view_name} framed on {v_span:.2f}x{h_span:.2f} m plane, "
+          f"standoff {dist:.2f} m (was "
+          f"{abs(base['position'][depth] - base['focal_point'][depth]):.2f} m)")
+
+    return {"position": position, "focal_point": list(centre), "view_up": up}
+
+
+def apply_fitted_cameras(bounds, img_size):
+    """Replace the traced camera for each view in FIT_VIEWS with a fitted one.
+
+    Called once per case before the movie and slice stages so shifted_camera()
+    picks the corrected base up automatically.
+    """
+    for view_name in FIT_VIEWS:
+        CAMS_BY_VIEW[view_name] = fit_camera_to_bounds(view_name, bounds, img_size)
 
 
 def shifted_camera(view_name, distance):
@@ -861,6 +931,9 @@ def process_case(case, opt):
     view = GetActiveViewOrCreate('RenderView')
     force_render_size(view, IMG_SIZE)
 
+    # recompute the framed cameras now that resolution and bounds are known
+    apply_fitted_cameras(WASH_BOUNDS, IMG_SIZE)
+
     stages = opt["stages"]
     for i, s in enumerate(stages, 1):
         print(f"  [{i}/{len(stages)}] {s}")
@@ -906,6 +979,14 @@ examples:
                    help="limit movies/slices to these fields (default: all three)")
     p.add_argument("--case", nargs="+", default=None,
                    help="only run cases with these names (default: all in CASES)")
+    p.add_argument("--file", default=None,
+                   help="path to a .encas case file; overrides the CASES list entirely "
+                        "(used by the GUI launcher so paths need not be edited in code)")
+    p.add_argument("--out", default=None,
+                   help="output folder for --file (defaults to an 'output' folder "
+                        "beside the case file)")
+    p.add_argument("--name", default=None,
+                   help="name for the --file case (defaults to the file's stem)")
     p.add_argument("--frames", type=int, default=None,
                    help=f"override sweep frame count (default {N_SWEEP_FRAMES})")
     p.add_argument("--fps", type=int, default=None,
@@ -969,10 +1050,19 @@ if __name__ == "__main__":
         "probe_only": args.probe_only,
     }
 
-    cases = CASES if args.case is None else [c for c in CASES if c["name"] in args.case]
-    if not cases:
-        print(f"!! no cases matched {args.case}", file=sys.stderr)
-        sys.exit(1)
+    if args.file is not None:
+        case_file = os.path.abspath(args.file)
+        if not os.path.exists(case_file):
+            print(f"!! case file not found: {case_file}", file=sys.stderr)
+            sys.exit(1)
+        out_dir = args.out or os.path.join(os.path.dirname(case_file), "output")
+        case_name = args.name or os.path.splitext(os.path.basename(case_file))[0]
+        cases = [{"name": case_name, "file": case_file, "out": os.path.abspath(out_dir)}]
+    else:
+        cases = CASES if args.case is None else [c for c in CASES if c["name"] in args.case]
+        if not cases:
+            print(f"!! no cases matched {args.case}", file=sys.stderr)
+            sys.exit(1)
 
     print(f"batch_postprocess version {SCRIPT_VERSION}")
     print(f"started {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
