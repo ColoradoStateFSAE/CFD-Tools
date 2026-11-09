@@ -11,10 +11,12 @@ Adding a new core material: add one line to CORE_MATERIALS below.
 """
 
 import sys
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QComboBox, QCheckBox,
-    QPushButton, QTextEdit, QGridLayout, QVBoxLayout, QFrame, QMessageBox,
+    QPushButton, QTextEdit, QGridLayout, QVBoxLayout, QHBoxLayout, QFrame,
+    QMessageBox, QFileDialog,
 )
 
 # ---------------------------------------------------------------------------
@@ -128,6 +130,7 @@ class CarbonWeightCalculator(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Carbon Part Weight Calculator")
+        self._last_export_lines = None
         self._build_layout()
         self._refresh_sandwich_state()
 
@@ -212,19 +215,40 @@ class CarbonWeightCalculator(QWidget):
         row += 1
         self._load_core_default_thickness()
 
+        self.resin_absorb_check = QCheckBox("Core absorbs resin during infusion")
+        self.resin_absorb_check.stateChanged.connect(self._refresh_sandwich_state)
+        grid.addWidget(self.resin_absorb_check, row, 0, 1, 2)
+        row += 1
+
+        self.resin_pickup_label = QLabel("Resin pickup (% of dry core weight):")
+        self.resin_pickup_entry = QLineEdit()
+        self.resin_pickup_entry.setFixedWidth(140)
+        self.resin_pickup_entry.setText("0")
+        grid.addWidget(self.resin_pickup_label, row, 0)
+        grid.addWidget(self.resin_pickup_entry, row, 1)
+        row += 1
+
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
         grid.addWidget(sep2, row, 0, 1, 2)
         row += 1
 
+        button_row = QHBoxLayout()
         self.calc_button = QPushButton("Calculate")
         self.calc_button.clicked.connect(self._calculate)
-        grid.addWidget(self.calc_button, row, 0)
+        button_row.addWidget(self.calc_button)
+
+        self.export_button = QPushButton("Export to text file...")
+        self.export_button.clicked.connect(self._export_results)
+        self.export_button.setEnabled(False)
+        button_row.addWidget(self.export_button)
+
+        grid.addLayout(button_row, row, 0, 1, 2)
         row += 1
 
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
-        self.result_text.setFixedSize(420, 190)
+        self.result_text.setFixedSize(420, 230)
         grid.addWidget(self.result_text, row, 0, 1, 2)
 
         self._row_widgets = {
@@ -234,6 +258,8 @@ class CarbonWeightCalculator(QWidget):
             "skin2_gsm": (self.skin2_gsm_label, self.skin2_gsm_entry),
             "core": (self.core_label, self.core_combo),
             "core_thickness": (self.core_thickness_label, self.core_thickness_entry),
+            "resin_absorb": (self.resin_absorb_check, None),
+            "resin_pickup": (self.resin_pickup_label, self.resin_pickup_entry),
         }
 
     def _load_core_default_thickness(self):
@@ -252,7 +278,7 @@ class CarbonWeightCalculator(QWidget):
         skin1_custom = self.skin1_combo.currentText() == CUSTOM_DRY_LABEL
         self._set_visible("skin1_gsm", skin1_custom)
 
-        for key in ("same_skin", "core", "core_thickness"):
+        for key in ("same_skin", "core", "core_thickness", "resin_absorb"):
             self._set_visible(key, sandwich_on)
 
         if sandwich_on:
@@ -260,9 +286,11 @@ class CarbonWeightCalculator(QWidget):
             self._set_visible("skin2", not same_skin)
             skin2_custom = (not same_skin) and (self.skin2_combo.currentText() == CUSTOM_DRY_LABEL)
             self._set_visible("skin2_gsm", skin2_custom)
+            self._set_visible("resin_pickup", self.resin_absorb_check.isChecked())
         else:
             self._set_visible("skin2", False)
             self._set_visible("skin2_gsm", False)
+            self._set_visible("resin_pickup", False)
 
     # -----------------------------------------------------------------
     # Calculation
@@ -293,6 +321,20 @@ class CarbonWeightCalculator(QWidget):
             return
 
         lines = []
+        export_lines = []
+        export_lines.append("Carbon Part Weight Calculator - saved results")
+        export_lines.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        export_lines.append("")
+        export_lines.append("Inputs:")
+        export_lines.append(f"  Surface area: {area_m2:.4f} m^2")
+        export_lines.append(f"  Sandwich panel: {'yes' if self.sandwich_check.isChecked() else 'no'}")
+        export_lines.append(f"  Skin 1 selection: {self.skin1_combo.currentText()}")
+        if self.skin1_combo.currentText() == CUSTOM_DRY_LABEL:
+            export_lines.append(f"    Skin 1 dry gsm entered: {self.skin1_gsm_entry.text()}")
+            export_lines.append(f"    Infusion assumption: Vf={DEFAULT_FIBER_VOLUME_FRACTION:.2f}, "
+                                 f"fiber density={CARBON_FIBER_DENSITY_G_CM3:.2f} g/cc, "
+                                 f"resin density={INFUSION_RESIN_DENSITY_G_CM3:.2f} g/cc")
+
         lines.append(f"Surface area: {area_m2:.4f} m^2")
         lines.append(f"Skin 1 ({self.skin1_combo.currentText()}): {skin1_gsm:.2f} g/m^2" +
                      (" (estimated from dry gsm, standard infusion VFR)" if skin1_estimated else ""))
@@ -303,6 +345,7 @@ class CarbonWeightCalculator(QWidget):
             if self.same_skin_check.isChecked():
                 skin2_gsm, skin2_estimated = skin1_gsm, skin1_estimated
                 skin2_name = self.skin1_combo.currentText()
+                export_lines.append("  Skin 2 selection: same as skin 1")
             else:
                 try:
                     skin2_gsm, skin2_estimated = self._get_skin_gsm(self.skin2_combo.currentText(), self.skin2_gsm_entry)
@@ -310,6 +353,12 @@ class CarbonWeightCalculator(QWidget):
                     QMessageBox.critical(self, "Input error", str(e))
                     return
                 skin2_name = self.skin2_combo.currentText()
+                export_lines.append(f"  Skin 2 selection: {skin2_name}")
+                if skin2_name == CUSTOM_DRY_LABEL:
+                    export_lines.append(f"    Skin 2 dry gsm entered: {self.skin2_gsm_entry.text()}")
+                    export_lines.append(f"    Infusion assumption: Vf={DEFAULT_FIBER_VOLUME_FRACTION:.2f}, "
+                                         f"fiber density={CARBON_FIBER_DENSITY_G_CM3:.2f} g/cc, "
+                                         f"resin density={INFUSION_RESIN_DENSITY_G_CM3:.2f} g/cc")
 
             lines.append(f"Skin 2 ({skin2_name}): {skin2_gsm:.2f} g/m^2" +
                          (" (estimated from dry gsm, standard infusion VFR)" if skin2_estimated else ""))
@@ -321,10 +370,31 @@ class CarbonWeightCalculator(QWidget):
                 return
 
             core = CORE_MATERIALS[self.core_combo.currentText()]
-            core_gsm = core_areal_weight_g_m2(core["density_kg_m3"], core_thickness_mm)
-            lines.append(f"Core ({self.core_combo.currentText()}, {core_thickness_mm:.2f} mm): {core_gsm:.2f} g/m^2")
+            core_dry_gsm = core_areal_weight_g_m2(core["density_kg_m3"], core_thickness_mm)
+            lines.append(f"Core dry ({self.core_combo.currentText()}, {core_thickness_mm:.2f} mm): {core_dry_gsm:.2f} g/m^2")
+
+            export_lines.append(f"  Core selection: {self.core_combo.currentText()}")
+            export_lines.append(f"    Core density: {core['density_kg_m3']:.1f} kg/m^3")
+            export_lines.append(f"    Core thickness entered: {core_thickness_mm:.2f} mm")
+
+            core_gsm = core_dry_gsm
+            if self.resin_absorb_check.isChecked():
+                try:
+                    pickup_pct = float(self.resin_pickup_entry.text())
+                except ValueError:
+                    QMessageBox.critical(self, "Input error", "Enter a valid resin pickup percentage.")
+                    return
+                resin_pickup_gsm = core_dry_gsm * (pickup_pct / 100.0)
+                core_gsm = core_dry_gsm + resin_pickup_gsm
+                lines.append(f"Resin absorbed by core ({pickup_pct:.1f}%): {resin_pickup_gsm:.2f} g/m^2")
+                lines.append(f"Core total (dry + absorbed resin): {core_gsm:.2f} g/m^2")
+                export_lines.append(f"    Core absorbs resin: yes, {pickup_pct:.1f}% of dry core weight")
+            else:
+                export_lines.append("    Core absorbs resin: no")
 
             total_gsm = skin1_gsm + skin2_gsm + core_gsm
+        else:
+            export_lines.append("  (single skin, no core)")
 
         total_grams = total_gsm * area_m2
         total_lb = total_grams * G_TO_LB
@@ -335,6 +405,34 @@ class CarbonWeightCalculator(QWidget):
         lines.append(f"Estimated weight: {total_lb:.3f} lb")
 
         self.result_text.setPlainText("\n".join(lines))
+
+        export_lines.append("")
+        export_lines.append("Breakdown:")
+        for line in lines:
+            export_lines.append(f"  {line}" if line else "")
+
+        self._last_export_lines = export_lines
+        self.export_button.setEnabled(True)
+
+    def _export_results(self):
+        if not self._last_export_lines:
+            return
+
+        default_name = datetime.now().strftime("carbon_weight_%Y%m%d_%H%M%S.txt")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save results as text file", default_name, "Text files (*.txt);;All files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w") as f:
+                f.write("\n".join(self._last_export_lines) + "\n")
+        except OSError as e:
+            QMessageBox.critical(self, "Export error", f"Could not save file:\n{e}")
+            return
+
+        QMessageBox.information(self, "Export complete", f"Results saved to:\n{path}")
 
 
 if __name__ == "__main__":
